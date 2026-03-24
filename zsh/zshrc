@@ -30,6 +30,19 @@ elif [[ -f "$HOME/.p10k.zsh" ]]; then
 fi
 
 export ZSH="$HOME/.oh-my-zsh"
+TERM_PUBLIC_BOOTSTRAP_HINT=""
+if [[ ! -d "$ZSH" ]]; then
+  TERM_PUBLIC_BOOTSTRAP_HINT="oh-my-zsh"
+elif [[ ! -d "${ZSH_CUSTOM:-$ZSH/custom}/themes/powerlevel10k" ]]; then
+  TERM_PUBLIC_BOOTSTRAP_HINT="powerlevel10k"
+fi
+
+if [[ -n "$TERM_PUBLIC_BOOTSTRAP_HINT" ]]; then
+  printf 'term-public: missing %s; run %s\n' \
+    "$TERM_PUBLIC_BOOTSTRAP_HINT" \
+    "$TERM_PUBLIC_ROOT/setup/bootstrap-macos.sh" >&2
+fi
+
 if [[ -d "$ZSH" ]]; then
   if [[ -d "${ZSH_CUSTOM:-$ZSH/custom}/themes/powerlevel10k" ]]; then
     export ZSH_THEME="powerlevel10k/powerlevel10k"
