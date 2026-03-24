@@ -1,0 +1,31 @@
+# Minimal zsh baseline for term-public.
+
+if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]; then
+  source "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh"
+fi
+
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:=$HOME/.config}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:=$HOME/.local/share}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:=$HOME/.cache}"
+
+export PATH="$HOME/bin:$PATH"
+
+if [[ -n "${TERM_PUBLIC_P10K:-}" && -f "${TERM_PUBLIC_P10K}" ]]; then
+  source "${TERM_PUBLIC_P10K}"
+elif [[ -f "$HOME/.p10k.zsh" ]]; then
+  source "$HOME/.p10k.zsh"
+fi
+
+export ZSH="$HOME/.oh-my-zsh"
+if [[ -d "$ZSH" ]]; then
+  if [[ -d "${ZSH_CUSTOM:-$ZSH/custom}/themes/powerlevel10k" ]]; then
+    export ZSH_THEME="powerlevel10k/powerlevel10k"
+  else
+    export ZSH_THEME=""
+  fi
+
+  plugins=(git)
+  source "$ZSH/oh-my-zsh.sh"
+fi
+
+bindkey -v

@@ -1,0 +1,11 @@
+# Ghostty configuration
+
+theme = palenight
+font-family = MesloLGS Nerd Font
+font-size = 14
+
+background-opacity = 0.90
+window-theme = dark
+
+macos-titlebar-style = tabs
+macos-option-as-alt = true
