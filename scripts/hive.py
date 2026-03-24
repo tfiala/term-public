@@ -119,6 +119,18 @@ def _storable_path(path: Path) -> str:
     return _display_path(path)
 
 
+def _real_zdotdir(env: dict[str, str]) -> str:
+    home = str(Path.home())
+
+    # Nested hive shells should preserve the original user config location.
+    if env.get("HIVE_REAL_ZDOTDIR"):
+        return env["HIVE_REAL_ZDOTDIR"]
+
+    # For normal shells, prefer HOME-based startup files as the canonical zsh
+    # config instead of inheriting external ZDOTDIR values such as ~/.config/zsh.
+    return home
+
+
 def _save_apiary(hives: list[Path]) -> None:
     _APIARY_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     _APIARY_CONFIG.write_text(
@@ -319,9 +331,7 @@ def _launch_dtach(hive: Path, hive_name: str, workspace: Path, number: str) -> N
     env["HIVE_COLOR_RGB"] = color["rgb"]
     env["HIVE_COLOR_256"] = color["c256"]
 
-    original_zdotdir = env.get("ZDOTDIR", str(Path.home()))
-    if original_zdotdir.startswith(str(_DTACH_DIR / ".zdotdir-")):
-        original_zdotdir = env.get("HIVE_REAL_ZDOTDIR", str(Path.home()))
+    original_zdotdir = _real_zdotdir(env)
 
     zdotdir = _DTACH_DIR / f".zdotdir-{hive_name}-{number}"
     zdotdir.mkdir(parents=True, exist_ok=True)

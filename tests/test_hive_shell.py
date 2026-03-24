@@ -49,6 +49,25 @@ def test_workspace_number():
     assert hive._workspace_number("repo") is None
 
 
+def test_real_zdotdir_defaults_to_home(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+
+    with patch.object(hive.Path, "home", return_value=home):
+        assert hive._real_zdotdir({}) == str(home)
+        assert hive._real_zdotdir({"ZDOTDIR": str(tmp_path / "legacy-zsh")}) == str(home)
+
+
+def test_real_zdotdir_preserves_nested_hive_original(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    original = tmp_path / "real-zsh"
+    original.mkdir()
+
+    with patch.object(hive.Path, "home", return_value=home):
+        assert hive._real_zdotdir({"HIVE_REAL_ZDOTDIR": str(original)}) == str(original)
+
+
 def test_socket_and_sidecar_paths():
     with patch.object(hive, "_DTACH_DIR", Path("/tmp/hive-dtach")):
         assert hive._socket_path("infra", "3") == Path("/tmp/hive-dtach/infra-3.sock")
