@@ -43,6 +43,13 @@ It avoids:
 - `local/env.local` for environment and PATH changes
 - `local/zshrc.local` for aliases, functions, and extra shell setup
 - `local/bin/` for private helper scripts
+- `ghostty/local.config` for machine-specific Ghostty overrides
+
+Template files in `local/` may be committed as examples using the normal
+`<real-file>.template` convention. The real file stays untracked. For example:
+
+- `ghostty/local.config.template` is committed
+- `ghostty/local.config` is machine-local and ignored
 
 This is the place for things like Node path tweaks, k3s helper scripts, or workstation-only tooling that should not be committed back to the public repo.
 

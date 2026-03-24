@@ -1,0 +1,6 @@
+# Machine-local Ghostty overrides.
+# Copy to `ghostty/local.config` and adjust for the font family names that
+# actually exist on this machine.
+#
+# Example on this macOS system:
+# font-family = MesloLGS Nerd Font Mono

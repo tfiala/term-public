@@ -1,7 +1,6 @@
 # Ghostty configuration
 
 theme = palenight
-font-family = MesloLGS Nerd Font
 font-size = 14
 
 background-opacity = 0.90
@@ -9,3 +8,7 @@ window-theme = dark
 
 macos-titlebar-style = tabs
 macos-option-as-alt = true
+
+# Machine-local Ghostty overrides. Typical use: font-family names that differ
+# across platforms or installations.
+config-file = ?local.config

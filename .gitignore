@@ -2,5 +2,8 @@
 /.pytest_cache/
 /tests/__pycache__/
 /.venv/
-/local/
+/local/*
+!/local/*.template
+/ghostty/local.config
+!/ghostty/*.template
 *.pyc
