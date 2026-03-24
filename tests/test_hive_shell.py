@@ -197,3 +197,49 @@ def test_shell_list_and_cleanup(dtach_dir, fake_hive, capsys):
 
     assert not sock.exists()
     assert not sidecar.exists()
+
+
+def test_generated_zsh_wrapper_sources_home_config(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    hive_root = tmp_path / "hive"
+    hive_root.mkdir()
+    workspace = hive_root / "repo-1"
+    workspace.mkdir()
+    dtach_dir = tmp_path / "hive-dtach"
+    dtach_dir.mkdir()
+
+    (home / ".zshenv").write_text("export FROM_REAL_ZSHENV=1\n")
+    (home / ".zshrc").write_text("export FROM_REAL_ZSHRC=1\n")
+    (home / "bin").mkdir()
+    (home / "bin" / "hive-shell-prompt.zsh").write_text(":\n")
+
+    captured: dict[str, object] = {}
+
+    def capture_execvpe(file, args, env):
+        captured["file"] = file
+        captured["args"] = args
+        captured["env"] = env
+        raise RuntimeError("stop after wrapper generation")
+
+    with patch.object(hive, "_DTACH_DIR", dtach_dir), \
+         patch.object(hive, "_socket_alive", return_value=False), \
+         patch.object(hive, "_write_sidecar"), \
+         patch.object(hive, "_hive_color", return_value={"name": "blue", "rgb": "97;150;255", "c256": "75"}), \
+         patch.object(hive.Path, "home", return_value=home), \
+         patch("os.chdir"), \
+         patch("os.execvpe", side_effect=capture_execvpe), \
+         patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+        with pytest.raises(RuntimeError, match="stop after wrapper generation"):
+            hive._launch_dtach(hive_root, "hive", workspace, "1")
+
+    env = captured["env"]
+    result = subprocess.run(
+        ["zsh", "-i", "-c", 'print -r -- "$HIVE_REAL_ZDOTDIR|$HISTFILE|$FROM_REAL_ZSHENV|$FROM_REAL_ZSHRC"'],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert result.stdout.strip() == f"{home}|{home}/.zsh_history|1|1"

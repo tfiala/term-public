@@ -8,25 +8,34 @@ rm -f "${XDG_CACHE_HOME:-$HOME/.cache}"/p10k-instant-prompt-*.zsh.zwc 2>/dev/nul
 
 _hive_last_branch=""
 _hive_pr_cache="/tmp/hive-dtach/${HIVE_NAME}-${HIVE_NUMBER}.pr"
+_hive_term_public_root="${TERM_PUBLIC_ROOT:-${${(%):-%N}:A:h:h}}"
+_hive_prompt_helper="${_hive_term_public_root}/scripts/hive_prompt.py"
 
 _hive_git_branch() {
   git rev-parse --abbrev-ref HEAD 2>/dev/null
 }
 
+_hive_origin_url() {
+  git remote get-url origin 2>/dev/null
+}
+
+_hive_pr_cli() {
+  local origin_url
+  origin_url=$(_hive_origin_url) || return
+  [[ -r "$_hive_prompt_helper" ]] || return
+  python3 "$_hive_prompt_helper" cli "$origin_url" 2>/dev/null
+}
+
 _hive_fetch_pr() {
   local branch="$1"
-  local pr_json num
+  local cli pr_json num
 
-  command -v fj >/dev/null 2>&1 || return
+  cli=$(_hive_pr_cli) || return
+  [[ -n "$cli" ]] || return
 
-  pr_json=$(fj pr list --json --state open --head "$branch" 2>/dev/null)
+  pr_json=$($cli pr list --json number --state open --head "$branch" 2>/dev/null)
   if [[ -n "$pr_json" ]]; then
-    num=$(printf '%s' "$pr_json" | python3 -c '
-import json, sys
-data = json.load(sys.stdin)
-if data:
-    print(data[0].get("number", ""))
-' 2>/dev/null)
+    num=$(printf '%s' "$pr_json" | python3 "$_hive_prompt_helper" number 2>/dev/null)
     [[ -n "$num" ]] && printf '%s' "$num" > "$_hive_pr_cache" || : > "$_hive_pr_cache"
   else
     : > "$_hive_pr_cache"
