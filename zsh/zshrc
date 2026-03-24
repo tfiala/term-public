@@ -1,5 +1,11 @@
 # Minimal zsh baseline for term-public.
 
+if [[ -z "${TERM_PUBLIC_ROOT:-}" ]]; then
+  export TERM_PUBLIC_ROOT="${${(%):-%N}:A:h:h}"
+fi
+
+export TERM_PUBLIC_LOCAL_DIR="${TERM_PUBLIC_ROOT}/local"
+
 if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]; then
   source "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh"
 fi
@@ -9,6 +15,13 @@ export XDG_DATA_HOME="${XDG_DATA_HOME:=$HOME/.local/share}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:=$HOME/.cache}"
 
 export PATH="$HOME/bin:$PATH"
+if [[ -d "${TERM_PUBLIC_LOCAL_DIR}/bin" ]]; then
+  export PATH="${TERM_PUBLIC_LOCAL_DIR}/bin:$PATH"
+fi
+
+if [[ -f "${TERM_PUBLIC_LOCAL_DIR}/env.local" ]]; then
+  source "${TERM_PUBLIC_LOCAL_DIR}/env.local"
+fi
 
 if [[ -n "${TERM_PUBLIC_P10K:-}" && -f "${TERM_PUBLIC_P10K}" ]]; then
   source "${TERM_PUBLIC_P10K}"
@@ -26,6 +39,10 @@ if [[ -d "$ZSH" ]]; then
 
   plugins=(git)
   source "$ZSH/oh-my-zsh.sh"
+fi
+
+if [[ -f "${TERM_PUBLIC_LOCAL_DIR}/zshrc.local" ]]; then
+  source "${TERM_PUBLIC_LOCAL_DIR}/zshrc.local"
 fi
 
 bindkey -v

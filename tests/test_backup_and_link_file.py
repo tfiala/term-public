@@ -3,6 +3,7 @@
 import os
 import re
 import subprocess
+from pathlib import Path
 
 
 SETUP_SH = os.path.join(os.path.dirname(__file__), "..", "setup.sh")
@@ -94,3 +95,35 @@ def test_backs_up_directory(tmp_path):
     backup = tmp_path / "dest_dir.bak"
     assert backup.is_dir()
     assert (backup / "precious.txt").read_text() == "keep me"
+
+
+def test_setup_creates_local_overlay_skeleton(tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+
+    (repo_root / "setup.sh").write_text(Path(SETUP_SH).read_text())
+    (repo_root / "ghostty").mkdir()
+    (repo_root / "zsh").mkdir()
+    (repo_root / "scripts").mkdir()
+    (repo_root / "ghostty" / "config").write_text("ghostty = true\n")
+    (repo_root / "zsh" / "zshrc").write_text("export TEST_ZSHRC=1\n")
+    (repo_root / "zsh" / "hive-shell-prompt.zsh").write_text("# prompt helper\n")
+    (repo_root / "p10k.zsh").write_text("# p10k\n")
+    (repo_root / "scripts" / "hive.py").write_text("#!/usr/bin/env python3\n")
+
+    result = subprocess.run(
+        ["zsh", "setup.sh"],
+        cwd=repo_root,
+        env={**os.environ, "HOME": str(home)},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert (repo_root / "local" / "bin").is_dir()
+    assert (repo_root / "local" / "env.local").exists()
+    assert (repo_root / "local" / "zshrc.local").exists()
+    assert (home / ".zshrc").is_symlink()
+    assert (home / "bin" / "hive").is_symlink()

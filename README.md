@@ -28,12 +28,23 @@ It avoids:
 - `scripts/hive.py` hive/apiary/dtach entrypoint
 - `setup.sh` symlink installer
 - `setup/bootstrap-macos.sh` package/bootstrap helper
+- `local/` untracked per-machine overlay created by `setup.sh`
 
 ## Install
 
 1. Run `setup/bootstrap-macos.sh` to install baseline dependencies.
 2. Run `./setup.sh` from the repo root to link config files into place.
 3. Restart Ghostty and open a new shell.
+
+## Per-Machine Overlay
+
+`setup.sh` creates an untracked `local/` directory in the repo for machine-specific additions.
+
+- `local/env.local` for environment and PATH changes
+- `local/zshrc.local` for aliases, functions, and extra shell setup
+- `local/bin/` for private helper scripts
+
+This is the place for things like Node path tweaks, k3s helper scripts, or workstation-only tooling that should not be committed back to the public repo.
 
 ## Hive Shell
 
