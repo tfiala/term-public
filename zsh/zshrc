@@ -41,8 +41,16 @@ if [[ -d "$ZSH" ]]; then
   source "$ZSH/oh-my-zsh.sh"
 fi
 
+if [[ -r "$HOME/.zplug/repos/zsh-users/zsh-autosuggestions/zsh-autosuggestions.zsh" ]]; then
+  source "$HOME/.zplug/repos/zsh-users/zsh-autosuggestions/zsh-autosuggestions.zsh"
+fi
+
 if [[ -f "${TERM_PUBLIC_LOCAL_DIR}/zshrc.local" ]]; then
   source "${TERM_PUBLIC_LOCAL_DIR}/zshrc.local"
 fi
 
 bindkey -v
+if (( $+widgets[autosuggest-accept] )); then
+  bindkey '^[[C' autosuggest-accept
+  bindkey -M viins '^[[C' autosuggest-accept
+fi
