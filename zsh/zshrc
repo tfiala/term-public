@@ -63,6 +63,7 @@ if [[ -f "${TERM_PUBLIC_LOCAL_DIR}/zshrc.local" ]]; then
 fi
 
 bindkey -v
+bindkey -M viins 'jk' vi-cmd-mode
 if (( $+widgets[autosuggest-accept] )); then
   bindkey '^[[C' autosuggest-accept
   bindkey -M viins '^[[C' autosuggest-accept
