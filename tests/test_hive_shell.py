@@ -789,8 +789,8 @@ class TestPullEngine:
         mock_git.assert_called_once()
         assert cache.remote_shas == {}
 
-    def test_dirty_repo_with_cache_hit_returns_cached(self, tmp_path):
-        """A dirty repo whose HEAD matches cache returns cached, not skipped."""
+    def test_dirty_repo_with_cache_hit_returns_skipped(self, tmp_path):
+        """A dirty repo is always reported as dirty, even on cache hit."""
         repo = tmp_path / 'repo'
         repo.mkdir()
         origin_url = 'ssh://git@host/org/repo'
@@ -813,9 +813,9 @@ class TestPullEngine:
             with patch.object(hive, '_git') as mock_git:
                 result = self._pull(repo, cache=cache)
 
-        assert result.cached is True
-        assert result.up_to_date is True
-        assert result.skipped is False
+        assert result.skipped is True
+        assert result.dirty_count == 1
+        assert result.cached is False
         mock_git.assert_not_called()
 
     def test_different_branches_same_origin_no_collision(self, tmp_path):

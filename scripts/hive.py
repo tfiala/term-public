@@ -736,6 +736,14 @@ def analyze_repo(repo_path: Path, remote_profile: RemoteProfile,
         action=SyncAction.PULL,
     )
 
+    # Check for uncommitted changes before anything else — a dirty repo
+    # must always be reported as dirty, even if its HEAD matches the cache.
+    porcelain = _git_out(['status', '--porcelain'], cwd=repo_path)
+    if porcelain and porcelain != '':
+        status.action = SyncAction.SKIP_DIRTY
+        status.dirty_count = len(porcelain.splitlines())
+        return status
+
     # Check pull cache — if HEAD matches last successful pull, skip
     if remote_cache is not None and remote_url:
         head_sha = _git_out(['rev-parse', 'HEAD'], cwd=repo_path)
@@ -747,13 +755,6 @@ def analyze_repo(repo_path: Path, remote_profile: RemoteProfile,
             status.action = SyncAction.NONE
             return status
         remote_cache.cache_misses += 1
-
-    # Check for uncommitted changes
-    porcelain = _git_out(['status', '--porcelain'], cwd=repo_path)
-    if porcelain and porcelain != '':
-        status.action = SyncAction.SKIP_DIRTY
-        status.dirty_count = len(porcelain.splitlines())
-        return status
 
     return status
 
