@@ -1,4 +1,4 @@
-"""Tests for the TERM/TERMINFO fixup at the top of zsh/zshrc."""
+"""Tests for the TERM/TERMINFO fixup in zsh/zshenv."""
 
 import os
 import subprocess
@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 
+ZSHENV = str(Path(__file__).resolve().parents[1] / "zsh" / "zshenv")
 ZSHRC = str(Path(__file__).resolve().parents[1] / "zsh" / "zshrc")
 
 # The terminfo guard block, extracted so tests can run it in isolation
@@ -43,21 +44,18 @@ def _base_env(**overrides: str) -> dict[str, str]:
     return env
 
 
-class TestTerminfoGuardInZshrc:
-    """Verify the terminfo guard block exists in zshrc with correct structure."""
+class TestTerminfoGuardLocation:
+    """Verify the terminfo guard lives in zshenv, not zshrc."""
 
-    def test_guard_block_present(self):
-        text = Path(ZSHRC).read_text()
+    def test_guard_block_in_zshenv(self):
+        text = Path(ZSHENV).read_text()
         assert "infocmp" in text
         assert "xterm-256color" in text
 
-    def test_guard_before_p10k_instant_prompt(self):
+    def test_guard_not_in_zshrc(self):
+        """The guard must live in zshenv (before terminal init), not zshrc."""
         text = Path(ZSHRC).read_text()
-        infocmp_pos = text.index("infocmp")
-        p10k_pos = text.index("p10k-instant-prompt")
-        assert infocmp_pos < p10k_pos, (
-            "terminfo guard must run before p10k instant prompt"
-        )
+        assert "infocmp" not in text
 
 
 class TestTerminfoResolvable:

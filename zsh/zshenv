@@ -1,0 +1,19 @@
+# term-public zshenv — sourced before zsh initializes the terminal.
+#
+# Ghostty sets TERM=xterm-ghostty but SSH only forwards TERM, not TERMINFO.
+# If the remote host lacks the terminfo entry, zsh cannot initialize the
+# terminal at all.  This must run in .zshenv (not .zshrc) because zsh
+# reads the terminal definition after .zshenv but before .zshrc.
+if (( $+commands[infocmp] )) && ! infocmp "$TERM" &>/dev/null; then
+  if [[ "$TERM" == *ghostty* \
+      && -d /Applications/Ghostty.app/Contents/Resources/terminfo ]]; then
+    export TERMINFO=/Applications/Ghostty.app/Contents/Resources/terminfo
+  else
+    export TERM=xterm-256color
+  fi
+fi
+
+# Source the user's prior .zshenv if setup.sh backed it up.
+if [[ -f "$HOME/.zshenv.bak" ]]; then
+  source "$HOME/.zshenv.bak"
+fi
