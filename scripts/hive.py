@@ -871,6 +871,8 @@ def _is_notable(result: RepoStatus, default_branch: str) -> bool:
     """Return True when a pull result should be shown in quiet mode."""
     return (
         result.branch != default_branch
+        or result.pulled
+        or result.pushed
         or result.skipped
         or result.pull_failed
         or result.push_failed

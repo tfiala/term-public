@@ -13,7 +13,8 @@ ZSHRC = str(Path(__file__).resolve().parents[1] / "zsh" / "zshrc")
 # without sourcing the rest of zshrc (which needs oh-my-zsh, etc.).
 _TERMINFO_GUARD = """\
 if (( $+commands[infocmp] )) && ! infocmp "$TERM" &>/dev/null; then
-  if [[ -d /Applications/Ghostty.app/Contents/Resources/terminfo ]]; then
+  if [[ "$TERM" == *ghostty* \\
+      && -d /Applications/Ghostty.app/Contents/Resources/terminfo ]]; then
     export TERMINFO=/Applications/Ghostty.app/Contents/Resources/terminfo
   else
     export TERM=xterm-256color
@@ -104,20 +105,15 @@ class TestTerminfoUnresolvable:
             assert "TERM=xterm-256color" in r.stdout
 
     def test_bogus_term_falls_back(self):
-        """A completely unknown TERM value should trigger the fallback."""
-        ghostty_ti = Path("/Applications/Ghostty.app/Contents/Resources/terminfo")
+        """A non-ghostty unknown TERM always falls back to xterm-256color."""
         env = _base_env(TERM="xterm-totally-bogus-12345")
         r = _run_zsh_snippet(
             _TERMINFO_GUARD + 'echo "TERM=$TERM TERMINFO=${TERMINFO:-unset}"',
             env,
         )
         assert r.returncode == 0
-        if ghostty_ti.is_dir():
-            # Ghostty bundle exists — guard sets TERMINFO rather than
-            # changing TERM, even for non-ghostty TERM values.
-            assert f"TERMINFO={ghostty_ti}" in r.stdout
-        else:
-            assert "TERM=xterm-256color" in r.stdout
+        assert "TERM=xterm-256color" in r.stdout
+        assert "TERMINFO=unset" in r.stdout
 
 
 class TestTerminfoGhosttyBundle:
