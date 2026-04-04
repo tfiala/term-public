@@ -203,11 +203,12 @@ def _scaffold_repo(tmp_path):
 
 
 def _run_setup(repo_root, home, extra_env=None):
-    """Run setup.sh in a fake repo with the given HOME."""
+    """Run setup.sh in a fake repo with the given HOME.
+
+    Inherits the real environment (including TERMINFO if set by Ghostty)
+    so tests exercise the same code path a user would hit.
+    """
     env = {**os.environ, "HOME": str(home)}
-    # Clear TERMINFO so infocmp only searches ~/.terminfo (under fake HOME)
-    # and system dirs — not the running Ghostty's bundle.
-    env.pop("TERMINFO", None)
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
