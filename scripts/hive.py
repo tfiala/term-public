@@ -55,7 +55,9 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
@@ -203,6 +205,86 @@ def _git_out(args: list[str], cwd: str | Path | None = None) -> str | None:
 
 
 # --- Pull cache ---------------------------------------------------------------
+
+
+class SyncAction(Enum):
+    """Possible sync actions for a repo."""
+
+    NONE = 'none'
+    PUSH = 'push'
+    PULL = 'pull'
+    SKIP_DIRTY = 'skip_dirty'
+    SKIP_NOT_DEFAULT = 'skip_not_default'
+    SKIP_NO_REMOTE = 'skip_no_remote'
+    SKIP_NO_BRANCH_ON_REMOTE = 'skip_no_branch_on_remote'
+    ERROR = 'error'
+
+
+@dataclass(frozen=True)
+class RemoteProfile:
+    """Remote-specific behavior for sync operations."""
+
+    name: str
+    pull_args: tuple[str, ...]
+    push_enabled: bool = False
+
+
+@dataclass
+class RepoStatus:
+    """Structured status for a single repo sync operation."""
+
+    path: Path
+    branch: str
+    remote_profile: RemoteProfile
+    action: SyncAction
+    remote_url: str | None = None
+    dirty_count: int = 0
+    up_to_date: bool = False
+    pulled: bool = False
+    cached: bool = False
+    error_lines: list[str] = field(default_factory=list)
+    pushed: bool = False
+    push_failed: bool = False
+
+    @property
+    def skipped(self) -> bool:
+        return self.action == SyncAction.SKIP_DIRTY
+
+    @property
+    def pull_failed(self) -> bool:
+        return self.action == SyncAction.ERROR
+
+
+@dataclass
+class RemoteCache:
+    """Cache remote state for one `hive pull` invocation."""
+
+    remote_shas: dict[str, dict[str, str]] = field(default_factory=dict)
+    synced_paths: dict[str, dict[str, Path]] = field(default_factory=dict)
+    cache_hits: int = 0
+    cache_misses: int = 0
+    local_pulls: int = 0
+
+    def get_remote_sha(self, remote_url: str, branch: str) -> str | None:
+        """Get a cached remote SHA, or None when not present."""
+        return self.remote_shas.get(remote_url, {}).get(branch)
+
+    def set_remote_sha(self, remote_url: str, branch: str, sha: str) -> None:
+        """Cache the remote SHA for a remote URL + branch."""
+        if remote_url not in self.remote_shas:
+            self.remote_shas[remote_url] = {}
+        self.remote_shas[remote_url][branch] = sha
+
+    def get_synced_path(self, remote_url: str, branch: str) -> Path | None:
+        """Get a local path known to be synced to the remote."""
+        return self.synced_paths.get(remote_url, {}).get(branch)
+
+    def set_synced_path(self, remote_url: str, branch: str, path: Path) -> None:
+        """Record that a local path is synced to the remote."""
+        if remote_url not in self.synced_paths:
+            self.synced_paths[remote_url] = {}
+        self.synced_paths[remote_url][branch] = path
+        self.local_pulls += 1
 
 
 def _normalize_origin_url(url: str) -> str:
@@ -632,172 +714,261 @@ def cmd_status(args: argparse.Namespace) -> None:
 # --- Pull ---------------------------------------------------------------------
 
 
-def _do_pull(repo_path: Path, push: bool,
-             pull_cache: dict[str, str] | None = None) -> dict:
-    """Pull a repo and return structured result (no output).
+_ORIGIN_REMOTE = RemoteProfile(
+    name='origin',
+    pull_args=('pull', '--rebase'),
+)
 
-    Keys: branch, skipped, dirty_count, up_to_date, pulled, pull_failed,
-          cached, error_lines, pushed, push_failed.
 
-    pull_cache is an in-memory dict (``origin_url#branch`` -> HEAD SHA)
-    scoped to a single cmd_pull invocation.  It deduplicates same-origin,
-    same-branch clones within one workspace scan but is NOT persisted
-    across invocations, so every new ``hive pull`` always contacts the
-    remote at least once per origin+branch pair.
-    """
+def analyze_repo(repo_path: Path, remote_profile: RemoteProfile,
+                 remote_cache: RemoteCache | None = None) -> RepoStatus:
+    """Analyze a repo and return the sync action to execute."""
     branch = _git_out(['rev-parse', '--abbrev-ref', 'HEAD'], cwd=repo_path) or '(unknown)'
+    remote_url = None
+    if remote_cache is not None and remote_profile.name == 'origin':
+        remote_url = _get_origin_url(repo_path)
 
-    result = {
-        'branch': branch,
-        'skipped': False,
-        'dirty_count': 0,
-        'up_to_date': False,
-        'pulled': False,
-        'pull_failed': False,
-        'cached': False,
-        'error_lines': [],
-        'pushed': False,
-        'push_failed': False,
-    }
+    status = RepoStatus(
+        path=repo_path,
+        branch=branch,
+        remote_profile=remote_profile,
+        remote_url=remote_url,
+        action=SyncAction.PULL,
+    )
 
     # Check pull cache — if HEAD matches last successful pull, skip
-    origin_url = _get_origin_url(repo_path) if pull_cache is not None else None
-    cache_key = f'{origin_url}#{branch}' if origin_url else None
-    if cache_key and pull_cache is not None:
+    if remote_cache is not None and remote_url:
         head_sha = _git_out(['rev-parse', 'HEAD'], cwd=repo_path)
-        if head_sha and pull_cache.get(cache_key) == head_sha:
-            result['cached'] = True
-            result['up_to_date'] = True
-            return result
+        cached_sha = remote_cache.get_remote_sha(remote_url, branch)
+        if head_sha and cached_sha == head_sha:
+            remote_cache.cache_hits += 1
+            status.cached = True
+            status.up_to_date = True
+            status.action = SyncAction.NONE
+            return status
+        remote_cache.cache_misses += 1
 
     # Check for uncommitted changes
     porcelain = _git_out(['status', '--porcelain'], cwd=repo_path)
     if porcelain and porcelain != '':
-        result['skipped'] = True
-        result['dirty_count'] = len(porcelain.splitlines())
-        return result
+        status.action = SyncAction.SKIP_DIRTY
+        status.dirty_count = len(porcelain.splitlines())
+        return status
+
+    return status
+
+
+def execute_sync(status: RepoStatus, remote_cache: RemoteCache | None = None,
+                 push: bool = False) -> RepoStatus:
+    """Execute the planned sync action for a repo."""
+    if status.action != SyncAction.PULL:
+        return status
 
     # Pull --rebase
-    r = _git(['pull', '--rebase', 'origin', branch], cwd=repo_path, timeout=30)
+    r = _git(
+        [*status.remote_profile.pull_args, status.remote_profile.name, status.branch],
+        cwd=status.path,
+        timeout=30,
+    )
     if r.returncode != 0:
-        _git(['rebase', '--abort'], cwd=repo_path)
-        result['pull_failed'] = True
+        _git(['rebase', '--abort'], cwd=status.path)
+        status.action = SyncAction.ERROR
         stderr = r.stderr.strip()
         if stderr:
-            result['error_lines'] = stderr.splitlines()[:3]
-        return result
+            status.error_lines = stderr.splitlines()[:3]
+        return status
 
     # Determine pull outcome
     stdout = r.stdout.strip()
     if 'Already up to date' in stdout or 'Already up-to-date' in stdout:
-        result['up_to_date'] = True
+        status.up_to_date = True
     else:
-        result['pulled'] = True
+        status.pulled = True
 
     # Update pull cache with new HEAD
-    if pull_cache is not None and cache_key:
-        new_sha = _git_out(['rev-parse', 'HEAD'], cwd=repo_path)
+    if remote_cache is not None and status.remote_url:
+        new_sha = _git_out(['rev-parse', 'HEAD'], cwd=status.path)
         if new_sha:
-            pull_cache[cache_key] = new_sha
+            remote_cache.set_remote_sha(status.remote_url, status.branch, new_sha)
 
     # Optional push
     if push:
-        rp = _git(['push', 'origin', branch], cwd=repo_path, timeout=30)
+        rp = _git(['push', status.remote_profile.name, status.branch],
+                  cwd=status.path, timeout=30)
         if rp.returncode != 0:
-            result['push_failed'] = True
-            return result
-        result['pushed'] = True
+            status.push_failed = True
+            return status
+        status.pushed = True
 
-    return result
+    return status
 
 
 def _pull_repo(repo_path: Path, push: bool, indent: str = '  ',
-               pull_cache: dict[str, str] | None = None) -> bool:
+               pull_cache: RemoteCache | None = None) -> bool:
     """Pull a single repo with verbose output. Returns True on success."""
-    result = _do_pull(repo_path, push, pull_cache=pull_cache)
+    result = execute_sync(
+        analyze_repo(repo_path, _ORIGIN_REMOTE, remote_cache=pull_cache),
+        remote_cache=pull_cache,
+        push=push,
+    )
 
-    if result['skipped']:
-        n = result['dirty_count']
+    if result.skipped:
+        n = result.dirty_count
         print(f'{indent}{CROSS()} skipped — {n} uncommitted file{"s" if n != 1 else ""}')
         return False
 
-    if result['pull_failed']:
-        print(f'{indent}{CROSS()} pull --rebase failed on {result["branch"]}')
-        for line in result['error_lines']:
+    if result.pull_failed:
+        print(f'{indent}{CROSS()} pull --rebase failed on {result.branch}')
+        for line in result.error_lines:
             print(f'{indent}  {C.dim(line)}')
         return False
 
-    if result['up_to_date']:
-        cached = ' (cached)' if result['cached'] else ''
-        print(f'{indent}{CHECK()} {result["branch"]} — already up to date{cached}')
+    if result.up_to_date:
+        cached = ' (cached)' if result.cached else ''
+        print(f'{indent}{CHECK()} {result.branch} — already up to date{cached}')
     else:
-        print(f'{indent}{CHECK()} {result["branch"]} — pulled')
+        print(f'{indent}{CHECK()} {result.branch} — pulled')
 
-    if result['push_failed']:
+    if result.push_failed:
         print(f'{indent}{CROSS()} push failed')
         return False
 
-    if result['pushed']:
+    if result.pushed:
         print(f'{indent}{CHECK()} pushed')
 
     return True
 
 
-def _format_pull_segment(result: dict) -> str:
+def _format_pull_segment(result: RepoStatus) -> str:
     """Format a compact one-line segment from a pull result.
 
     Examples: "✓ main — up to date", "✗ skipped 3!", "✓ main — pulled + pushed"
     """
-    if result['skipped']:
-        return f'{CROSS()} skipped {result["dirty_count"]}!'
+    if result.skipped:
+        return f'{CROSS()} skipped {result.dirty_count}!'
 
-    if result['pull_failed']:
-        return f'{CROSS()} {result["branch"]} — rebase failed'
+    if result.pull_failed:
+        return f'{CROSS()} {result.branch} — rebase failed'
 
     parts = []
-    if result['up_to_date']:
-        label = 'up to date (cached)' if result['cached'] else 'up to date'
+    if result.up_to_date:
+        label = 'up to date (cached)' if result.cached else 'up to date'
         parts.append(label)
     else:
         parts.append('pulled')
 
-    if result['push_failed']:
-        return f'{CROSS()} {result["branch"]} — {parts[0]}, push failed'
+    if result.push_failed:
+        return f'{CROSS()} {result.branch} — {parts[0]}, push failed'
 
-    if result['pushed']:
+    if result.pushed:
         parts.append('pushed')
 
     mark = CHECK()
-    return f'{mark} {result["branch"]} — {" + ".join(parts)}'
+    return f'{mark} {result.branch} — {" + ".join(parts)}'
+
+
+def _is_notable(result: RepoStatus, default_branch: str) -> bool:
+    """Return True when a pull result should be shown in quiet mode."""
+    return (
+        result.branch != default_branch
+        or result.skipped
+        or result.pull_failed
+        or result.push_failed
+    )
 
 
 def _pull_single_hive(hive: Path, compact: bool, push: bool,
                       resolve_branches: bool = False,
-                      pull_cache: dict[str, str] | None = None) -> None:
+                      pull_cache: RemoteCache | None = None,
+                      quiet: bool = False,
+                      render: bool = True) -> dict | None:
     """Pull all repos in a single hive."""
     repos = _discover_repos(hive)
 
     if not repos:
         print(f'  {CROSS()} No git repos found in hive')
-        return
+        return None
 
     if compact:
         spinner = _Spinner()
 
         # Pull all repos with spinner progress
-        rows: list[tuple[str, dict, list[tuple[str, dict]]]] = []
+        rows: list[tuple[str, RepoStatus, list[tuple[str, RepoStatus]]]] = []
         for repo_path, nested in repos:
             spinner.start(f'Pulling {repo_path.name}...')
-            result = _do_pull(repo_path, push=push, pull_cache=pull_cache)
+            result = execute_sync(
+                analyze_repo(repo_path, _ORIGIN_REMOTE, remote_cache=pull_cache),
+                remote_cache=pull_cache,
+                push=push,
+            )
             nested_rows = []
             for n in nested:
                 spinner.update(f'Pulling {n.name}...')
-                n_result = _do_pull(n, push=push, pull_cache=pull_cache)
+                n_result = execute_sync(
+                    analyze_repo(n, _ORIGIN_REMOTE, remote_cache=pull_cache),
+                    remote_cache=pull_cache,
+                    push=push,
+                )
                 rel = str(n.relative_to(repo_path))
                 nested_rows.append((rel, n_result))
             rows.append((repo_path.name, result, nested_rows))
 
         spinner.stop()
+
+        if quiet:
+            visible_rows: list[tuple[str, RepoStatus | None, list[tuple[str, RepoStatus]]]] = []
+            rendered_lines: list[str] = []
+            clean_count = 0
+            for (repo_path, nested_paths), (name, result, nested_rows) in zip(repos, rows):
+                default_branch = _default_branch(repo_path)
+                repo_notable = _is_notable(result, default_branch)
+                visible_nested = []
+                if repo_notable:
+                    visible_rows.append((name, result, []))
+                else:
+                    clean_count += 1
+
+                for nested_path, (nname, nresult) in zip(nested_paths, nested_rows):
+                    nested_default = _default_branch(nested_path)
+                    if _is_notable(nresult, nested_default):
+                        visible_nested.append((nname, nresult))
+                    else:
+                        clean_count += 1
+
+                if repo_notable:
+                    visible_rows[-1] = (name, result, visible_nested)
+                elif visible_nested:
+                    visible_rows.append((name, None, visible_nested))
+
+            if visible_rows:
+                max_name = max(len(name) for name, _, _ in visible_rows)
+                for name, result, nested_rows in visible_rows:
+                    if result is not None:
+                        name_pad = ' ' * (max_name - len(name))
+                        segment = _format_pull_segment(result)
+                        rendered_lines.append(f'  {name}{name_pad}  {segment}')
+                    for nname, nresult in nested_rows:
+                        nseg = _format_pull_segment(nresult)
+                        # Include parent name when parent wasn't shown
+                        display_name = nname if result is not None else f'{name}/{nname}'
+                        rendered_lines.append(
+                            f'    {C.dim("↳")} {C.dim(display_name)}  {nseg}')
+            if clean_count:
+                noun = 'repo' if clean_count == 1 else 'repos'
+                rendered_lines.append(f'  {clean_count} {noun} clean / up to date')
+
+            summary = {
+                'repo_count': sum(1 + len(nested) for _, nested in repos),
+                'clean_count': clean_count,
+                'all_clean': len(visible_rows) == 0,
+                'lines': rendered_lines,
+            }
+            if render:
+                for line in rendered_lines:
+                    print(line)
+            if resolve_branches:
+                _resolve_branches_for_hive(hive)
+            return summary
 
         # Calculate column widths and print aligned
         max_name = max(len(name) for name, _, _ in rows)
@@ -825,25 +996,49 @@ def _pull_single_hive(hive: Path, compact: bool, push: bool,
 
     if resolve_branches:
         _resolve_branches_for_hive(hive)
+    return None
 
 
 def cmd_pull(args: argparse.Namespace) -> None:
     """Execute the pull subcommand."""
-    compact = getattr(args, 'compact', False)
+    quiet = getattr(args, 'quiet', False)
+    compact = getattr(args, 'compact', False) or quiet
     apiary = getattr(args, 'apiary', False)
     resolve_branches = getattr(args, 'resolve_branches', False)
-    pull_cache: dict[str, str] = {}  # deduplicates same-origin repos within this run
+    pull_cache = RemoteCache()  # deduplicates same-origin repos within this run
 
     if apiary:
         hives = _load_apiary()
         if not hives:
             print(f'{CROSS()} No apiary config found at {_APIARY_CONFIG}', file=sys.stderr)
             sys.exit(1)
+        if quiet:
+            valid = [h for h in hives if h.is_dir()]
+            print(f'Apiary: {len(valid)} hive{"s" if len(valid) != 1 else ""}\n')
+            for hive_path in valid:
+                summary = _pull_single_hive(
+                    hive_path,
+                    compact,
+                    args.push,
+                    resolve_branches,
+                    pull_cache=pull_cache,
+                    quiet=quiet,
+                    render=False,
+                )
+                display = _display_path(hive_path)
+                if summary and summary['all_clean']:
+                    print(f'━━ {display} ━━  (all {summary["clean_count"]} repos clean)')
+                else:
+                    print(f'━━ {display} ━━')
+                    for line in (summary or {}).get('lines', []):
+                        print(line)
+            return
         _run_apiary(
             hives,
             lambda h: _pull_single_hive(h, compact, args.push,
                                         resolve_branches,
-                                        pull_cache=pull_cache),
+                                        pull_cache=pull_cache,
+                                        quiet=quiet),
         )
         return
 
@@ -856,7 +1051,7 @@ def cmd_pull(args: argparse.Namespace) -> None:
 
     print(f'Hive: {C.dim(str(hive))}\n')
     _pull_single_hive(hive, compact, args.push, resolve_branches,
-                      pull_cache=pull_cache)
+                      pull_cache=pull_cache, quiet=quiet)
 
 
 # --- Branch Resolution (Claude-powered) --------------------------------------
@@ -2216,6 +2411,10 @@ def main():
     pull_parser.add_argument(
         '--compact', action='store_true',
         help='One-line-per-repo summary',
+    )
+    pull_parser.add_argument(
+        '-q', '--quiet', action='store_true',
+        help='Show only notable repos and a clean summary (implies --compact)',
     )
     pull_parser.add_argument(
         '--resolve-branches', action='store_true',
