@@ -129,3 +129,48 @@ def test_setup_creates_local_overlay_skeleton(tmp_path):
     assert (home / ".zshenv").is_symlink()
     assert (home / ".zshrc").is_symlink()
     assert (home / "bin" / "hive").is_symlink()
+
+
+def test_setup_preserves_existing_zshenv(tmp_path):
+    """A pre-existing .zshenv is backed up and sourced by the new one."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+
+    # Pre-existing user .zshenv with critical exports
+    (home / ".zshenv").write_text('export MY_CRITICAL_VAR=hello\n')
+
+    (repo_root / "setup.sh").write_text(Path(SETUP_SH).read_text())
+    (repo_root / "ghostty").mkdir()
+    (repo_root / "zsh").mkdir()
+    (repo_root / "scripts").mkdir()
+    (repo_root / "ghostty" / "config").write_text("ghostty = true\n")
+    zshenv_src = Path(__file__).resolve().parents[1] / "zsh" / "zshenv"
+    (repo_root / "zsh" / "zshenv").write_text(zshenv_src.read_text())
+    (repo_root / "zsh" / "zshrc").write_text("# zshrc\n")
+    (repo_root / "zsh" / "hive-shell-prompt.zsh").write_text("# prompt\n")
+    (repo_root / "p10k.zsh").write_text("# p10k\n")
+    (repo_root / "scripts" / "hive.py").write_text("#!/usr/bin/env python3\n")
+
+    result = subprocess.run(
+        ["zsh", "setup.sh"],
+        cwd=repo_root,
+        env={**os.environ, "HOME": str(home)},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+
+    # The original is backed up
+    assert (home / ".zshenv.bak").exists()
+    assert (home / ".zshenv.bak").read_text() == 'export MY_CRITICAL_VAR=hello\n'
+
+    # The new .zshenv sources the backup, so the user's var is still set
+    r = subprocess.run(
+        ["zsh", "-f", "-c",
+         f'HOME="{home}" source "{home}/.zshenv"; echo "$MY_CRITICAL_VAR"'],
+        capture_output=True,
+        text=True,
+    )
+    assert r.stdout.strip() == "hello"

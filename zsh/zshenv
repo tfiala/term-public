@@ -12,3 +12,8 @@ if (( $+commands[infocmp] )) && ! infocmp "$TERM" &>/dev/null; then
     export TERM=xterm-256color
   fi
 fi
+
+# Source the user's prior .zshenv if setup.sh backed it up.
+if [[ -f "$HOME/.zshenv.bak" ]]; then
+  source "$HOME/.zshenv.bak"
+fi
