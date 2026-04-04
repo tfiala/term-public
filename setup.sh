@@ -52,5 +52,19 @@ if [[ ! -f "$LOCAL_DIR/zshrc.local" ]]; then
 EOF
 fi
 
+# Install Ghostty terminfo into ~/.terminfo so zsh (and other programs)
+# can find xterm-ghostty without TERMINFO being set.  This is necessary
+# because zsh resolves the terminal definition before any startup file
+# (.zshenv, .zshrc) can set TERMINFO.
+if command -v infocmp >/dev/null 2>&1 && command -v tic >/dev/null 2>&1; then
+  if ! infocmp xterm-ghostty >/dev/null 2>&1; then
+    _ghostty_ti="/Applications/Ghostty.app/Contents/Resources/terminfo"
+    if [[ -d "$_ghostty_ti" ]]; then
+      TERMINFO="$_ghostty_ti" infocmp -x xterm-ghostty 2>/dev/null | tic -x - 2>/dev/null \
+        && echo "Installed xterm-ghostty terminfo to ~/.terminfo"
+    fi
+  fi
+fi
+
 echo "Linked config into place."
 echo "Local machine overlay is available in $LOCAL_DIR"

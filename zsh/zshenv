@@ -1,9 +1,12 @@
-# term-public zshenv — sourced before zsh initializes the terminal.
+# term-public zshenv.
 #
-# Ghostty sets TERM=xterm-ghostty but SSH only forwards TERM, not TERMINFO.
-# If the remote host lacks the terminfo entry, zsh cannot initialize the
-# terminal at all.  This must run in .zshenv (not .zshrc) because zsh
-# reads the terminal definition after .zshenv but before .zshrc.
+# The primary terminfo fix is in setup.sh, which installs xterm-ghostty
+# into ~/.terminfo so zsh finds it at startup.  This fallback handles
+# the case where setup.sh was not run (e.g. SSH from Ghostty to a host
+# that only has term-public checked out, not bootstrapped).
+#
+# NOTE: zsh may still print "can't find terminal definition" before this
+# file runs — the warning is cosmetic when the fallback sets TERM below.
 if (( $+commands[infocmp] )) && ! infocmp "$TERM" &>/dev/null; then
   if [[ "$TERM" == *ghostty* \
       && -d /Applications/Ghostty.app/Contents/Resources/terminfo ]]; then
