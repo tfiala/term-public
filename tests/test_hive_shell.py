@@ -49,23 +49,87 @@ def test_workspace_number():
     assert hive._workspace_number("repo") is None
 
 
-def test_real_zdotdir_defaults_to_home(tmp_path):
+def test_zdotdir_defaults_to_home(tmp_path):
+    """When no ZDOTDIR is set, _launch_dtach writes $HOME as HIVE_REAL_ZDOTDIR."""
     home = tmp_path / "home"
     home.mkdir()
+    hive_root = tmp_path / "hive"
+    hive_root.mkdir()
+    workspace = hive_root / "repo-1"
+    workspace.mkdir()
+    dtach_dir = tmp_path / "hive-dtach"
+    dtach_dir.mkdir()
 
-    with patch.object(hive.Path, "home", return_value=home):
-        assert hive._real_zdotdir({}) == str(home)
-        assert hive._real_zdotdir({"ZDOTDIR": str(tmp_path / "legacy-zsh")}) == str(home)
+    (home / "bin").mkdir()
+    (home / "bin" / "hive-shell-prompt.zsh").write_text(":\n")
+
+    captured: dict[str, object] = {}
+
+    def capture_execvpe(file, args, env):
+        captured["env"] = env
+        raise RuntimeError("stop")
+
+    with patch.object(hive, "_DTACH_DIR", dtach_dir), \
+         patch.object(hive, "_socket_alive", return_value=False), \
+         patch.object(hive, "_write_sidecar"), \
+         patch.object(hive, "_hive_color", return_value={"name": "blue", "rgb": "97;150;255", "c256": "75"}), \
+         patch.object(hive.Path, "home", return_value=home), \
+         patch("os.chdir"), \
+         patch("os.execvpe", side_effect=capture_execvpe), \
+         patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+        # Remove ZDOTDIR so the default (home) is used
+        os.environ.pop("ZDOTDIR", None)
+        with pytest.raises(RuntimeError, match="stop"):
+            hive._launch_dtach(hive_root, "hive", workspace, "1")
+
+    zdotdir = Path(captured["env"]["ZDOTDIR"])
+    zshenv = (zdotdir / ".zshenv").read_text()
+    assert f'HIVE_REAL_ZDOTDIR="{home}"' in zshenv
 
 
-def test_real_zdotdir_preserves_nested_hive_original(tmp_path):
+def test_zdotdir_resolves_nested_hive(tmp_path):
+    """When ZDOTDIR points to a hive wrapper dir, use HIVE_REAL_ZDOTDIR."""
     home = tmp_path / "home"
     home.mkdir()
     original = tmp_path / "real-zsh"
     original.mkdir()
+    hive_root = tmp_path / "hive"
+    hive_root.mkdir()
+    workspace = hive_root / "repo-1"
+    workspace.mkdir()
+    dtach_dir = tmp_path / "hive-dtach"
+    dtach_dir.mkdir()
 
-    with patch.object(hive.Path, "home", return_value=home):
-        assert hive._real_zdotdir({"HIVE_REAL_ZDOTDIR": str(original)}) == str(original)
+    (home / "bin").mkdir()
+    (home / "bin" / "hive-shell-prompt.zsh").write_text(":\n")
+
+    # Simulate being inside an existing hive shell
+    wrapper_zdotdir = str(dtach_dir / ".zdotdir-outer-1")
+
+    captured: dict[str, object] = {}
+
+    def capture_execvpe(file, args, env):
+        captured["env"] = env
+        raise RuntimeError("stop")
+
+    with patch.object(hive, "_DTACH_DIR", dtach_dir), \
+         patch.object(hive, "_socket_alive", return_value=False), \
+         patch.object(hive, "_write_sidecar"), \
+         patch.object(hive, "_hive_color", return_value={"name": "blue", "rgb": "97;150;255", "c256": "75"}), \
+         patch.object(hive.Path, "home", return_value=home), \
+         patch("os.chdir"), \
+         patch("os.execvpe", side_effect=capture_execvpe), \
+         patch.dict(os.environ, {
+             "HOME": str(home),
+             "ZDOTDIR": wrapper_zdotdir,
+             "HIVE_REAL_ZDOTDIR": str(original),
+         }, clear=False):
+        with pytest.raises(RuntimeError, match="stop"):
+            hive._launch_dtach(hive_root, "hive", workspace, "1")
+
+    zdotdir = Path(captured["env"]["ZDOTDIR"])
+    zshenv = (zdotdir / ".zshenv").read_text()
+    assert f'HIVE_REAL_ZDOTDIR="{original}"' in zshenv
 
 
 def test_socket_and_sidecar_paths():
