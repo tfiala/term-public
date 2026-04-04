@@ -28,6 +28,7 @@ mkdir -p "$HOME/bin"
 mkdir -p "$LOCAL_DIR/bin"
 
 backup_and_link_file "$ROOT_DIR/ghostty" "$CONFIG_HOME/ghostty"
+backup_and_link_file "$ROOT_DIR/zsh/zshenv" "$HOME/.zshenv"
 backup_and_link_file "$ROOT_DIR/zsh/zshrc" "$HOME/.zshrc"
 backup_and_link_file "$ROOT_DIR/p10k.zsh" "$HOME/.p10k.zsh"
 backup_and_link_file "$ROOT_DIR/scripts/hive.py" "$HOME/bin/hive"
