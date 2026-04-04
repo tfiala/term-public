@@ -1,5 +1,13 @@
 # Minimal zsh baseline for term-public.
 
+# When TERM is xterm-ghostty but TERMINFO is unset (e.g. SSH session where
+# Ghostty forwarded TERM but not TERMINFO), point to the Ghostty terminfo
+# so the terminal capabilities are known.
+if [[ "$TERM" == *ghostty* && -z "${TERMINFO:-}" \
+    && -d /Applications/Ghostty.app/Contents/Resources/terminfo ]]; then
+  export TERMINFO=/Applications/Ghostty.app/Contents/Resources/terminfo
+fi
+
 if [[ -z "${TERM_PUBLIC_ROOT:-}" ]]; then
   export TERM_PUBLIC_ROOT="${${(%):-%N}:A:h:h}"
 fi
