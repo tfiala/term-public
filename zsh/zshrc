@@ -1,11 +1,14 @@
 # Minimal zsh baseline for term-public.
 
-# When TERM is xterm-ghostty but TERMINFO is unset (e.g. SSH session where
-# Ghostty forwarded TERM but not TERMINFO), point to the Ghostty terminfo
-# so the terminal capabilities are known.
-if [[ "$TERM" == *ghostty* && -z "${TERMINFO:-}" \
-    && -d /Applications/Ghostty.app/Contents/Resources/terminfo ]]; then
-  export TERMINFO=/Applications/Ghostty.app/Contents/Resources/terminfo
+# Ghostty sets TERM=xterm-ghostty but SSH only forwards TERM, not TERMINFO.
+# If the remote host lacks the terminfo entry the terminal is unusable.
+# Try the macOS Ghostty app bundle first; otherwise fall back to xterm-256color.
+if (( $+commands[infocmp] )) && ! infocmp "$TERM" &>/dev/null; then
+  if [[ -d /Applications/Ghostty.app/Contents/Resources/terminfo ]]; then
+    export TERMINFO=/Applications/Ghostty.app/Contents/Resources/terminfo
+  else
+    export TERM=xterm-256color
+  fi
 fi
 
 if [[ -z "${TERM_PUBLIC_ROOT:-}" ]]; then
