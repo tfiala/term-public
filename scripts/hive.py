@@ -143,7 +143,7 @@ class _Spinner:
             with self._lock:
                 msg = self._message
             frame = _SPINNER_FRAMES[self._frame % len(_SPINNER_FRAMES)]
-            sys.stderr.write(f'\r  {C.cyan(frame)} {C.dim(msg)}')
+            sys.stderr.write(f'\r\033[K  {C.cyan(frame)} {C.dim(msg)}')
             sys.stderr.flush()
             self._frame += 1
             time.sleep(0.08)
