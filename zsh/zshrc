@@ -60,6 +60,44 @@ if [[ -r "$HOME/.zplug/repos/zsh-users/zsh-autosuggestions/zsh-autosuggestions.z
   source "$HOME/.zplug/repos/zsh-users/zsh-autosuggestions/zsh-autosuggestions.zsh"
 fi
 
+if [[ -x "$HOME/apps/nvim.appimage" ]]; then
+  alias nvim="$HOME/apps/nvim.appimage"
+fi
+
+if command -v nvim >/dev/null 2>&1; then
+  alias v='nvim'
+
+  _term_public_nvim_flavor_alias() {
+    local name="$1" appname="$2"
+    if [[ -d "${XDG_CONFIG_HOME:-$HOME/.config}/${appname}" ]]; then
+      alias "${name}=NVIM_APPNAME=${appname} nvim"
+    fi
+  }
+  _term_public_nvim_flavor_alias va  nvim-astro5
+  _term_public_nvim_flavor_alias var nvim-astro
+  _term_public_nvim_flavor_alias vl  nvim-lazyvim
+  _term_public_nvim_flavor_alias vn  nvim-nvchad
+  unfunction _term_public_nvim_flavor_alias
+
+  vv() {
+    local configs=()
+    local d name
+    for d in "${XDG_CONFIG_HOME:-$HOME/.config}"/nvim-*(/N); do
+      name="${d:t}"
+      configs+=("${name#nvim-}")
+    done
+    if (( ${#configs} == 0 )); then
+      print -u2 "vv: no nvim-* configs found under ${XDG_CONFIG_HOME:-$HOME/.config}"
+      return 1
+    fi
+    local config
+    select config in "${configs[@]}"; do
+      [[ -n "$config" ]] && NVIM_APPNAME="nvim-${config}" nvim "$@"
+      break
+    done
+  }
+fi
+
 if [[ -f "${TERM_PUBLIC_LOCAL_DIR}/zshrc.local" ]]; then
   source "${TERM_PUBLIC_LOCAL_DIR}/zshrc.local"
 fi
