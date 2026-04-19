@@ -60,10 +60,6 @@ if [[ -r "$HOME/.zplug/repos/zsh-users/zsh-autosuggestions/zsh-autosuggestions.z
   source "$HOME/.zplug/repos/zsh-users/zsh-autosuggestions/zsh-autosuggestions.zsh"
 fi
 
-if [[ -f "${TERM_PUBLIC_LOCAL_DIR}/zshrc.local" ]]; then
-  source "${TERM_PUBLIC_LOCAL_DIR}/zshrc.local"
-fi
-
 if [[ -x "$HOME/apps/nvim.appimage" ]]; then
   alias nvim="$HOME/apps/nvim.appimage"
 fi
@@ -85,9 +81,10 @@ if command -v nvim >/dev/null 2>&1; then
 
   vv() {
     local configs=()
-    local d
+    local d name
     for d in "${XDG_CONFIG_HOME:-$HOME/.config}"/nvim-*(/N); do
-      configs+=("${d:t#nvim-}")
+      name="${d:t}"
+      configs+=("${name#nvim-}")
     done
     if (( ${#configs} == 0 )); then
       print -u2 "vv: no nvim-* configs found under ${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -99,6 +96,10 @@ if command -v nvim >/dev/null 2>&1; then
       break
     done
   }
+fi
+
+if [[ -f "${TERM_PUBLIC_LOCAL_DIR}/zshrc.local" ]]; then
+  source "${TERM_PUBLIC_LOCAL_DIR}/zshrc.local"
 fi
 
 bindkey -v
