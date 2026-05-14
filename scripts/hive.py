@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Canonical source for the `hive` tool. Other repos vendor this file from
+# here at install time — make changes in tfiala/term-public, never in a
+# vendored copy.
 """hive.py - Multi-repo status, pull & create utility for the flow hive.
 
 Discovers all git repos in the hive (parent of current repo's git root)
@@ -13,7 +16,6 @@ Subcommands:
   local        Manage local repo checkouts in .local/
     clone      Clone a repo into .local/ (org/repo format)
     pull       Pull all repos in .local/
-  find-tmux-config  Print path to generated tmux config for current hive
   apiary       Manage the apiary (list/add/remove hives)
   tmux         Start or attach to a tmux dev session for a hive
     --list         List configured hives with their assigned colors
@@ -39,7 +41,6 @@ Examples:
   hive.py create --name-prefix my-project
   hive.py local clone hellenic-flow/corpus
   hive.py local pull
-  hive.py find-tmux-config
   hive.py apiary list
   hive.py apiary add ~/src/flow
   hive.py apiary remove ~/src/flow
@@ -392,20 +393,57 @@ def _display_path(path: Path) -> str:
 # --- Discovery ----------------------------------------------------------------
 
 
-def _find_hive_root() -> Path:
-    """Find the hive root using three-tier detection.
+def _looks_like_hive(path: Path) -> bool:
+    """True if ``path`` has at least one subdirectory that is a git repo."""
+    try:
+        entries = list(path.iterdir())
+    except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
+        return False
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        if (entry / '.git').exists():
+            return True
+    return False
+
+
+def _cwd_or_exit() -> Path:
+    """Return Path.cwd(), or exit with a clear message if cwd is invalid."""
+    try:
+        return Path.cwd()
+    except (FileNotFoundError, OSError) as exc:
+        print(
+            f'{CROSS()} Cannot determine current directory: {exc}',
+            file=sys.stderr,
+        )
+        print(
+            '  Your shell may be in a directory that was deleted or moved. '
+            'Try `cd` to a valid directory first.',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _find_hive_root() -> Path | None:
+    """Find the hive root using four-tier detection.
 
     1. Inside a hive member repo: return parent of git root.
-    2. At or under a configured apiary hive root: return the hive root.
-    3. Outside any hive: fail (caller handles apiary fallback).
+    2. Cwd itself is a hive base dir (contains git repo subdirs): return cwd.
+    3. At or under a configured apiary hive root: return the hive root.
+    4. Outside any hive: return None (caller handles apiary fallback).
     """
     # Tier 1: inside a git repo → parent is the hive root
     toplevel = _git_out(['rev-parse', '--show-toplevel'])
     if toplevel is not None:
         return Path(toplevel).parent
 
-    # Tier 2: at or under a configured apiary hive root (most specific wins)
-    cwd = Path.cwd()
+    cwd = _cwd_or_exit()
+
+    # Tier 2: cwd itself looks like a hive base dir
+    if _looks_like_hive(cwd):
+        return cwd
+
+    # Tier 3: at or under a configured apiary hive root (most specific wins)
     apiary_hives = _load_apiary()
     if apiary_hives:
         resolved_cwd = cwd.resolve()
@@ -419,7 +457,7 @@ def _find_hive_root() -> Path:
         if best is not None:
             return best[1]
 
-    # Tier 3: outside any hive
+    # Tier 4: outside any hive
     return None
 
 
@@ -1711,36 +1749,12 @@ def cmd_create(args: argparse.Namespace) -> None:
     print(f'{CHECK()} {target.name}')
 
 
-# --- Find Tmux Config ---------------------------------------------------------
-
-_TMUX_CONF_DIR = Path('/tmp/hive-tmux')
+# --- Hive name helpers --------------------------------------------------------
 
 
 def _short_name(hive: Path) -> str:
     """Get the short name (leaf directory) for a hive."""
     return hive.resolve().name
-
-
-def cmd_find_tmux_config(args: argparse.Namespace) -> None:
-    """Find the generated tmux config for the current hive.
-
-    Generated configs are stored at /tmp/hive-tmux/<name>.conf and are
-    created by `hive tmux` when launching a session.
-    """
-    hive = _find_hive_root()
-    if hive is None:
-        print(f'{CROSS()} Not inside a git repository or hive root', file=sys.stderr)
-        sys.exit(1)
-
-    name = _short_name(hive)
-    config_path = _TMUX_CONF_DIR / f'{name}.conf'
-
-    if not config_path.is_file():
-        print(f'{CROSS()} No generated config found at {config_path}', file=sys.stderr)
-        print(f'  Run `hive tmux` to generate the config.', file=sys.stderr)
-        sys.exit(1)
-
-    print(config_path)
 
 
 # --- Apiary management --------------------------------------------------------
@@ -2665,11 +2679,6 @@ def main():
         help='Explicit prefix (skips inference from existing repos)',
     )
 
-    sub.add_parser(
-        'find-tmux-config',
-        help='Find the hive tmux config at /tmp/hive-tmux/<name>.conf',
-    )
-
     local_parser = sub.add_parser('local', help='Manage local repo checkouts in .local/')
     local_sub = local_parser.add_subparsers(dest='local_action', required=True)
     local_clone_parser = local_sub.add_parser('clone', help='Clone a repo into .local/')
@@ -2731,8 +2740,6 @@ def main():
         cmd_create(args)
     elif args.command == 'local':
         cmd_local(args)
-    elif args.command == 'find-tmux-config':
-        cmd_find_tmux_config(args)
     elif args.command == 'apiary':
         cmd_apiary(args)
     elif args.command == 'tmux':
