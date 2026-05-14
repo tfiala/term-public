@@ -136,6 +136,28 @@ class TestParseForejoRemote:
         result = hive_ci_popup._parse_forgejo_remote(url)
         assert result is None
 
+    def test_returns_none_for_local_path(self) -> None:
+        """Local filesystem remotes are not Forgejo repos — must return None,
+        not a bogus '://None' base that later crashes credential lookup."""
+        for url in ('/tmp/repo.git', '../repo.git', 'file:///tmp/repo.git',
+                    '/srv/git/weird:repo.git'):
+            assert hive_ci_popup._parse_forgejo_remote(url) is None, url
+
+
+class TestParseTime:
+    """Tests for _parse_time() — PT must be DST-aware (review finding)."""
+
+    def test_summer_timestamp_uses_pdt(self) -> None:
+        # July → Pacific Daylight Time (UTC-7): 12:00Z → 05:00.
+        assert hive_ci_popup._parse_time('2026-07-01T12:00:00Z') == '05:00'
+
+    def test_winter_timestamp_uses_pst(self) -> None:
+        # January → Pacific Standard Time (UTC-8): 12:00Z → 04:00.
+        assert hive_ci_popup._parse_time('2026-01-01T12:00:00Z') == '04:00'
+
+    def test_empty_string_returns_empty(self) -> None:
+        assert hive_ci_popup._parse_time('') == ''
+
 
 class TestDiscoverRepos:
     """Tests for _discover_repos()."""

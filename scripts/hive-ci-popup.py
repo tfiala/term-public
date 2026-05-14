@@ -35,8 +35,14 @@ from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-PT = timezone(timedelta(hours=-8))
+try:
+    # Real Pacific time — DST-aware, so summer renders as UTC-7, winter UTC-8.
+    PT = ZoneInfo('America/Los_Angeles')
+except ZoneInfoNotFoundError:
+    # No system tz database available — fall back to a fixed offset (no DST).
+    PT = timezone(timedelta(hours=-8))
 
 WF_ABBREV = {
     'ci.yml': 'ci',
@@ -197,9 +203,15 @@ def _parse_forgejo_remote(url: str) -> tuple[str, str, str] | None:
     if scp_match and '://' not in url:
         hostname = scp_match.group(1)
         path = scp_match.group(2)
+        if '/' in hostname:
+            # Not a hostname — a local path that happens to contain ':'.
+            return None
         base = f'https://{hostname}'
     else:
         parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https', 'ssh') or not parsed.hostname:
+            # Not a Forgejo URL — local path, bare path, unsupported scheme.
+            return None
         base = f'{parsed.scheme}://{parsed.hostname}'
         if parsed.port:
             base += f':{parsed.port}'
