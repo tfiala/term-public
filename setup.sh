@@ -32,7 +32,8 @@ backup_and_link_file "$ROOT_DIR/zsh/zshenv" "$HOME/.zshenv"
 backup_and_link_file "$ROOT_DIR/zsh/zshrc" "$HOME/.zshrc"
 backup_and_link_file "$ROOT_DIR/p10k.zsh" "$HOME/.p10k.zsh"
 backup_and_link_file "$ROOT_DIR/scripts/hive.py" "$HOME/bin/hive"
-backup_and_link_file "$ROOT_DIR/zsh/hive-shell-prompt.zsh" "$HOME/bin/hive-shell-prompt.zsh"
+backup_and_link_file "$ROOT_DIR/tmux/tmux.conf" "$HOME/.tmux/tmux.conf"
+backup_and_link_file "$ROOT_DIR/tmux/tmux.conf" "$HOME/.tmux.conf"
 
 if [[ ! -f "$LOCAL_DIR/env.local" ]]; then
   cat > "$LOCAL_DIR/env.local" <<'EOF'

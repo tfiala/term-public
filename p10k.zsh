@@ -134,7 +134,7 @@ function instant_prompt_hive_badge() {
 
 function prompt_hive_pr() {
   [[ -n "$HIVE_NAME" ]] || return
-  local cache="/tmp/hive-dtach/${HIVE_NAME}-${HIVE_NUMBER}.pr"
+  local cache="/tmp/hive-tmux/${HIVE_NAME}-${HIVE_NUMBER}.pr"
   local pr=""
   [[ -f "$cache" ]] && pr=$(<"$cache")
   [[ -n "$pr" ]] || return
