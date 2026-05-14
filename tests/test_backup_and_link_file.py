@@ -116,6 +116,7 @@ def test_setup_creates_local_overlay_skeleton(tmp_path):
     (repo_root / "tmux" / "tmux.conf").write_text("# tmux\n")
     (repo_root / "p10k.zsh").write_text("# p10k\n")
     (repo_root / "scripts" / "hive.py").write_text("#!/usr/bin/env python3\n")
+    (repo_root / "scripts" / "hive-ci-popup.py").write_text("#!/usr/bin/env python3\n")
 
     result = subprocess.run(
         ["zsh", "setup.sh"],
@@ -156,6 +157,7 @@ def test_setup_preserves_existing_zshenv(tmp_path):
     (repo_root / "tmux" / "tmux.conf").write_text("# tmux\n")
     (repo_root / "p10k.zsh").write_text("# p10k\n")
     (repo_root / "scripts" / "hive.py").write_text("#!/usr/bin/env python3\n")
+    (repo_root / "scripts" / "hive-ci-popup.py").write_text("#!/usr/bin/env python3\n")
 
     result = subprocess.run(
         ["zsh", "setup.sh"],
@@ -201,6 +203,7 @@ def _scaffold_repo(tmp_path):
     (repo_root / "tmux" / "tmux.conf").write_text("# tmux\n")
     (repo_root / "p10k.zsh").write_text("# p10k\n")
     (repo_root / "scripts" / "hive.py").write_text("#!/usr/bin/env python3\n")
+    (repo_root / "scripts" / "hive-ci-popup.py").write_text("#!/usr/bin/env python3\n")
 
     return repo_root, home
 
