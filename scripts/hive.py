@@ -15,9 +15,9 @@ Subcommands:
     pull       Pull all repos in .local/
   find-tmux-config  Print path to generated tmux config for current hive
   apiary       Manage the apiary (list/add/remove hives)
-  shell        Start or attach to a dtach dev shell session
-    list       List active dtach sessions
-    cleanup    Remove stale sessions
+  tmux         Start or attach to a tmux dev session for a hive
+    --list         List configured hives with their assigned colors
+    --new-window   Open a new window on an unused workspace
 
 Apiary mode (--apiary):
   Operates across all configured hives defined in ~/.config/hive/apiary.json.
@@ -56,7 +56,6 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
@@ -1726,7 +1725,7 @@ def cmd_find_tmux_config(args: argparse.Namespace) -> None:
     """Find the generated tmux config for the current hive.
 
     Generated configs are stored at /tmp/hive-tmux/<name>.conf and are
-    created by hive-tmux-start when launching a session.
+    created by `hive tmux` when launching a session.
     """
     hive = _find_hive_root()
     if hive is None:
@@ -1738,7 +1737,7 @@ def cmd_find_tmux_config(args: argparse.Namespace) -> None:
 
     if not config_path.is_file():
         print(f'{CROSS()} No generated config found at {config_path}', file=sys.stderr)
-        print(f'  Run hive-tmux-start to generate the config.', file=sys.stderr)
+        print(f'  Run `hive tmux` to generate the config.', file=sys.stderr)
         sys.exit(1)
 
     print(config_path)
@@ -1935,20 +1934,39 @@ def cmd_local(args: argparse.Namespace) -> None:
         _local_pull(args)
 
 
-# --- Shell (dtach dev sessions) -----------------------------------------------
+# --- tmux dev sessions --------------------------------------------------------
 
-_DTACH_DIR = Path('/tmp/hive-dtach')
+_TMUX_DIR = Path('/tmp/hive-tmux')
 
-# Color palette (matches hive-tmux-start.py PALETTE)
+# Per-hive color palette, assigned by position in the apiary config.
+# `rgb`/`c256` drive the `--list` output and the HIVE_COLOR_* env vars; the
+# hex fields (`primary`, `background`, `foreground`, `inactive_bg`) drive the
+# generated tmux status bar. Hex values are normative in ADR-0045.
 _SHELL_PALETTE = [
-    {'name': 'blue', 'rgb': '97;150;255', 'c256': '75'},
-    {'name': 'teal', 'rgb': '45;212;168', 'c256': '43'},
-    {'name': 'green', 'rgb': '102;187;106', 'c256': '114'},
-    {'name': 'purple', 'rgb': '179;157;219', 'c256': '141'},
-    {'name': 'amber', 'rgb': '255;202;40', 'c256': '220'},
-    {'name': 'rose', 'rgb': '239;83;80', 'c256': '203'},
-    {'name': 'cyan', 'rgb': '38;198;218', 'c256': '44'},
-    {'name': 'orange', 'rgb': '255;167;38', 'c256': '214'},
+    {'name': 'blue', 'rgb': '97;150;255', 'c256': '75',
+     'primary': '#6196ff', 'background': '#1a2744',
+     'foreground': '#82aaff', 'inactive_bg': '#2c3e6b'},
+    {'name': 'teal', 'rgb': '45;212;168', 'c256': '43',
+     'primary': '#2dd4a8', 'background': '#1a3a3a',
+     'foreground': '#56d6c2', 'inactive_bg': '#2c5e5e'},
+    {'name': 'green', 'rgb': '102;187;106', 'c256': '114',
+     'primary': '#66bb6a', 'background': '#1a3320',
+     'foreground': '#81c784', 'inactive_bg': '#2c5e3e'},
+    {'name': 'purple', 'rgb': '179;157;219', 'c256': '141',
+     'primary': '#b39ddb', 'background': '#2a1a44',
+     'foreground': '#ce93d8', 'inactive_bg': '#4a3a6e'},
+    {'name': 'amber', 'rgb': '255;202;40', 'c256': '220',
+     'primary': '#ffca28', 'background': '#3a2e1a',
+     'foreground': '#ffd54f', 'inactive_bg': '#5e4e2e'},
+    {'name': 'rose', 'rgb': '239;83;80', 'c256': '203',
+     'primary': '#ef5350', 'background': '#3a1a1a',
+     'foreground': '#ef9a9a', 'inactive_bg': '#5e2e2e'},
+    {'name': 'cyan', 'rgb': '38;198;218', 'c256': '44',
+     'primary': '#26c6da', 'background': '#1a3344',
+     'foreground': '#80deea', 'inactive_bg': '#2c4e5e'},
+    {'name': 'orange', 'rgb': '255;167;38', 'c256': '214',
+     'primary': '#ffa726', 'background': '#3a2a1a',
+     'foreground': '#ffcc80', 'inactive_bg': '#5e4a2e'},
 ]
 
 
@@ -1969,405 +1987,612 @@ def _workspace_number(name: str) -> str | None:
     return m.group(2) if m else None
 
 
-def _socket_path(hive_name: str, number: str) -> Path:
-    """Return the dtach socket path for a hive workspace."""
-    return _DTACH_DIR / f'{hive_name}-{number}.sock'
+# --- tmux session helpers -----------------------------------------------------
 
 
-def _sidecar_path(hive_name: str, number: str) -> Path:
-    """Return the metadata sidecar path for a hive workspace."""
-    return _DTACH_DIR / f'{hive_name}-{number}.json'
+def _tmux_available() -> bool:
+    """True if the tmux binary is on PATH."""
+    return shutil.which('tmux') is not None
 
 
-def _socket_alive(sock: Path) -> bool:
-    """Check if a dtach socket is connectable (session alive)."""
-    if not sock.exists():
-        return False
-    # Try a non-interactive attach that immediately detaches.
-    # dtach -p copies stdin to session — with empty stdin it exits immediately.
-    # If the socket is dead, this returns non-zero.
-    r = subprocess.run(
-        ['dtach', '-p', str(sock)],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        timeout=2,
-    )
-    return r.returncode == 0
-
-
-def _find_workspace_for_reattach(hive: Path, hive_name: str) -> tuple[Path, str] | None:
-    """If cwd is inside a hive workspace with an active dtach session, return it."""
-    cwd = Path.cwd().resolve()
-    for entry in sorted(hive.iterdir()):
-        if not entry.is_dir() or not (entry / '.git').exists():
-            continue
-        resolved = entry.resolve()
-        if cwd == resolved or resolved in cwd.parents:
-            num = _workspace_number(entry.name)
-            if num and _socket_alive(_socket_path(hive_name, num)):
-                return entry, num
-    return None
-
-
-def _find_clean_workspace(hive: Path, hive_name: str) -> tuple[Path, str] | None:
-    """Find a hive member on the default branch with a clean worktree and no active session."""
-    for entry in sorted(hive.iterdir()):
-        if not entry.is_dir() or not (entry / '.git').exists():
-            continue
-        num = _workspace_number(entry.name)
-        if not num:
-            continue
-        # Skip if active dtach session
-        if _socket_alive(_socket_path(hive_name, num)):
-            continue
-        # Check default branch
-        default = _default_branch(entry)
-        current = _git_out(['rev-parse', '--abbrev-ref', 'HEAD'], cwd=entry)
-        if current != default:
-            continue
-        # Check clean worktree
-        porcelain = _git_out(['status', '--porcelain'], cwd=entry)
-        if porcelain is not None and porcelain == '':
-            return entry, num
-    return None
-
-
-def _create_new_workspace(hive: Path) -> tuple[Path, str]:
-    """Create a new hive workspace by cloning from an existing member's origin."""
-    # Find an existing repo to get the clone URL
-    existing = None
-    for entry in sorted(hive.iterdir()):
-        if entry.is_dir() and (entry / '.git').exists():
-            existing = entry
-            break
-    if existing is None:
-        print(f'{CROSS()} No existing repos in hive to clone from', file=sys.stderr)
-        sys.exit(1)
-
-    origin_url = _git_out(['remote', 'get-url', 'origin'], cwd=existing)
-    if not origin_url:
-        print(f'{CROSS()} Cannot determine origin URL from {existing.name}',
-              file=sys.stderr)
-        sys.exit(1)
-
-    target = _infer_next_repo_dir(hive, None)
-    spinner = _Spinner()
-    spinner.start(f'Cloning into {target.name}...')
-    r = _git(['clone', origin_url, str(target)])
-    spinner.stop()
-
+def _tmux_sessions() -> list[str]:
+    """Return the names of all current tmux sessions."""
+    try:
+        r = subprocess.run(
+            ['tmux', 'list-sessions', '-F', '#{session_name}'],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        return []
     if r.returncode != 0:
-        print(f'{CROSS()} Clone failed: {target.name}', file=sys.stderr)
-        stderr = r.stderr.strip()
-        if stderr:
-            for line in stderr.splitlines()[:3]:
-                print(f'  {C.dim(line)}', file=sys.stderr)
+        return []
+    return r.stdout.split()
+
+
+def _next_session_num(name: str, sessions: list[str]) -> int:
+    """Find the next free session number for a hive (sessions are <name>-N)."""
+    prefix = f'{name}-'
+    nums = [
+        int(s[len(prefix):])
+        for s in sessions
+        if s.startswith(prefix) and s[len(prefix):].isdigit()
+    ]
+    return max(nums) + 1 if nums else 0
+
+
+def _group_exists(name: str, sessions: list[str]) -> bool:
+    """True if a session for this hive already exists."""
+    return any(s.startswith(f'{name}-') for s in sessions)
+
+
+def _current_session() -> str | None:
+    """Return the current tmux session name, or None if not inside tmux."""
+    if not os.environ.get('TMUX'):
+        return None
+    try:
+        r = subprocess.run(
+            ['tmux', 'display-message', '-p', '#{session_name}'],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def _windows_in_session(session: str) -> list[str]:
+    """Return the pane paths of every window in a session."""
+    try:
+        r = subprocess.run(
+            ['tmux', 'list-windows', '-t', session,
+             '-F', '#{pane_current_path}'],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        return []
+    if r.returncode != 0:
+        return []
+    return [ln for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def _discover_workspaces(hive: Path) -> list[Path]:
+    """Return the hive's workspace directories (git repos), sorted by name."""
+    return [main for main, _nested in _discover_repos(hive)]
+
+
+def _resolve_tmux_hive(hive_arg: str | None) -> Path | None:
+    """Resolve a hive from --hive (short name or path), or detect from cwd."""
+    if hive_arg is None:
+        return _find_hive_root()
+    apiary = _load_apiary() or []
+    # Try as a path first.
+    path = Path(hive_arg).expanduser()
+    if path.is_dir():
+        resolved = path.resolve()
+        for h in apiary:
+            if h.resolve() == resolved:
+                return h
+        return path  # a real dir not in the apiary — allow it anyway
+    # Try as a short name.
+    for h in apiary:
+        if _short_name(h) == hive_arg:
+            return h
+    return None
+
+
+# --- tmux config generation ---------------------------------------------------
+
+
+def _generate_tmux_config(hive: Path, color: dict) -> str:
+    """Generate the per-hive tmux config sourced at session creation.
+
+    All settings are session-scoped (no -g) so multiple hive sessions
+    coexist. The base ~/.tmux/tmux.conf is sourced first — it must carry
+    the Claude-CLI-safe settings (allow-passthrough on, synchronized
+    output, extended keys) per ADR-0063.
+    """
+    name = _short_name(hive)
+    hive_root = str(hive.resolve())
+    lines = [
+        f'# Generated tmux config for hive: {name}',
+        f'# Color theme: {color["name"]}',
+        '',
+        '# Base config — carries the Claude-CLI-safe settings (ADR-0063)',
+        'source-file ~/.tmux/tmux.conf',
+        '',
+        '# Environment (session-scoped)',
+        f'set-environment HIVE_ROOT "{hive_root}"',
+        f'set-environment HIVE_NAME "{name}"',
+        f'set-environment HIVE_COLOR "{color["name"]}"',
+        f'set-environment HIVE_COLOR_RGB "{color["rgb"]}"',
+        f'set-environment HIVE_COLOR_256 "{color["c256"]}"',
+        '',
+        '# Status bar (session-scoped)',
+        f'set status-style "bg={color["background"]},fg={color["foreground"]}"',
+        '',
+        '# Active window tab',
+        f'set window-status-current-format "#[bg={color["primary"]},fg={color["background"]},bold] #I:#W #[default]"',
+        '',
+        '# Inactive window tab',
+        f'set window-status-format "#[bg={color["inactive_bg"]},fg={color["foreground"]}] #I:#W #[default]"',
+        '',
+        '# Pane borders',
+        f'set pane-border-style "fg={color["inactive_bg"]}"',
+        f'set pane-active-border-style "fg={color["primary"]}"',
+        '',
+        '# Status left (session name badge)',
+        f'set status-left "#[bg={color["primary"]},fg={color["background"]},bold] #{{session_name}} #[default] "',
+        'set status-left-length 20',
+        '',
+        '# Status right (folder | branch [sync] | time)',
+        'set status-right-length 70',
+        'set status-right " #(basename \\"#{pane_current_path}\\") | '
+        '#(git -C \\"#{pane_current_path}\\" rev-parse --abbrev-ref HEAD 2>/dev/null || echo \\"no-git\\")'
+        '#(hive tmux git-sync \\"#{pane_current_path}\\") | %H:%M PT "',
+        '',
+        '# Window naming',
+        'set automatic-rename off',
+        'set allow-rename off',
+        '',
+        '# Window label update hooks (session-scoped)',
+        'set-hook after-select-window "run-shell -b \'hive tmux label-window #{pane_current_path} #{window_id}\'"',
+        'set-hook after-select-pane   "run-shell -b \'hive tmux label-window #{pane_current_path} #{window_id}\'"',
+        '',
+        '# Keybindings — tmux keybindings are global (not session-scoped), so',
+        '# every hive-specific binding guards on $HIVE_ROOT and falls back to',
+        '# the default behavior for non-hive sessions.',
+        '',
+        '# backtick + r: reload config (hive config or base tmux.conf)',
+        'bind r run-shell \''
+        'if [ -n "$HIVE_NAME" ]; then'
+        '  CONF="/tmp/hive-tmux/$HIVE_NAME.conf";'
+        '  [ -f "$CONF" ] && tmux source-file "$CONF" && tmux display-message "Reloaded: $CONF"'
+        '    || tmux display-message "Config not found";'
+        'else'
+        '  tmux source-file "$HOME/.tmux/tmux.conf" && tmux display-message "Reloaded!";'
+        'fi\'',
+        '',
+        '# backtick + c: new window (hive workspace picker, or plain new-window)',
+        'bind c run-shell \''
+        'if [ -n "$HIVE_ROOT" ]; then'
+        '  hive tmux --hive "$HIVE_ROOT" --new-window;'
+        'else'
+        '  tmux new-window;'
+        'fi\'',
+        '',
+        '# backtick + b: CI status popup (hive only)',
+        'bind b run-shell \''
+        'if [ -n "$HIVE_ROOT" ]; then'
+        '  hive-ci-popup --hive-root "$HIVE_ROOT";'
+        'else'
+        '  tmux display-message "Not in a hive session";'
+        'fi\'',
+        '',
+        '# backtick + g/G/C-g: hive multi-repo management (hive only)',
+        'bind g run-shell -b \''
+        'if [ -n "$HIVE_ROOT" ]; then'
+        '  tmux display-message "Hive: fetching status..." &&'
+        '  hive tmux popup --cwd "#{pane_current_path}" hive --color status --compact;'
+        'else'
+        '  tmux display-message "Not in a hive session";'
+        'fi\'',
+        'bind G run-shell -b \''
+        'if [ -n "$HIVE_ROOT" ]; then'
+        '  tmux display-message "Hive: pulling repos..." &&'
+        '  hive tmux popup --cwd "#{pane_current_path}" hive --color pull --compact;'
+        'else'
+        '  tmux display-message "Not in a hive session";'
+        'fi\'',
+        'bind C-g run-shell -b \''
+        'if [ -n "$HIVE_ROOT" ]; then'
+        '  tmux display-message "Hive: pulling + pushing repos..." &&'
+        '  hive tmux popup --cwd "#{pane_current_path}" hive --color pull --compact --push;'
+        'else'
+        '  tmux display-message "Not in a hive session";'
+        'fi\'',
+        '',
+        '# backtick + R: force-refresh all window labels (hive only)',
+        'bind R run-shell -b \''
+        'if [ -n "$HIVE_ROOT" ]; then'
+        '  for win_info in $(tmux list-windows -F "#{window_id}:#{pane_current_path}"); do'
+        '    wid="${win_info%%:*}"; wpath="${win_info#*:}";'
+        '    hive tmux label-window "$wpath" "$wid";'
+        '  done;'
+        '  tmux display-message "Labels refreshed";'
+        'else'
+        '  tmux display-message "Not in a hive session";'
+        'fi\'',
+    ]
+    return '\n'.join(lines) + '\n'
+
+
+def _write_tmux_config(hive: Path, color: dict) -> Path:
+    """Write the generated tmux config to /tmp/hive-tmux/<name>.conf."""
+    _TMUX_DIR.mkdir(parents=True, exist_ok=True)
+    config_path = _TMUX_DIR / f'{_short_name(hive)}.conf'
+    config_path.write_text(_generate_tmux_config(hive, color))
+    return config_path
+
+
+# --- Window labeling ----------------------------------------------------------
+
+_LABEL_CACHE_TTL = 300  # seconds — window hooks fire often; don't hammer fj
+_DEFAULT_BRANCHES = {'main', 'master', 'develop', 'dev',
+                     'flow-dev', 'flow-prod', 'infra-dev', 'infra-prod'}
+
+
+def _label_cache_key(workspace: Path) -> str:
+    """Cache filename stem for a workspace (leaf name + path hash).
+
+    The path hash prevents collisions between workspaces with the same
+    leaf name in different hives.
+    """
+    import hashlib
+    full = str(workspace.resolve())
+    digest = hashlib.sha256(full.encode()).hexdigest()[:12]
+    return f'label-{workspace.resolve().name}-{digest}'
+
+
+def _shorten_branch(branch: str) -> str:
+    """Shorten a branch name for a window label (strip prefix, truncate)."""
+    short = branch.split('/', 1)[1] if '/' in branch else branch
+    if len(short) > 16:
+        short = short[:14] + '..'
+    return short
+
+
+def _compute_window_label(workspace: Path) -> dict:
+    """Compute label data for a workspace: branch, default, pr, label.
+
+    Produces <workspace>#<pr> when an open PR exists, <workspace>/<branch>
+    on a feature branch, and <workspace> on the default branch.
+    """
+    branch = _git_out(['rev-parse', '--abbrev-ref', 'HEAD'],
+                      cwd=workspace) or 'unknown'
+    default = _default_branch(workspace)
+    feature = branch != default and branch not in _DEFAULT_BRANCHES
+    pr = None
+    if feature:
+        info = _get_pr_info(workspace, branch)
+        if info and info.get('state') == 'open':
+            pr = info.get('number')
+
+    name = workspace.name
+    if pr:
+        label = f'{name}#{pr}'
+    elif feature:
+        label = f'{name}/{_shorten_branch(branch)}'
+    else:
+        label = name
+    return {'branch': branch, 'default': default, 'pr': pr, 'label': label}
+
+
+def _tmux_label_window(pane_path: str, window_id: str) -> None:
+    """Rename a tmux window to reflect its workspace's git state.
+
+    Results are cached under /tmp/hive-tmux/ for _LABEL_CACHE_TTL seconds
+    and invalidated on branch change — the after-select-window/pane hooks
+    fire often. Also refreshes the per-workspace PR cache the prompt
+    segments read. Invoked by tmux hooks; fails silently.
+    """
+    if not pane_path or not window_id:
+        return
+    pane = Path(pane_path)
+    if not pane.is_dir():
+        return
+
+    toplevel = _git_out(['rev-parse', '--show-toplevel'], cwd=pane)
+    if not toplevel:
+        # Not a git repo — fall back to the directory basename.
+        subprocess.run(['tmux', 'rename-window', '-t', window_id, pane.name],
+                       capture_output=True)
+        return
+    workspace = Path(toplevel)
+
+    _TMUX_DIR.mkdir(parents=True, exist_ok=True)
+    cache_file = _TMUX_DIR / f'{_label_cache_key(workspace)}.json'
+    current_branch = _git_out(['rev-parse', '--abbrev-ref', 'HEAD'],
+                              cwd=workspace)
+
+    data = None
+    if cache_file.is_file():
+        try:
+            cached = json.loads(cache_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            cached = None
+        if cached is not None:
+            fresh = time.time() - cached.get('ts', 0) <= _LABEL_CACHE_TTL
+            if fresh and cached.get('branch') == current_branch:
+                data = cached
+
+    if data is None:
+        data = _compute_window_label(workspace)
+        data['ts'] = time.time()
+        try:
+            cache_file.write_text(json.dumps(data))
+        except OSError:
+            pass
+
+    subprocess.run(['tmux', 'rename-window', '-t', window_id, data['label']],
+                   capture_output=True)
+
+    # Refresh the per-workspace PR cache the prompt segments consume.
+    number = _workspace_number(workspace.name)
+    if number:
+        hive_name = _short_name(workspace.parent)
+        pr_cache = _TMUX_DIR / f'{hive_name}-{number}.pr'
+        try:
+            pr_cache.write_text(str(data['pr']) if data.get('pr') else '')
+        except OSError:
+            pass
+
+
+# --- tmux subcommand ----------------------------------------------------------
+
+
+def cmd_tmux(args: argparse.Namespace) -> None:
+    """Execute the tmux subcommand."""
+    action = getattr(args, 'tmux_action', None)
+
+    # Hidden helper actions, invoked by the generated tmux config.
+    if action == 'label-window':
+        _tmux_label_window(args.pane_path, args.window_id)
+        return
+    if action == 'git-sync':
+        _tmux_git_sync(args.pane_path)
+        return
+    if action == 'popup':
+        _tmux_popup(getattr(args, 'cwd', None), args.command)
+        return
+
+    if not _tmux_available():
+        print(f'{CROSS()} tmux is not installed', file=sys.stderr)
         sys.exit(1)
 
-    num = _workspace_number(target.name)
-    if not num:
-        num = '1'
-    print(f'{CHECK()} Created {target.name}')
-    return target, num
-
-
-def _write_sidecar(hive_name: str, number: str, workspace: Path) -> None:
-    """Write session metadata sidecar."""
-    _DTACH_DIR.mkdir(parents=True, exist_ok=True)
-    data = {
-        'hive': hive_name,
-        'workspace': str(workspace),
-        'number': int(number),
-        'created': datetime.now(timezone.utc).isoformat(),
-        'branch_at_checkout': _git_out(
-            ['rev-parse', '--abbrev-ref', 'HEAD'], cwd=workspace) or 'unknown',
-    }
-    _sidecar_path(hive_name, number).write_text(json.dumps(data, indent=2) + '\n')
-
-
-def _launch_dtach(hive: Path, hive_name: str, workspace: Path, number: str) -> None:
-    """Launch or reattach to a dtach session."""
-    _DTACH_DIR.mkdir(parents=True, exist_ok=True)
-    sock = _socket_path(hive_name, number)
-
-    # Write sidecar if creating new session
-    if not _socket_alive(sock):
-        _write_sidecar(hive_name, number, workspace)
-
-    # Pre-populate PR cache so the prompt has it on first render.
-    # Always run (not just new sessions) — zshexit cleans the cache,
-    # so reattaching would find an empty cache without this.
-    pr_cache = _DTACH_DIR / f'{hive_name}-{number}.pr'
-    branch = _git_out(['rev-parse', '--abbrev-ref', 'HEAD'], cwd=workspace)
-    default = _default_branch(workspace)
-    if branch and branch != default:
-        fj = shutil.which('fj')
-        if fj:
-            try:
-                r = subprocess.run(
-                    [fj, 'pr', 'list', '--json', '--state', 'open',
-                     '--head', branch],
-                    capture_output=True, text=True, cwd=workspace, timeout=10,
-                )
-                if r.returncode == 0 and r.stdout.strip():
-                    prs = json.loads(r.stdout)
-                    if prs:
-                        pr_cache.write_text(str(prs[0].get('number', '')))
-                    else:
-                        pr_cache.write_text('')
-            except (subprocess.TimeoutExpired, Exception):
-                pass
-
-    # Resolve prompt color
-    color = _hive_color(hive)
-
-    # Find the prompt zsh file — check ~/bin first (installed), then script dir
-    prompt_zsh = Path.home() / 'bin' / 'hive-shell-prompt.zsh'
-    if not prompt_zsh.is_file():
-        prompt_zsh = Path(__file__).resolve().parent / 'hive-shell-prompt.zsh'
-
-    env = os.environ.copy()
-    env['HIVE_ROOT'] = str(hive)
-    env['HIVE_NAME'] = hive_name
-    env['HIVE_WORKSPACE'] = workspace.name
-    env['HIVE_NUMBER'] = number
-    env['HIVE_COLOR_RGB'] = color['rgb']
-    env['HIVE_COLOR_256'] = color['c256']
-
-    # Launch zsh with the hive prompt sourced via ZDOTDIR wrapper.
-    # We set ZDOTDIR to a temp dir so zsh loads our .zshenv and .zshrc.
-    # Our .zshenv sources the user's real .zshenv (without resetting
-    # ZDOTDIR — that would cause zsh to load the real .zshrc instead
-    # of ours). Our .zshrc sources the user's real .zshrc, then layers
-    # the hive prompt on top.
-    # Resolve the user's real ZDOTDIR — ignore hive wrapper paths so
-    # launching a hive shell from inside another hive shell works.
-    original_zdotdir = env.get('ZDOTDIR', str(Path.home()))
-    if original_zdotdir.startswith(str(_DTACH_DIR / '.zdotdir-')):
-        original_zdotdir = env.get('HIVE_REAL_ZDOTDIR', str(Path.home()))
-    zdotdir = _DTACH_DIR / f'.zdotdir-{hive_name}-{number}'
-    zdotdir.mkdir(parents=True, exist_ok=True)
-
-    # .zshenv runs first — source the user's .zshenv for PATH, env
-    # vars, etc. We do NOT reset ZDOTDIR here: zsh uses ZDOTDIR at
-    # each startup-file stage, so resetting it in .zshenv would cause
-    # zsh to skip our .zshrc and load the real one instead.
-    zshenv = zdotdir / '.zshenv'
-    zshenv.write_text(
-        '# Hive shell — source user .zshenv without resetting ZDOTDIR\n'
-        f'HIVE_REAL_ZDOTDIR="{original_zdotdir}"\n'
-        f'[[ -f "$HIVE_REAL_ZDOTDIR/.zshenv" ]] && source "$HIVE_REAL_ZDOTDIR/.zshenv"\n'
-        '# Re-assert our ZDOTDIR in case the user .zshenv changed it\n'
-        f'export ZDOTDIR="{zdotdir}"\n'
-    )
-
-    # .zshrc runs after .zshenv and .zprofile. Since ZDOTDIR still
-    # points to our temp dir, zsh loads this .zshrc (not the real one).
-    # We source the real .zshrc explicitly, then layer the prompt.
-    zshrc = zdotdir / '.zshrc'
-    zshrc.write_text(
-        '# Hive shell — source user .zshrc then hive prompt overlay\n'
-        '# Suppress p10k instant prompt warning — hive-shell-prompt.zsh\n'
-        '# sources after the user .zshrc, which p10k flags as console I/O.\n'
-        'typeset -g POWERLEVEL9K_INSTANT_PROMPT=quiet\n'
-        f'[[ -f "$HIVE_REAL_ZDOTDIR/.zshrc" ]] && source "$HIVE_REAL_ZDOTDIR/.zshrc"\n'
-        '# Fix HISTFILE — zsh defaults it to $ZDOTDIR/.zsh_history, which\n'
-        '# lands in our temp wrapper dir. Point it back to the real location.\n'
-        f'export HISTFILE="$HIVE_REAL_ZDOTDIR/.zsh_history"\n'
-        f'source "{prompt_zsh}"\n'
-    )
-    env['ZDOTDIR'] = str(zdotdir)
-
-    action = 'Reattaching to' if _socket_alive(sock) else 'Starting'
-    print(f'{CHECK()} {action} {C.cyan(f"{hive_name}-{number}")} '
-          f'in {C.dim(str(workspace))}')
-
-    os.chdir(workspace)
-    os.execvpe('dtach', [
-        'dtach', '-A', str(sock),
-        '-Ez', '-r', 'winch',
-        'zsh',
-    ], env)
-
-
-def cmd_shell(args: argparse.Namespace) -> None:
-    """Execute the shell subcommand."""
-    shell_action = getattr(args, 'shell_action', None)
-
-    if shell_action == 'list':
-        _shell_list()
-        return
-    elif shell_action == 'cleanup':
-        _shell_cleanup()
+    if getattr(args, 'list_hives', False):
+        _tmux_list()
         return
 
-    # Resolve hive
     hive_arg = getattr(args, 'hive', None)
-    if hive_arg:
-        # Try as short name first
-        apiary = _load_apiary()
-        hive = None
-        if apiary:
-            for h in apiary:
-                if _short_name(h) == hive_arg:
-                    hive = h
-                    break
-        if hive is None:
-            # Try as path
-            candidate = Path(hive_arg).expanduser().resolve()
-            if candidate.is_dir():
-                hive = candidate
-        if hive is None:
+    hive = _resolve_tmux_hive(hive_arg)
+    if hive is None:
+        if hive_arg:
             print(f'{CROSS()} Hive not found: {hive_arg}', file=sys.stderr)
-            sys.exit(1)
-    else:
-        hive = _find_hive_root()
-        if hive is None:
-            print(f'{CROSS()} Not inside a hive. Use --hive to specify one.',
-                  file=sys.stderr)
-            sys.exit(1)
-
-    hive_name = _short_name(hive)
-    number_arg = getattr(args, 'number', None)
-
-    if number_arg is not None:
-        # Explicit workspace number — attach or create
-        number = str(number_arg)
-        # Find the workspace directory
-        workspace = None
-        for entry in sorted(hive.iterdir()):
-            if not entry.is_dir() or not (entry / '.git').exists():
-                continue
-            num = _workspace_number(entry.name)
-            if num == number:
-                workspace = entry
-                break
-        if workspace is None:
-            print(f'{CROSS()} No workspace #{number} found in {hive_name}',
-                  file=sys.stderr)
-            sys.exit(1)
-        _launch_dtach(hive, hive_name, workspace, number)
-        return
-
-    # Find a clean workspace (no active session, default branch, clean worktree).
-    # Note: we intentionally do NOT reattach based on cwd — terminal emulators
-    # inherit the working directory when opening new tabs/windows, which would
-    # cause spurious reattaches.  Use `hive shell N` to reattach explicitly.
-    result = _find_clean_workspace(hive, hive_name)
-    if result:
-        workspace, number = result
-        _launch_dtach(hive, hive_name, workspace, number)
-        return
-
-    # No clean workspace found — create a new one.
-    workspace, number = _create_new_workspace(hive)
-    _launch_dtach(hive, hive_name, workspace, number)
-
-
-def _shell_list() -> None:
-    """List active dtach sessions."""
-    if not _DTACH_DIR.is_dir():
-        print(C.dim('No active sessions'))
-        return
-
-    sockets = sorted(_DTACH_DIR.glob('*.sock'))
-    if not sockets:
-        print(C.dim('No active sessions'))
-        return
-
-    found = False
-    for sock in sockets:
-        name = sock.stem  # e.g., "infra-3"
-        alive = _socket_alive(sock)
-        sidecar = _DTACH_DIR / f'{name}.json'
-
-        workspace_display = ''
-        branch_display = ''
-        if sidecar.is_file():
-            try:
-                data = json.loads(sidecar.read_text())
-                ws = data.get('workspace', '')
-                if ws:
-                    workspace_display = _display_path(Path(ws))
-                    # Get current branch if workspace exists
-                    ws_path = Path(ws)
-                    if ws_path.is_dir():
-                        branch = _git_out(
-                            ['rev-parse', '--abbrev-ref', 'HEAD'], cwd=ws_path)
-                        if branch:
-                            branch_display = branch
-            except (json.JSONDecodeError, KeyError):
-                pass
-
-        if alive:
-            found = True
-            status = CHECK()
-            parts = [f'{status} {C.cyan(name)}']
-            if branch_display:
-                parts.append(branch_display)
-            if workspace_display:
-                parts.append(C.dim(workspace_display))
-            print('  '.join(parts))
         else:
-            found = True
-            print(f'  {CROSS()} {name}  {C.dim("(dead)")}')
+            print(f'{CROSS()} Not inside a hive. Use --hive to specify one, '
+                  f'or --list to see configured hives.', file=sys.stderr)
+        sys.exit(1)
 
-    if not found:
-        print(C.dim('No active sessions'))
+    _tmux_start(hive, _hive_color(hive),
+                new_window=getattr(args, 'new_window', False))
 
 
-def _shell_cleanup() -> None:
-    """Remove stale dtach sockets and orphaned sidecars."""
-    if not _DTACH_DIR.is_dir():
-        print(C.dim('Nothing to clean up'))
+def _tmux_list() -> None:
+    """List configured hives with their assigned colors."""
+    apiary = _load_apiary()
+    if not apiary:
+        print('No hives configured in the apiary.')
+        print('Add one with: hive apiary add <path>')
+        return
+    print('Configured hives:')
+    print()
+    for hive in apiary:
+        color = _hive_color(hive)
+        name = _short_name(hive)
+        if C.enabled:
+            badge = f'\033[38;2;{color["rgb"]}m{name:16}\033[0m'
+        else:
+            badge = f'{name:16}'
+        print(f'  {badge}  {_display_path(hive)}  ({color["name"]})')
+
+
+def _tmux_env_args(hive: Path, hive_name: str, color: dict,
+                   number: str | None) -> list[str]:
+    """Build `tmux new-session`/`new-window` `-e` args that seed the pane env.
+
+    tmux's `set-environment` only updates the session environment — it cannot
+    mutate the environment of an already-started shell. So the HIVE_* vars
+    must be passed at pane-creation time with `-e` to actually reach the
+    shell process. `HIVE_NUMBER` is per-window (the workspace number); the
+    rest are constant across the hive.
+    """
+    args = [
+        '-e', f'HIVE_ROOT={hive.resolve()}',
+        '-e', f'HIVE_NAME={hive_name}',
+        '-e', f'HIVE_COLOR={color["name"]}',
+        '-e', f'HIVE_COLOR_RGB={color["rgb"]}',
+        '-e', f'HIVE_COLOR_256={color["c256"]}',
+    ]
+    if number:
+        args += ['-e', f'HIVE_NUMBER={number}']
+    return args
+
+
+def _used_workspaces(session: str, workspaces: list[Path]) -> set[Path]:
+    """Workspaces in `workspaces` that already have a window in `session`.
+
+    Pane paths are normalized to their containing workspace, so a pane
+    sitting in a subdirectory of a workspace (e.g. after the user `cd`s
+    into `home-dc-1/scripts`) still counts that workspace as used.
+    """
+    resolved = {ws: ws.resolve() for ws in workspaces}
+    used: set[Path] = set()
+    for pane in _windows_in_session(session):
+        pane_resolved = Path(pane).resolve()
+        for ws, ws_resolved in resolved.items():
+            if pane_resolved == ws_resolved or ws_resolved in pane_resolved.parents:
+                used.add(ws)
+                break
+    return used
+
+
+def _tmux_start(hive: Path, color: dict, new_window: bool) -> None:
+    """Start a tmux session for the hive, or add a window to the current one."""
+    name = _short_name(hive)
+    sessions = _tmux_sessions()
+    workspaces = _discover_workspaces(hive)
+
+    def _env(ws: Path | None) -> list[str]:
+        number = _workspace_number(ws.name) if ws is not None else None
+        return _tmux_env_args(hive, name, color, number)
+
+    current = _current_session()
+    if current and current.startswith(f'{name}-'):
+        # Already inside a session for this hive.
+        if new_window:
+            used = _used_workspaces(current, workspaces)
+            for ws in workspaces:
+                if ws not in used:
+                    subprocess.run(['tmux', 'new-window', '-t', current,
+                                    '-c', str(ws), *_env(ws)])
+                    return
+            # Every workspace already has a window — open one in the hive root.
+            subprocess.run(['tmux', 'new-window', '-t', current,
+                            '-c', str(hive), *_env(None)])
+            return
+        print(f'Already in {name} session: {current}')
+        print('Use backtick+c for a new window, or detach first.')
         return
 
-    cleaned = 0
+    config_path = _write_tmux_config(hive, color)
+    session_name = f'{name}-{_next_session_num(name, sessions)}'
+    first_ws = workspaces[0] if workspaces else None
+    start_dir = str(first_ws) if first_ws else str(hive)
 
-    # Dead sockets
-    for sock in sorted(_DTACH_DIR.glob('*.sock')):
-        if not _socket_alive(sock):
-            sock.unlink()
-            name = sock.stem
-            sidecar = _DTACH_DIR / f'{name}.json'
-            if sidecar.is_file():
-                sidecar.unlink()
-            pr_cache = _DTACH_DIR / f'{name}.pr'
-            if pr_cache.is_file():
-                pr_cache.unlink()
-            print(f'  {CHECK()} Removed dead session: {name}')
-            cleaned += 1
-
-    # Orphaned sidecars
-    for sidecar in sorted(_DTACH_DIR.glob('*.json')):
-        sock = _DTACH_DIR / f'{sidecar.stem}.sock'
-        if not sock.exists():
-            sidecar.unlink()
-            print(f'  {CHECK()} Removed orphaned sidecar: {sidecar.stem}')
-            cleaned += 1
-
-    # Orphaned PR caches
-    for pr_cache in sorted(_DTACH_DIR.glob('*.pr')):
-        sock = _DTACH_DIR / f'{pr_cache.stem}.sock'
-        if not sock.exists():
-            pr_cache.unlink()
-            cleaned += 1
-
-    # Stale zdotdir directories
-    for zdotdir in sorted(_DTACH_DIR.glob('.zdotdir-*')):
-        if not zdotdir.is_dir():
-            continue
-        # Extract name from .zdotdir-<hive>-<num>
-        suffix = zdotdir.name[len('.zdotdir-'):]
-        sock = _DTACH_DIR / f'{suffix}.sock'
-        if not sock.exists() or not _socket_alive(sock):
-            shutil.rmtree(zdotdir)
-            cleaned += 1
-
-    if cleaned == 0:
-        print(C.dim('Nothing to clean up'))
+    if _group_exists(name, sessions):
+        # Join the existing group — windows are shared, so don't recreate them.
+        target = next(s for s in sessions if s.startswith(f'{name}-'))
+        subprocess.run(
+            ['tmux', 'new-session', '-d', '-t', target, '-s', session_name])
     else:
-        print(f'\nCleaned {cleaned} item(s)')
+        subprocess.run(['tmux', 'new-session', '-d', '-s', session_name,
+                        '-c', start_dir, *_env(first_ws)])
+        for ws in workspaces[1:]:
+            subprocess.run(['tmux', 'new-window', '-t', session_name,
+                            '-c', str(ws), *_env(ws)])
+
+    subprocess.run(['tmux', 'source-file', '-t', session_name, str(config_path)])
+
+    # Label every window.
+    r = subprocess.run(
+        ['tmux', 'list-windows', '-t', session_name,
+         '-F', '#{window_id}:#{pane_current_path}'],
+        capture_output=True, text=True,
+    )
+    if r.returncode == 0:
+        for line in r.stdout.splitlines():
+            if ':' not in line:
+                continue
+            wid, wpath = line.split(':', 1)
+            _tmux_label_window(wpath, wid)
+
+    subprocess.run(['tmux', 'select-window', '-t', f'{session_name}:1'],
+                   capture_output=True)
+    os.execlp('tmux', 'tmux', 'attach-session', '-t', session_name)
+
+
+def _tmux_git_sync(pane_path: str) -> None:
+    """Print an ahead/behind indicator for the tmux status bar.
+
+    Output is a tmux-formatted string with a leading space (e.g. ' ↑2↓3'),
+    or nothing when in sync / no upstream. Side effect: triggers a
+    background `git fetch` at most once every 2 minutes per repo so the
+    counts stay reasonably fresh. Invoked from status-right; fails silently.
+    """
+    if not pane_path:
+        return
+    toplevel = _git_out(['rev-parse', '--show-toplevel'], cwd=pane_path)
+    if not toplevel:
+        return
+    # Needs an upstream to compare against.
+    if _git_out(['rev-parse', '--abbrev-ref', '@{upstream}'],
+                cwd=toplevel) is None:
+        return
+    counts = _git_out(
+        ['rev-list', '--count', '--left-right', '@{upstream}...HEAD'],
+        cwd=toplevel)
+    if not counts:
+        return
+    parts = counts.split()
+    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+        return
+    behind, ahead = int(parts[0]), int(parts[1])
+    if ahead and behind:
+        sys.stdout.write(f' #[fg=#ff9e64]↑{ahead}↓{behind}#[default]')
+    elif behind:
+        sys.stdout.write(f' #[fg=#ff7a93]↓{behind}#[default]')
+    elif ahead:
+        sys.stdout.write(f' #[fg=#a9dc76]↑{ahead}#[default]')
+
+    # Background fetch if the per-repo marker is older than 2 minutes.
+    _TMUX_DIR.mkdir(parents=True, exist_ok=True)
+    key = str(Path(toplevel).resolve()).replace('/', '_')
+    marker = _TMUX_DIR / f'.fetch{key}'
+    now = time.time()
+    last = 0.0
+    if marker.is_file():
+        try:
+            last = float(marker.read_text().strip() or 0)
+        except (ValueError, OSError):
+            last = 0.0
+    if now - last > 120:
+        try:
+            marker.write_text(str(now))
+            subprocess.Popen(
+                ['git', '-C', str(toplevel), 'fetch', '--quiet'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError:
+            pass
+
+
+def _tmux_popup(cwd: str | None, command: list[str]) -> None:
+    """Run a command and show its output in a dynamically-sized tmux popup.
+
+    Captures the command's output to a temp file, sizes the popup to fit
+    (clamped to 80% of the window), and uses `less -R` when the content
+    overflows. Invoked by the backtick keybindings.
+    """
+    if not command:
+        subprocess.run(
+            ['tmux', 'display-message', 'hive tmux popup: no command'],
+            capture_output=True)
+        return
+
+    import tempfile
+    fd, tmpname = tempfile.mkstemp(prefix='hive-tmux-popup.')
+    os.close(fd)
+    tmpfile = Path(tmpname)
+    with open(tmpfile, 'w') as out:
+        try:
+            subprocess.run(command, cwd=cwd or None,
+                           stdout=out, stderr=subprocess.STDOUT)
+        except (OSError, FileNotFoundError) as exc:
+            out.write(f'hive tmux popup: {exc}\n')
+
+    def _dim(fmt: str, default: int) -> int:
+        r = subprocess.run(['tmux', 'display-message', '-p', fmt],
+                           capture_output=True, text=True)
+        try:
+            return int(r.stdout.strip())
+        except (ValueError, AttributeError):
+            return default
+
+    win_w = _dim('#{window_width}', 120)
+    win_h = _dim('#{window_height}', 40)
+    pop_w = max(40, min(120, win_w * 80 // 100))
+    line_count = len(tmpfile.read_text(errors='replace').splitlines())
+    pop_h = max(5, line_count + 2)
+    max_h = max(5, win_h * 80 // 100)
+    if pop_h > max_h:
+        # Content overflows — page it with less so the popup can scroll.
+        subprocess.run(['tmux', 'display-popup', '-w', str(pop_w),
+                        '-h', str(max_h), '-E',
+                        f"less -R '{tmpfile}'; rm -f '{tmpfile}'"])
+    else:
+        subprocess.run(['tmux', 'display-popup', '-w', str(pop_w),
+                        '-h', str(pop_h),
+                        f"cat '{tmpfile}'; rm -f '{tmpfile}'"])
 
 
 # --- Main ---------------------------------------------------------------------
@@ -2462,21 +2687,32 @@ def main():
     apiary_rm = apiary_sub.add_parser('remove', help='Remove a hive from the apiary')
     apiary_rm.add_argument('path', nargs='?', help='Path to remove (default: cwd)')
 
-    shell_parser = sub.add_parser(
-        'shell',
-        help='Start or attach to a dtach dev shell session',
+    tmux_parser = sub.add_parser(
+        'tmux',
+        help='Start or attach to a tmux dev session for a hive',
     )
-    shell_parser.add_argument(
+    tmux_parser.add_argument(
         '--hive',
         help='Hive short name or path (default: detect from cwd)',
     )
-    shell_parser.add_argument(
-        '--number', '-n', type=int,
-        help='Workspace number (skip clean-workspace search)',
+    tmux_parser.add_argument(
+        '--list', action='store_true', dest='list_hives',
+        help='List configured hives with their assigned colors',
     )
-    shell_sub = shell_parser.add_subparsers(dest='shell_action')
-    shell_sub.add_parser('list', help='List active dtach sessions')
-    shell_sub.add_parser('cleanup', help='Remove stale sessions')
+    tmux_parser.add_argument(
+        '--new-window', action='store_true',
+        help='Open a new window on an unused workspace in the current session',
+    )
+    tmux_sub = tmux_parser.add_subparsers(dest='tmux_action')
+    # Hidden helper actions, invoked by the generated tmux config.
+    tmux_label = tmux_sub.add_parser('label-window')
+    tmux_label.add_argument('pane_path')
+    tmux_label.add_argument('window_id')
+    tmux_gitsync = tmux_sub.add_parser('git-sync')
+    tmux_gitsync.add_argument('pane_path')
+    tmux_popup = tmux_sub.add_parser('popup')
+    tmux_popup.add_argument('--cwd')
+    tmux_popup.add_argument('command', nargs=argparse.REMAINDER)
 
     args = parser.parse_args()
 
@@ -2499,8 +2735,8 @@ def main():
         cmd_find_tmux_config(args)
     elif args.command == 'apiary':
         cmd_apiary(args)
-    elif args.command == 'shell':
-        cmd_shell(args)
+    elif args.command == 'tmux':
+        cmd_tmux(args)
 
 
 if __name__ == '__main__':

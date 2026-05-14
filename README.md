@@ -4,28 +4,28 @@ Public terminal baseline for macOS with:
 
 - Ghostty
 - `zsh` + `oh-my-zsh` + `powerlevel10k`
-- a `hive` workflow for multi-checkout hives and `dtach`-backed persistent shells
+- a `hive` workflow for multi-checkout hives and `tmux`-backed dev sessions
 
 ## Scope
 
 This repo is intentionally narrower than a personal dotfiles repo. It keeps:
 
 - terminal and shell baseline
-- `hive` / `apiary` / `dtach` workflow
+- `hive` / `apiary` / `tmux` workflow
 - a small bootstrap flow
 
 It avoids:
 
 - personal tokens and machine-local secrets
 - vendor- or employer-specific paths
-- tmux-specific workflow
 - language runtime clutter
 
 ## Layout
 
 - `ghostty/` terminal config and theme
-- `zsh/` shell config and hive prompt overlay
-- `scripts/hive.py` hive/apiary/dtach entrypoint
+- `zsh/` shell config
+- `tmux/` base tmux config (carries the Claude-CLI-safe settings)
+- `scripts/hive.py` hive/apiary/tmux entrypoint
 - `setup.sh` symlink installer
 - `setup/bootstrap-macos.sh` package/bootstrap helper
 - `local/` untracked per-machine overlay created by `setup.sh`
@@ -53,21 +53,25 @@ Template files in `local/` may be committed as examples using the normal
 
 This is the place for things like Node path tweaks, k3s helper scripts, or workstation-only tooling that should not be committed back to the public repo.
 
-## Hive Shell
+## Hive tmux
 
 Examples:
 
 ```bash
 hive status --compact
 hive create
-hive shell
-hive shell --hive ~/src/infra
-hive shell --number 3
-hive shell list
-hive shell cleanup
+hive tmux
+hive tmux --hive ~/src/infra
+hive tmux --list
+hive tmux --new-window
 ```
 
-`hive shell` uses `dtach`, not tmux, so Claude CLI and similar tools render as they do in a bare terminal while still surviving accidental window closure.
+`hive tmux` starts (or attaches to) a per-hive tmux session — one window per
+workspace, a per-hive color theme, automatic window labels, and backtick-prefix
+keybindings for the common hive operations. The session survives a closed
+terminal or a dropped SSH connection. The `tmux/tmux.conf` base config carries
+the settings that make Claude CLI render correctly inside tmux (notably
+`allow-passthrough on` plus synchronized output).
 
 ## Tests
 

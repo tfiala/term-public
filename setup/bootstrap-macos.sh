@@ -6,7 +6,7 @@ if ! command -v brew >/dev/null 2>&1; then
   exit 1
 fi
 
-brew install git gh jq ripgrep fd fzf bat eza dtach
+brew install git gh jq ripgrep fd fzf bat eza tmux
 brew install --cask ghostty
 
 if [[ ! -d "$HOME/.oh-my-zsh" ]]; then
