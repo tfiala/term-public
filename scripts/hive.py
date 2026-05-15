@@ -58,6 +58,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
@@ -2203,6 +2204,14 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
         '  tmux display-message "Not in a hive session";'
         'fi\'',
         '',
+        '# backtick + a: run-dsl status popup (hive only)',
+        'bind a run-shell -b \''
+        'if [ -n "$HIVE_ROOT" ]; then'
+        '  hive tmux popup --cwd "#{pane_current_path}" hive tmux runs --hive-root "$HIVE_ROOT";'
+        'else'
+        '  tmux display-message "Not in a hive session";'
+        'fi\'',
+        '',
         '# backtick + g/G/C-g: hive multi-repo management (hive only)',
         'bind g run-shell -b \''
         'if [ -n "$HIVE_ROOT" ]; then'
@@ -2302,6 +2311,199 @@ def _compute_window_label(workspace: Path) -> dict:
     return {'branch': branch, 'default': default, 'pr': pr, 'label': label}
 
 
+# --- run-dsl status integration -----------------------------------------------
+#
+# Surfaces run-dsl agent-job state per workspace inside `hive tmux`:
+#   - the backtick+a popup (`hive tmux runs`) — a full per-workspace table
+#   - a single-char suffix on each window label — only for attention-worthy
+#     states (running / failed / interrupted), so the label stays quiet
+#     when there's nothing to flag
+
+_ACC_RUNS_DIR = Path.home() / '.local' / 'state' / 'acc-runs'
+_RUN_HEARTBEAT_TTL = 300  # seconds — heartbeat older than this = interrupted
+
+
+def _parse_iso_timestamp(ts: str | None) -> float | None:
+    """Parse an ISO-8601 timestamp (with optional 'Z') into a Unix epoch."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _classify_run_state(sidecar: Path) -> str:
+    """Classify a run-dsl sidecar as running / succeeded / failed / interrupted.
+
+    - status.json present + success=true  → 'succeeded'
+    - status.json present + success=false → 'failed'
+    - status.json absent + heartbeat fresh → 'running'
+    - status.json absent + heartbeat stale → 'interrupted'
+    """
+    status_file = sidecar / 'status.json'
+    if status_file.is_file():
+        try:
+            status = json.loads(status_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            return 'interrupted'
+        return 'succeeded' if status.get('success') else 'failed'
+
+    runtime_file = sidecar / 'runtime.json'
+    if not runtime_file.is_file():
+        return 'interrupted'
+    try:
+        runtime = json.loads(runtime_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        return 'interrupted'
+    hb = _parse_iso_timestamp(runtime.get('last_heartbeat_at'))
+    if hb is None:
+        return 'interrupted'
+    return 'running' if (time.time() - hb) <= _RUN_HEARTBEAT_TTL else 'interrupted'
+
+
+def _workspace_run_state(workspace: Path) -> dict | None:
+    """Most-recent run-dsl run for ``workspace`` (workspaces are reused across
+    invocations — only the most recent one is interesting).
+
+    Returns dict ``{state, program, objective, sidecar, mtime}`` or None when
+    no run exists for this workspace. Compares by manifest mtime so it stays
+    correct as new runs land.
+    """
+    if not _ACC_RUNS_DIR.is_dir():
+        return None
+    try:
+        ws_resolved = workspace.resolve()
+    except OSError:
+        return None
+    best: tuple[float, dict] | None = None
+    for sidecar in _ACC_RUNS_DIR.iterdir():
+        if not sidecar.is_dir():
+            continue
+        manifest = sidecar / 'manifest.json'
+        if not manifest.is_file():
+            continue
+        try:
+            data = json.loads(manifest.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        wd = data.get('work_dir')
+        if not wd:
+            continue
+        try:
+            if Path(wd).resolve() != ws_resolved:
+                continue
+        except OSError:
+            continue
+        try:
+            mtime = manifest.stat().st_mtime
+        except OSError:
+            continue
+        if best is None or mtime > best[0]:
+            objective = data.get('objective') or ''
+            best = (mtime, {
+                'state': _classify_run_state(sidecar),
+                'program': data.get('program', ''),
+                'objective': objective.splitlines()[0] if objective else '',
+                'sidecar': sidecar,
+                'mtime': mtime,
+            })
+    return best[1] if best else None
+
+
+# Plain unicode (no ANSI): tmux rename-window takes plain text.
+_RUN_LABEL_INDICATOR = {
+    'running': '●',
+    'failed': '✗',
+    'interrupted': '…',
+    # 'succeeded' deliberately maps to nothing — recent success isn't noise.
+}
+
+
+def _run_state_label_suffix(workspace: Path) -> str:
+    """Single-char suffix for the window label reflecting run-dsl state,
+    or '' for none / succeeded. Only attention-worthy states are surfaced
+    so labels stay quiet by default."""
+    state = _workspace_run_state(workspace)
+    if state is None:
+        return ''
+    return _RUN_LABEL_INDICATOR.get(state['state'], '')
+
+
+def _format_run_age(state: dict) -> str:
+    """How long since the run last did something — compact: 30s / 8m / 2h / 3d.
+
+    Uses status.json.timestamp for terminal states, last_heartbeat_at /
+    started_at for live ones. Returns '' if no usable timestamp.
+    """
+    sidecar = state['sidecar']
+    ts = None
+    for name, key in (('status.json', 'timestamp'),
+                      ('runtime.json', 'last_heartbeat_at'),
+                      ('runtime.json', 'started_at')):
+        if ts:
+            break
+        f = sidecar / name
+        if f.is_file():
+            try:
+                ts = json.loads(f.read_text()).get(key)
+            except (json.JSONDecodeError, OSError):
+                ts = None
+    epoch = _parse_iso_timestamp(ts)
+    if epoch is None:
+        return ''
+    age = max(0, time.time() - epoch)
+    if age < 60:
+        return f'{int(age)}s'
+    if age < 3600:
+        return f'{int(age / 60)}m'
+    if age < 86400:
+        return f'{int(age / 3600)}h'
+    return f'{int(age / 86400)}d'
+
+
+def _tmux_runs(hive: Path) -> None:
+    """Print a per-workspace run-dsl status table — the backtick+a popup.
+
+    Lists only workspaces that have run history; workspaces with no
+    run-dsl record are skipped to keep the popup tight.
+    """
+    workspaces = _discover_workspaces(hive)
+    rows = []
+    for ws in workspaces:
+        state = _workspace_run_state(ws)
+        if state is None:
+            continue
+        rows.append((ws, state))
+
+    # The popup pipes through cat/less; ANSI passes through, so force colour on.
+    C.force_enable()
+
+    print(f'Runs in {_display_path(hive)}')
+    print()
+    if not rows:
+        print(C.dim('  (no run-dsl runs found for any workspace)'))
+        return
+
+    icons = {
+        'running':     ('●', C.cyan),
+        'succeeded':   ('✓', C.green),
+        'failed':      ('✗', C.bright_red),
+        'interrupted': ('…', C.yellow),
+    }
+    name_w = max(len(ws.name) for ws, _ in rows)
+    prog_w = max(len(s['program']) for _, s in rows)
+    prog_w = min(prog_w, 32)
+    for ws, state in rows:
+        char, colour = icons.get(state['state'], ('?', C.dim))
+        state_lbl = state['state']
+        prog = (state['program'] or '')[:prog_w]
+        age = _format_run_age(state)
+        obj = state['objective'][:80] if state['objective'] else ''
+        print(f'  {ws.name:<{name_w}}  {colour(char)} {state_lbl:<11} '
+              f'{prog:<{prog_w}}  {age:>4}  {C.dim(obj)}')
+
+
 def _tmux_label_window(pane_path: str, window_id: str) -> None:
     """Rename a tmux window to reflect its workspace's git state.
 
@@ -2309,6 +2511,10 @@ def _tmux_label_window(pane_path: str, window_id: str) -> None:
     and invalidated on branch change — the after-select-window/pane hooks
     fire often. Also refreshes the per-workspace PR cache the prompt
     segments read. Invoked by tmux hooks; fails silently.
+
+    The label-base (workspace + branch/PR) is cached; the run-dsl suffix
+    is recomputed each call (run state changes more dynamically than
+    branches, and per-call scanning is cheap).
     """
     if not pane_path or not window_id:
         return
@@ -2348,7 +2554,9 @@ def _tmux_label_window(pane_path: str, window_id: str) -> None:
         except OSError:
             pass
 
-    subprocess.run(['tmux', 'rename-window', '-t', window_id, data['label']],
+    suffix = _run_state_label_suffix(workspace)
+    label = f'{data["label"]} {suffix}' if suffix else data['label']
+    subprocess.run(['tmux', 'rename-window', '-t', window_id, label],
                    capture_output=True)
 
     # Refresh the per-workspace PR cache the prompt segments consume.
@@ -2378,6 +2586,14 @@ def cmd_tmux(args: argparse.Namespace) -> None:
         return
     if action == 'popup':
         _tmux_popup(getattr(args, 'cwd', None), args.command)
+        return
+    if action == 'runs':
+        hive = _resolve_tmux_hive(getattr(args, 'hive_root', None))
+        if hive is None:
+            print(f'{CROSS()} Not inside a hive — pass --hive-root',
+                  file=sys.stderr)
+            sys.exit(1)
+        _tmux_runs(hive)
         return
 
     if not _tmux_available():
@@ -2752,6 +2968,9 @@ def main():
     tmux_popup = tmux_sub.add_parser('popup')
     tmux_popup.add_argument('--cwd')
     tmux_popup.add_argument('command', nargs=argparse.REMAINDER)
+    tmux_runs = tmux_sub.add_parser('runs')
+    tmux_runs.add_argument('--hive-root', dest='hive_root',
+                           help='Hive root path (default: detect from cwd)')
 
     args = parser.parse_args()
 
