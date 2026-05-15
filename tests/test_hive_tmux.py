@@ -28,7 +28,7 @@ def fake_hive(tmp_path):
     """A hive root with three numbered workspaces plus a non-repo directory."""
     hive_root = tmp_path / 'infra'
     hive_root.mkdir()
-    for name in ['home-dc-1', 'home-dc-2', 'home-dc-3']:
+    for name in ['widget-1', 'widget-2', 'widget-3']:
         ws = hive_root / name
         ws.mkdir()
         (ws / '.git').mkdir()
@@ -164,13 +164,13 @@ class TestSessionHelpers:
         assert not hive._group_exists('infra', ['flow-1'])
 
     def test_workspace_number(self):
-        assert hive._workspace_number('home-dc-3') == '3'
+        assert hive._workspace_number('widget-3') == '3'
         assert hive._workspace_number('flow-app-12') == '12'
         assert hive._workspace_number('noname') is None
 
     def test_discover_workspaces(self, fake_hive):
         names = [w.name for w in hive._discover_workspaces(fake_hive)]
-        assert names == ['home-dc-1', 'home-dc-2', 'home-dc-3']
+        assert names == ['widget-1', 'widget-2', 'widget-3']
 
 
 class TestResolveTmuxHive:
@@ -220,56 +220,56 @@ def _git_out_for_branch(branch):
 
 class TestComputeWindowLabel:
     def test_default_branch_is_bare_name(self, tmp_path):
-        ws = tmp_path / 'home-dc-1'
+        ws = tmp_path / 'widget-1'
         ws.mkdir()
         with patch.object(hive, '_git_out', _git_out_for_branch('main')), \
              patch.object(hive, '_default_branch', return_value='main'):
             data = hive._compute_window_label(ws)
-        assert data['label'] == 'home-dc-1'
+        assert data['label'] == 'widget-1'
         assert data['pr'] is None
 
     def test_feature_branch_without_pr(self, tmp_path):
-        ws = tmp_path / 'home-dc-1'
+        ws = tmp_path / 'widget-1'
         ws.mkdir()
         with patch.object(hive, '_git_out', _git_out_for_branch('feat/thing')), \
              patch.object(hive, '_default_branch', return_value='main'), \
              patch.object(hive, '_get_pr_info', return_value=None):
             data = hive._compute_window_label(ws)
-        assert data['label'] == 'home-dc-1/thing'
+        assert data['label'] == 'widget-1/thing'
 
     def test_feature_branch_with_open_pr(self, tmp_path):
-        ws = tmp_path / 'home-dc-1'
+        ws = tmp_path / 'widget-1'
         ws.mkdir()
         with patch.object(hive, '_git_out', _git_out_for_branch('feat/thing')), \
              patch.object(hive, '_default_branch', return_value='main'), \
              patch.object(hive, '_get_pr_info',
                           return_value={'number': 42, 'state': 'open'}):
             data = hive._compute_window_label(ws)
-        assert data['label'] == 'home-dc-1#42'
+        assert data['label'] == 'widget-1#42'
         assert data['pr'] == 42
 
     def test_closed_pr_not_used(self, tmp_path):
-        ws = tmp_path / 'home-dc-1'
+        ws = tmp_path / 'widget-1'
         ws.mkdir()
         with patch.object(hive, '_git_out', _git_out_for_branch('feat/thing')), \
              patch.object(hive, '_default_branch', return_value='main'), \
              patch.object(hive, '_get_pr_info',
                           return_value={'number': 7, 'state': 'merged'}):
             data = hive._compute_window_label(ws)
-        assert data['label'] == 'home-dc-1/thing'
+        assert data['label'] == 'widget-1/thing'
         assert data['pr'] is None
 
 
 class TestLabelCacheKey:
     def test_includes_leaf_name(self, tmp_path):
-        ws = tmp_path / 'home-dc-1'
+        ws = tmp_path / 'widget-1'
         ws.mkdir()
         key = hive._label_cache_key(ws)
-        assert key.startswith('label-home-dc-1-')
+        assert key.startswith('label-widget-1-')
 
     def test_distinct_for_same_leaf_different_path(self, tmp_path):
-        a = tmp_path / 'hive-a' / 'home-dc-1'
-        b = tmp_path / 'hive-b' / 'home-dc-1'
+        a = tmp_path / 'hive-a' / 'widget-1'
+        b = tmp_path / 'hive-b' / 'widget-1'
         a.mkdir(parents=True)
         b.mkdir(parents=True)
         assert hive._label_cache_key(a) != hive._label_cache_key(b)
@@ -297,7 +297,7 @@ class TestLabelWindow:
         run.assert_not_called()
 
     def test_fresh_cache_skips_recompute(self, tmp_path):
-        ws = tmp_path / 'home-dc-1'
+        ws = tmp_path / 'widget-1'
         (ws / '.git').mkdir(parents=True)
         tmux_dir = tmp_path / 'hive-tmux'
 
@@ -310,7 +310,7 @@ class TestLabelWindow:
 
         compute = MagicMock(return_value={
             'branch': 'feat/thing', 'default': 'main',
-            'pr': 5, 'label': 'home-dc-1#5',
+            'pr': 5, 'label': 'widget-1#5',
         })
         with patch.object(hive, '_TMUX_DIR', tmux_dir), \
              patch.object(hive, '_git_out', side_effect=fake_git_out), \
@@ -323,7 +323,7 @@ class TestLabelWindow:
         assert compute.call_count == 1
 
     def test_branch_change_invalidates_cache(self, tmp_path):
-        ws = tmp_path / 'home-dc-1'
+        ws = tmp_path / 'widget-1'
         (ws / '.git').mkdir(parents=True)
         tmux_dir = tmp_path / 'hive-tmux'
         branch = {'name': 'feat/one'}
@@ -337,7 +337,7 @@ class TestLabelWindow:
 
         compute = MagicMock(side_effect=lambda w: {
             'branch': branch['name'], 'default': 'main',
-            'pr': None, 'label': f'home-dc-1/{branch["name"]}',
+            'pr': None, 'label': f'widget-1/{branch["name"]}',
         })
         with patch.object(hive, '_TMUX_DIR', tmux_dir), \
              patch.object(hive, '_git_out', side_effect=fake_git_out), \
@@ -350,7 +350,7 @@ class TestLabelWindow:
         assert compute.call_count == 2
 
     def test_writes_pr_cache_for_numbered_workspace(self, tmp_path):
-        ws = tmp_path / 'infra' / 'home-dc-3'
+        ws = tmp_path / 'infra' / 'widget-3'
         (ws / '.git').mkdir(parents=True)
         tmux_dir = tmp_path / 'hive-tmux'
 
@@ -363,7 +363,7 @@ class TestLabelWindow:
 
         compute = MagicMock(return_value={
             'branch': 'feat/thing', 'default': 'main',
-            'pr': 99, 'label': 'home-dc-3#99',
+            'pr': 99, 'label': 'widget-3#99',
         })
         with patch.object(hive, '_TMUX_DIR', tmux_dir), \
              patch.object(hive, '_git_out', side_effect=fake_git_out), \
@@ -517,19 +517,19 @@ class TestUsedWorkspaces:
     def test_exact_pane_path_counts_workspace(self, fake_hive):
         workspaces = hive._discover_workspaces(fake_hive)
         with patch.object(hive, '_windows_in_session',
-                          return_value=[str(fake_hive / 'home-dc-1')]):
+                          return_value=[str(fake_hive / 'widget-1')]):
             used = hive._used_workspaces('infra-0', workspaces)
-        assert fake_hive / 'home-dc-1' in used
-        assert fake_hive / 'home-dc-2' not in used
+        assert fake_hive / 'widget-1' in used
+        assert fake_hive / 'widget-2' not in used
 
     def test_pane_in_subdir_still_counts_workspace(self, fake_hive):
         # A pane that has cd'd below the workspace root must still mark the
         # workspace as used (ADR-0063 review finding P2).
         workspaces = hive._discover_workspaces(fake_hive)
         with patch.object(hive, '_windows_in_session',
-                          return_value=[str(fake_hive / 'home-dc-1' / 'scripts')]):
+                          return_value=[str(fake_hive / 'widget-1' / 'scripts')]):
             used = hive._used_workspaces('infra-0', workspaces)
-        assert fake_hive / 'home-dc-1' in used
+        assert fake_hive / 'widget-1' in used
 
     def test_pane_outside_any_workspace_ignored(self, fake_hive, tmp_path):
         workspaces = hive._discover_workspaces(fake_hive)
@@ -558,31 +558,31 @@ class TestTmuxStartNewWindow:
         return runs
 
     def test_new_window_picks_unused_workspace(self, fake_hive):
-        runs = self._run_new_window(fake_hive, [str(fake_hive / 'home-dc-1')])
+        runs = self._run_new_window(fake_hive, [str(fake_hive / 'widget-1')])
         assert len(runs) == 1
         cmd = runs[0]
-        # Opens a window on the first unused workspace (home-dc-2)...
+        # Opens a window on the first unused workspace (widget-2)...
         assert cmd[:6] == ['tmux', 'new-window', '-t', 'infra-0',
-                           '-c', str(fake_hive / 'home-dc-2')]
+                           '-c', str(fake_hive / 'widget-2')]
         # ...with the HIVE_* env seeded at creation time.
         assert '-e' in cmd
         assert 'HIVE_NAME=infra' in cmd
         assert 'HIVE_NUMBER=2' in cmd
 
     def test_new_window_skips_workspace_with_pane_in_subdir(self, fake_hive):
-        # home-dc-1 has a pane sitting in a subdirectory — it must still be
-        # treated as used, so the new window lands on home-dc-2, not a
-        # duplicate home-dc-1 (ADR-0063 review finding P2).
+        # widget-1 has a pane sitting in a subdirectory — it must still be
+        # treated as used, so the new window lands on widget-2, not a
+        # duplicate widget-1 (ADR-0063 review finding P2).
         runs = self._run_new_window(
-            fake_hive, [str(fake_hive / 'home-dc-1' / 'scripts')])
+            fake_hive, [str(fake_hive / 'widget-1' / 'scripts')])
         assert len(runs) == 1
         assert runs[0][:6] == ['tmux', 'new-window', '-t', 'infra-0',
-                               '-c', str(fake_hive / 'home-dc-2')]
+                               '-c', str(fake_hive / 'widget-2')]
 
     def test_new_window_falls_back_to_hive_root(self, fake_hive):
         # Every workspace already windowed — open in the hive root, no
         # HIVE_NUMBER, no error.
-        panes = [str(fake_hive / f'home-dc-{n}') for n in (1, 2, 3)]
+        panes = [str(fake_hive / f'widget-{n}') for n in (1, 2, 3)]
         runs = self._run_new_window(fake_hive, panes)
         assert len(runs) == 1
         assert runs[0][:6] == ['tmux', 'new-window', '-t', 'infra-0',
@@ -607,7 +607,7 @@ class TestPaneEnvironmentProbe:
     process environment (ADR-0063 review finding P1)."""
 
     def test_env_args_reach_pane_process_env(self, tmp_path):
-        ws = tmp_path / 'infra' / 'home-dc-7'
+        ws = tmp_path / 'infra' / 'widget-7'
         ws.mkdir(parents=True)
         env_args = hive._tmux_env_args(
             ws.parent, 'infra', hive._SHELL_PALETTE[0], '7')
@@ -700,7 +700,7 @@ class TestClassifyRunState:
 
 class TestWorkspaceRunState:
     def test_no_acc_runs_dir_returns_none(self, tmp_path):
-        ws = tmp_path / 'home-dc-1'
+        ws = tmp_path / 'widget-1'
         ws.mkdir()
         with patch.object(hive, '_ACC_RUNS_DIR', tmp_path / 'nonexistent'):
             assert hive._workspace_run_state(ws) is None
@@ -708,7 +708,7 @@ class TestWorkspaceRunState:
     def test_workspace_with_no_runs_returns_none(self, tmp_path):
         acc = tmp_path / 'acc-runs'
         acc.mkdir()
-        ws = tmp_path / 'home-dc-1'
+        ws = tmp_path / 'widget-1'
         ws.mkdir()
         # A sidecar for a *different* work_dir.
         _write_sidecar(acc, 'a', work_dir=tmp_path / 'other')
@@ -718,7 +718,7 @@ class TestWorkspaceRunState:
     def test_picks_most_recent_run(self, tmp_path):
         acc = tmp_path / 'acc-runs'
         acc.mkdir()
-        ws = tmp_path / 'home-dc-1'
+        ws = tmp_path / 'widget-1'
         ws.mkdir()
         older = _write_sidecar(acc, 'old', work_dir=ws, status=False,
                                objective='Old run')
@@ -738,7 +738,7 @@ class TestRunStateLabelSuffix:
     def test_running_returns_dot(self, tmp_path):
         acc = tmp_path / 'acc-runs'
         acc.mkdir()
-        ws = tmp_path / 'home-dc-1'
+        ws = tmp_path / 'widget-1'
         ws.mkdir()
         _write_sidecar(acc, 's', work_dir=ws, heartbeat_age=10)
         with patch.object(hive, '_ACC_RUNS_DIR', acc):
@@ -747,7 +747,7 @@ class TestRunStateLabelSuffix:
     def test_failed_returns_cross(self, tmp_path):
         acc = tmp_path / 'acc-runs'
         acc.mkdir()
-        ws = tmp_path / 'home-dc-1'
+        ws = tmp_path / 'widget-1'
         ws.mkdir()
         _write_sidecar(acc, 's', work_dir=ws, status=False)
         with patch.object(hive, '_ACC_RUNS_DIR', acc):
@@ -756,7 +756,7 @@ class TestRunStateLabelSuffix:
     def test_interrupted_returns_ellipsis(self, tmp_path):
         acc = tmp_path / 'acc-runs'
         acc.mkdir()
-        ws = tmp_path / 'home-dc-1'
+        ws = tmp_path / 'widget-1'
         ws.mkdir()
         _write_sidecar(acc, 's', work_dir=ws,
                        heartbeat_age=hive._RUN_HEARTBEAT_TTL + 100)
@@ -767,14 +767,14 @@ class TestRunStateLabelSuffix:
         # Recent-success is informational only — keep the label clean.
         acc = tmp_path / 'acc-runs'
         acc.mkdir()
-        ws = tmp_path / 'home-dc-1'
+        ws = tmp_path / 'widget-1'
         ws.mkdir()
         _write_sidecar(acc, 's', work_dir=ws, status=True)
         with patch.object(hive, '_ACC_RUNS_DIR', acc):
             assert hive._run_state_label_suffix(ws) == ''
 
     def test_no_runs_returns_empty(self, tmp_path):
-        ws = tmp_path / 'home-dc-1'
+        ws = tmp_path / 'widget-1'
         ws.mkdir()
         with patch.object(hive, '_ACC_RUNS_DIR', tmp_path / 'nonexistent'):
             assert hive._run_state_label_suffix(ws) == ''
@@ -791,38 +791,38 @@ class TestTmuxRunsPopup:
     def test_lists_workspaces_with_runs(self, fake_hive, tmp_path, capsys):
         acc = tmp_path / 'acc-runs'
         acc.mkdir()
-        _write_sidecar(acc, 'a', work_dir=fake_hive / 'home-dc-1',
+        _write_sidecar(acc, 'a', work_dir=fake_hive / 'widget-1',
                        status=True, program='channel-review',
                        objective='Review the thing')
-        _write_sidecar(acc, 'b', work_dir=fake_hive / 'home-dc-2',
+        _write_sidecar(acc, 'b', work_dir=fake_hive / 'widget-2',
                        heartbeat_age=5, program='channel-brainstorm',
                        objective='Brainstorm thing')
         with patch.object(hive, '_ACC_RUNS_DIR', acc):
             hive._tmux_runs(fake_hive)
         out = capsys.readouterr().out
-        assert 'home-dc-1' in out and 'succeeded' in out
-        assert 'home-dc-2' in out and 'running' in out
+        assert 'widget-1' in out and 'succeeded' in out
+        assert 'widget-2' in out and 'running' in out
         assert 'channel-review' in out
         assert 'Brainstorm thing' in out
 
     def test_omits_workspaces_without_runs(self, fake_hive, tmp_path, capsys):
         acc = tmp_path / 'acc-runs'
         acc.mkdir()
-        _write_sidecar(acc, 'a', work_dir=fake_hive / 'home-dc-2', status=True)
+        _write_sidecar(acc, 'a', work_dir=fake_hive / 'widget-2', status=True)
         with patch.object(hive, '_ACC_RUNS_DIR', acc):
             hive._tmux_runs(fake_hive)
         out = capsys.readouterr().out
-        assert 'home-dc-2' in out
-        # home-dc-1 and home-dc-3 have no runs — must not appear in the body.
+        assert 'widget-2' in out
+        # widget-1 and widget-3 have no runs — must not appear in the body.
         # (The "Runs in <hive>" header itself doesn't mention workspace names.)
         body = out.split('\n', 2)[-1] if '\n' in out else out
-        assert 'home-dc-1' not in body
-        assert 'home-dc-3' not in body
+        assert 'widget-1' not in body
+        assert 'widget-3' not in body
 
 
 class TestLabelWindowRunSuffix:
     def test_appends_running_suffix(self, tmp_path):
-        ws = tmp_path / 'home-dc-1'
+        ws = tmp_path / 'widget-1'
         (ws / '.git').mkdir(parents=True)
         acc = tmp_path / 'acc-runs'
         acc.mkdir()
@@ -849,10 +849,10 @@ class TestLabelWindowRunSuffix:
              patch.object(hive.subprocess, 'run', side_effect=fake_run):
             hive._tmux_label_window(str(ws), '@1')
 
-        assert renames == ['home-dc-1 ●']
+        assert renames == ['widget-1 ●']
 
     def test_no_suffix_when_no_run(self, tmp_path):
-        ws = tmp_path / 'home-dc-1'
+        ws = tmp_path / 'widget-1'
         (ws / '.git').mkdir(parents=True)
 
         renames = []
@@ -876,4 +876,4 @@ class TestLabelWindowRunSuffix:
              patch.object(hive.subprocess, 'run', side_effect=fake_run):
             hive._tmux_label_window(str(ws), '@1')
 
-        assert renames == ['home-dc-1']
+        assert renames == ['widget-1']
