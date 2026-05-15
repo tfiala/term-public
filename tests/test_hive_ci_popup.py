@@ -239,6 +239,93 @@ class TestGetTokenFromCredentials:
         assert token is None
 
 
+class TestApiGet:
+    """Tests for _api_get() error handling — opt-in 404 suppression."""
+
+    def _http_error(self, code):
+        from urllib.error import HTTPError
+        return HTTPError('http://x', code, 'Not Found', {}, None)
+
+    def test_404_prints_by_default(self, monkeypatch, capsys):
+        """By default a 404 is treated like any other HTTP error — it could
+        mean renamed repo / wrong remote / missing endpoint and must surface."""
+        monkeypatch.setattr(hive_ci_popup, 'urlopen',
+                            mock.MagicMock(side_effect=self._http_error(404)))
+        result = hive_ci_popup._api_get('https://x', 'tok', '/repos/o/r/actions/runs')
+        assert result == []
+        assert 'API error' in capsys.readouterr().out
+
+    def test_404_silenced_when_opted_in(self, monkeypatch, capsys):
+        """With silence_404=True (used by _get_pr_state), 404 is treated as
+        'no data at that index' and must not print to the popup."""
+        monkeypatch.setattr(hive_ci_popup, 'urlopen',
+                            mock.MagicMock(side_effect=self._http_error(404)))
+        result = hive_ci_popup._api_get('https://x', 'tok', '/pulls/9999',
+                                        silence_404=True)
+        assert result == []
+        assert capsys.readouterr().out == ''
+
+    def test_silence_404_still_reports_other_http_errors(self, monkeypatch, capsys):
+        """silence_404 must NOT silence 500 (or other non-404 HTTP errors)."""
+        monkeypatch.setattr(hive_ci_popup, 'urlopen',
+                            mock.MagicMock(side_effect=self._http_error(500)))
+        result = hive_ci_popup._api_get('https://x', 'tok', '/pulls/1',
+                                        silence_404=True)
+        assert result == []
+        assert 'API error' in capsys.readouterr().out
+
+    def test_prints_non_404_http_errors(self, monkeypatch, capsys):
+        """A 500 (or other non-404 HTTP error) is genuine and is reported."""
+        monkeypatch.setattr(hive_ci_popup, 'urlopen',
+                            mock.MagicMock(side_effect=self._http_error(500)))
+        result = hive_ci_popup._api_get('https://x', 'tok', '/pulls/1')
+        assert result == []
+        assert 'API error' in capsys.readouterr().out
+
+    def test_prints_network_errors(self, monkeypatch, capsys):
+        """A non-HTTP exception (timeout / DNS / connection) is reported."""
+        from urllib.error import URLError
+        monkeypatch.setattr(hive_ci_popup, 'urlopen',
+                            mock.MagicMock(side_effect=URLError('refused')))
+        result = hive_ci_popup._api_get('https://x', 'tok', '/anything')
+        assert result == []
+        assert 'API error' in capsys.readouterr().out
+
+
+class TestGetPrState:
+    """Tests for _get_pr_state() — passes silence_404=True to _api_get."""
+
+    def test_passes_silence_404_true(self, monkeypatch):
+        captured = {}
+
+        def fake_api_get(base_url, token, path, silence_404=False):
+            captured['path'] = path
+            captured['silence_404'] = silence_404
+            return {}
+
+        monkeypatch.setattr(hive_ci_popup, '_api_get', fake_api_get)
+        hive_ci_popup._get_pr_state('https://x', 'o', 'r', 'tok', 9999)
+        assert captured['silence_404'] is True
+        assert captured['path'] == '/repos/o/r/pulls/9999'
+
+
+class TestGetRuns:
+    """Tests for _get_runs() — must NOT silence 404 (a real fetch failure)."""
+
+    def test_does_not_silence_404(self, monkeypatch):
+        captured = {}
+
+        def fake_api_get(base_url, token, path, silence_404=False):
+            captured['silence_404'] = silence_404
+            return {'workflow_runs': []}
+
+        monkeypatch.setattr(hive_ci_popup, '_api_get', fake_api_get)
+        hive_ci_popup._get_runs('https://x', 'o', 'r', 'tok')
+        # _get_runs must rely on the default (False) so a missing/renamed
+        # repo surfaces as an API error rather than "No recent runs".
+        assert captured['silence_404'] is False
+
+
 class TestVisLen:
     """Tests for _vis_len()."""
 
