@@ -2664,7 +2664,7 @@ def _used_workspaces(session: str, workspaces: list[Path]) -> set[Path]:
 
     Pane paths are normalized to their containing workspace, so a pane
     sitting in a subdirectory of a workspace (e.g. after the user `cd`s
-    into `home-dc-1/scripts`) still counts that workspace as used.
+    into `widget-1/scripts`) still counts that workspace as used.
     """
     resolved = {ws: ws.resolve() for ws in workspaces}
     used: set[Path] = set()
