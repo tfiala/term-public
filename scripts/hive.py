@@ -38,8 +38,9 @@ Examples:
   hive.py issues
   hive.py --apiary issues
   hive.py create
+  hive.py create https://git.example.com/acme/widget.git
   hive.py create --name-prefix my-project
-  hive.py local clone hellenic-flow/corpus
+  hive.py local clone acme/widget
   hive.py local pull
   hive.py apiary list
   hive.py apiary add ~/src/flow
@@ -108,8 +109,6 @@ def CHECK():
 
 def CROSS():
     return C.bright_red('✗')
-
-FLOW_APP_CLONE_URL = 'http://git.flow.internal:3000/hellenic-flow/flow-app.git'
 
 _ANSI_RE = re.compile(r'\033\[[0-9;]*m')
 
@@ -1559,8 +1558,8 @@ def _get_repo_slug(repo_path: Path) -> str | None:
     same org/repo path are not collapsed during deduplication.
 
     Handles HTTPS and SSH URLs:
-      https://git.home.invezt.io/infra/home-dc.git → git.home.invezt.io/infra/home-dc
-      git@git.home.invezt.io:infra/home-dc.git → git.home.invezt.io/infra/home-dc
+      https://git.example.com/acme/widget.git → git.example.com/acme/widget
+      git@git.example.com:acme/widget.git → git.example.com/acme/widget
     """
     url = _git_out(['remote', 'get-url', 'origin'], cwd=repo_path)
     if not url:
@@ -1718,6 +1717,21 @@ def cmd_issues(args: argparse.Namespace) -> None:
 # --- Create -------------------------------------------------------------------
 
 
+def _infer_clone_url_from_siblings(hive: Path) -> str | None:
+    """If every sibling git workspace in ``hive`` shares one origin URL,
+    return it. Returns None when there is no shared origin (empty hive, or
+    workspaces pointing at different remotes) — the caller must supply a URL.
+    """
+    urls: set[str] = set()
+    for entry in sorted(hive.iterdir()):
+        if not entry.is_dir() or not (entry / '.git').exists():
+            continue
+        url = _git_out(['remote', 'get-url', 'origin'], cwd=entry)
+        if url:
+            urls.add(url)
+    return urls.pop() if len(urls) == 1 else None
+
+
 def cmd_create(args: argparse.Namespace) -> None:
     """Execute the create subcommand."""
     if getattr(args, 'apiary', False):
@@ -1728,14 +1742,22 @@ def cmd_create(args: argparse.Namespace) -> None:
     if hive is None:
         print(f'{CROSS()} Not inside a git repository or hive root', file=sys.stderr)
         sys.exit(1)
+
+    clone_url = getattr(args, 'url', None)
+    if not clone_url:
+        clone_url = _infer_clone_url_from_siblings(hive)
+        if not clone_url:
+            print(f'{CROSS()} No shared origin among hive workspaces — pass a '
+                  f'URL explicitly: hive create <url>', file=sys.stderr)
+            sys.exit(1)
+
     target = _infer_next_repo_dir(hive, getattr(args, 'name_prefix', None))
 
     print(f'Hive: {C.dim(str(hive))}')
 
-    # Clone flow-app
     spinner = _Spinner()
-    spinner.start(f'Cloning flow-app into {target.name}...')
-    r = _git(['clone', FLOW_APP_CLONE_URL, str(target)])
+    spinner.start(f'Cloning {clone_url} into {target.name}...')
+    r = _git(['clone', clone_url, str(target)])
     spinner.stop()
 
     if r.returncode != 0:
@@ -1888,7 +1910,7 @@ def _local_clone(args: argparse.Namespace) -> None:
     repo_name = args.repo
 
     if '/' not in repo_name:
-        print(f'{CROSS()} Use org/repo format (e.g. hellenic-flow/corpus)', file=sys.stderr)
+        print(f'{CROSS()} Use org/repo format (e.g. acme/widget)', file=sys.stderr)
         sys.exit(1)
 
     clone_dir_name = repo_name.rsplit('/', 1)[-1]
@@ -2673,7 +2695,15 @@ def main():
 
     sub.add_parser('issues', help='List open Forgejo issues for each unique repo')
 
-    create_parser = sub.add_parser('create', help='Clone a new repo into the hive')
+    create_parser = sub.add_parser(
+        'create',
+        help='Clone a new repo into the hive (URL or inferred from siblings)',
+    )
+    create_parser.add_argument(
+        'url', nargs='?',
+        help='Git clone URL. If omitted, inferred from existing sibling '
+             'workspaces (when they all share one origin)',
+    )
     create_parser.add_argument(
         '--name-prefix',
         help='Explicit prefix (skips inference from existing repos)',
