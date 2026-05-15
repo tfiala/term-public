@@ -309,7 +309,7 @@ def _get_token_from_credentials(base_url: str) -> str | None:
 # --- API ----------------------------------------------------------------------
 
 
-def _api_get(base_url: str, token: str, path: str) -> list | dict:
+def _api_get(base_url: str, token: str, path: str, silence_404: bool = False) -> list | dict:
     url = f'{base_url}/api/v1{path}'
     req = Request(url, headers={
         'Authorization': f'token {token}',
@@ -319,14 +319,15 @@ def _api_get(base_url: str, token: str, path: str) -> list | dict:
         with urlopen(req, timeout=8) as resp:
             return json.loads(resp.read().decode())
     except HTTPError as e:
-        # 404 is expected when looking up a per-repo resource that doesn't
-        # exist at the requested index — most commonly _get_pr_state querying
-        # /pulls/{N} where N came from a run's `prettyref` but isn't a valid
-        # PR index on this repo (cross-repo triggers, issue refs, or other
-        # cases where Forgejo's prettyref doesn't map to a real PR here).
-        # Treat as no-data rather than printing popup-noise error lines.
-        if e.code != 404:
-            print(f'\033[31mAPI error: {e}\033[0m')
+        # `silence_404` is opt-in per-caller: only set it for endpoints where
+        # 404 is an expected "no data at that index" outcome (see
+        # `_get_pr_state`). For most endpoints — actions/runs, repo metadata
+        # — a 404 means renamed/missing repo or wrong parsed remote and must
+        # still surface so the popup doesn't quietly turn into "No recent
+        # runs".
+        if silence_404 and e.code == 404:
+            return []
+        print(f'\033[31mAPI error: {e}\033[0m')
         return []
     except Exception as e:
         print(f'\033[31mAPI error: {e}\033[0m')
@@ -341,8 +342,16 @@ def _get_runs(base_url: str, owner: str, repo: str, token: str, limit: int = 10)
 
 
 def _get_pr_state(base_url: str, owner: str, repo: str, token: str, pr_num: int) -> str:
-    """Get PR state: 'open', 'merged', or 'closed'."""
-    data = _api_get(base_url, token, f'/repos/{owner}/{repo}/pulls/{pr_num}')
+    """Get PR state: 'open', 'merged', or 'closed'.
+
+    Passes ``silence_404=True`` because the ``pr_num`` arg often comes from a
+    workflow run's ``prettyref`` (e.g. ``#2821``), which on this Forgejo
+    instance does not always map to a valid per-repo PR index — cross-repo
+    triggers, issue refs, etc. The per-repo ``/pulls/{N}`` endpoint correctly
+    404s in those cases, and we should treat it as "no PR data" rather than
+    printing red API-error lines at the top of the popup.
+    """
+    data = _api_get(base_url, token, f'/repos/{owner}/{repo}/pulls/{pr_num}', silence_404=True)
     if isinstance(data, dict):
         if data.get('merged_at') or data.get('merged'):
             return 'merged'
