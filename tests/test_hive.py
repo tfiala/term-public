@@ -280,6 +280,137 @@ class TestCmdCreateApiary:
         assert 'not supported in apiary mode' in err
 
 
+# --- cmd_create URL / sibling-inference tests --------------------------------
+
+
+class TestCmdCreate:
+    """Tests for `hive create [<url>]` — URL handling and sibling inference."""
+
+    def _hive_with_siblings(self, tmp_path, names):
+        hive_root = tmp_path / 'hive'
+        hive_root.mkdir()
+        for name in names:
+            ws = hive_root / name
+            ws.mkdir()
+            (ws / '.git').mkdir()
+        return hive_root
+
+    def _make_git_out(self, origins):
+        def fake(args, cwd=None):
+            if args[:3] == ['remote', 'get-url', 'origin'] and cwd:
+                return origins.get(Path(cwd).name)
+            return None
+        return fake
+
+    def test_explicit_url_clones_from_it(self, tmp_path):
+        hive_root = self._hive_with_siblings(tmp_path, [])
+        target = hive_root / 'repo-1'
+        runs = []
+
+        def fake_git(args, cwd=None, timeout=None):
+            runs.append(args)
+            return subprocess.CompletedProcess(args, 0, stdout='', stderr='')
+
+        args = hive.argparse.Namespace(
+            apiary=False, url='https://x/y.git', name_prefix=None, color=False)
+        with patch.object(hive, '_find_hive_root', return_value=hive_root), \
+             patch.object(hive, '_infer_next_repo_dir', return_value=target), \
+             patch.object(hive, '_git', side_effect=fake_git):
+            hive.cmd_create(args)
+
+        assert runs == [['clone', 'https://x/y.git', str(target)]]
+
+    def test_no_url_infers_from_siblings(self, tmp_path):
+        hive_root = self._hive_with_siblings(tmp_path, ['repo-1'])
+        target = hive_root / 'repo-2'
+        runs = []
+
+        def fake_git(args, cwd=None, timeout=None):
+            runs.append(args)
+            return subprocess.CompletedProcess(args, 0, stdout='', stderr='')
+
+        args = hive.argparse.Namespace(
+            apiary=False, url=None, name_prefix=None, color=False)
+        with patch.object(hive, '_find_hive_root', return_value=hive_root), \
+             patch.object(hive, '_infer_next_repo_dir', return_value=target), \
+             patch.object(hive, '_git_out',
+                          side_effect=self._make_git_out(
+                              {'repo-1': 'https://x/y.git'})), \
+             patch.object(hive, '_git', side_effect=fake_git):
+            hive.cmd_create(args)
+
+        assert runs == [['clone', 'https://x/y.git', str(target)]]
+
+    def test_no_url_empty_hive_exits(self, tmp_path, capsys):
+        hive_root = tmp_path / 'hive'
+        hive_root.mkdir()
+        args = hive.argparse.Namespace(
+            apiary=False, url=None, name_prefix=None, color=False)
+        with patch.object(hive, '_find_hive_root', return_value=hive_root):
+            with pytest.raises(SystemExit):
+                hive.cmd_create(args)
+        assert 'No shared origin' in capsys.readouterr().err
+
+    def test_no_url_mixed_origins_exits(self, tmp_path, capsys):
+        hive_root = self._hive_with_siblings(tmp_path, ['repo-1', 'repo-2'])
+        args = hive.argparse.Namespace(
+            apiary=False, url=None, name_prefix=None, color=False)
+        with patch.object(hive, '_find_hive_root', return_value=hive_root), \
+             patch.object(hive, '_git_out',
+                          side_effect=self._make_git_out(
+                              {'repo-1': 'https://a/x.git',
+                               'repo-2': 'https://b/x.git'})):
+            with pytest.raises(SystemExit):
+                hive.cmd_create(args)
+        assert 'No shared origin' in capsys.readouterr().err
+
+
+class TestInferCloneUrlFromSiblings:
+    def test_returns_shared_url_when_all_match(self, tmp_path):
+        hive_root = tmp_path / 'hive'
+        hive_root.mkdir()
+        for name in ['repo-1', 'repo-2']:
+            ws = hive_root / name
+            ws.mkdir()
+            (ws / '.git').mkdir()
+        with patch.object(hive, '_git_out',
+                          return_value='https://shared/x.git'):
+            assert hive._infer_clone_url_from_siblings(hive_root) == \
+                'https://shared/x.git'
+
+    def test_returns_none_for_empty_hive(self, tmp_path):
+        hive_root = tmp_path / 'hive'
+        hive_root.mkdir()
+        assert hive._infer_clone_url_from_siblings(hive_root) is None
+
+    def test_returns_none_for_mixed_origins(self, tmp_path):
+        hive_root = tmp_path / 'hive'
+        hive_root.mkdir()
+        for name in ['repo-1', 'repo-2']:
+            ws = hive_root / name
+            ws.mkdir()
+            (ws / '.git').mkdir()
+        urls = {'repo-1': 'https://a/x.git', 'repo-2': 'https://b/x.git'}
+
+        def fake(args, cwd=None):
+            return urls.get(Path(cwd).name) if cwd else None
+
+        with patch.object(hive, '_git_out', side_effect=fake):
+            assert hive._infer_clone_url_from_siblings(hive_root) is None
+
+    def test_ignores_non_git_directories(self, tmp_path):
+        hive_root = tmp_path / 'hive'
+        hive_root.mkdir()
+        (hive_root / 'notes').mkdir()  # no .git — must be ignored
+        ws = hive_root / 'repo-1'
+        ws.mkdir()
+        (ws / '.git').mkdir()
+        with patch.object(hive, '_git_out',
+                          return_value='https://x/y.git'):
+            assert hive._infer_clone_url_from_siblings(hive_root) == \
+                'https://x/y.git'
+
+
 # --- _save_apiary / _storable_path tests ------------------------------------
 
 
