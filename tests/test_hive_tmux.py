@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -130,6 +131,7 @@ class TestGenerateTmuxConfig:
         assert 'hive tmux label-window' in conf
         assert 'hive tmux git-sync' in conf
         assert 'hive tmux popup' in conf
+        assert 'hive tmux runs' in conf
         assert 'hive tmux --hive' in conf
         assert 'hive-ci-popup' in conf
 
@@ -631,3 +633,247 @@ class TestPaneEnvironmentProbe:
         finally:
             subprocess.run(['tmux', '-L', socket, 'kill-server'],
                            capture_output=True)
+
+
+# --- run-dsl status integration ----------------------------------------------
+
+
+def _write_sidecar(acc_runs_dir, name, *, work_dir, status=None,
+                   heartbeat_age=None, program='channel-plan-implement-review',
+                   objective='Fix thing', created_at='2026-05-15T00:00:00Z'):
+    """Create a fake run-dsl sidecar dir under ``acc_runs_dir``.
+
+    - ``status``: None (no status.json — running/interrupted), True (success),
+      or False (failure).
+    - ``heartbeat_age``: seconds since now for the heartbeat timestamp. None
+      means no runtime.json.
+    """
+    sidecar = acc_runs_dir / name
+    sidecar.mkdir(parents=True)
+    (sidecar / 'manifest.json').write_text(json.dumps({
+        'tool': 'run-dsl',
+        'objective': objective,
+        'work_dir': str(work_dir),
+        'program': program,
+        'created_at': created_at,
+    }))
+    if status is not None:
+        (sidecar / 'status.json').write_text(json.dumps({
+            'completed': True,
+            'success': status,
+            'timestamp': '2026-05-15T01:00:00Z',
+        }))
+    if heartbeat_age is not None:
+        hb = datetime.fromtimestamp(time.time() - heartbeat_age).isoformat()
+        (sidecar / 'runtime.json').write_text(json.dumps({
+            'pid': 12345,
+            'started_at': hb,
+            'last_heartbeat_at': hb,
+        }))
+    return sidecar
+
+
+class TestClassifyRunState:
+    def test_status_success_true(self, tmp_path):
+        sc = _write_sidecar(tmp_path, 's', work_dir=tmp_path, status=True)
+        assert hive._classify_run_state(sc) == 'succeeded'
+
+    def test_status_success_false(self, tmp_path):
+        sc = _write_sidecar(tmp_path, 's', work_dir=tmp_path, status=False)
+        assert hive._classify_run_state(sc) == 'failed'
+
+    def test_no_status_fresh_heartbeat_running(self, tmp_path):
+        sc = _write_sidecar(tmp_path, 's', work_dir=tmp_path,
+                            status=None, heartbeat_age=10)
+        assert hive._classify_run_state(sc) == 'running'
+
+    def test_no_status_stale_heartbeat_interrupted(self, tmp_path):
+        sc = _write_sidecar(tmp_path, 's', work_dir=tmp_path,
+                            status=None, heartbeat_age=hive._RUN_HEARTBEAT_TTL + 10)
+        assert hive._classify_run_state(sc) == 'interrupted'
+
+    def test_no_status_no_runtime_interrupted(self, tmp_path):
+        sc = _write_sidecar(tmp_path, 's', work_dir=tmp_path,
+                            status=None, heartbeat_age=None)
+        assert hive._classify_run_state(sc) == 'interrupted'
+
+
+class TestWorkspaceRunState:
+    def test_no_acc_runs_dir_returns_none(self, tmp_path):
+        ws = tmp_path / 'home-dc-1'
+        ws.mkdir()
+        with patch.object(hive, '_ACC_RUNS_DIR', tmp_path / 'nonexistent'):
+            assert hive._workspace_run_state(ws) is None
+
+    def test_workspace_with_no_runs_returns_none(self, tmp_path):
+        acc = tmp_path / 'acc-runs'
+        acc.mkdir()
+        ws = tmp_path / 'home-dc-1'
+        ws.mkdir()
+        # A sidecar for a *different* work_dir.
+        _write_sidecar(acc, 'a', work_dir=tmp_path / 'other')
+        with patch.object(hive, '_ACC_RUNS_DIR', acc):
+            assert hive._workspace_run_state(ws) is None
+
+    def test_picks_most_recent_run(self, tmp_path):
+        acc = tmp_path / 'acc-runs'
+        acc.mkdir()
+        ws = tmp_path / 'home-dc-1'
+        ws.mkdir()
+        older = _write_sidecar(acc, 'old', work_dir=ws, status=False,
+                               objective='Old run')
+        newer = _write_sidecar(acc, 'new', work_dir=ws, status=True,
+                               objective='New run')
+        # Force the newer one's manifest mtime to be later.
+        os.utime(newer / 'manifest.json', (time.time(), time.time()))
+        os.utime(older / 'manifest.json', (time.time() - 100, time.time() - 100))
+        with patch.object(hive, '_ACC_RUNS_DIR', acc):
+            state = hive._workspace_run_state(ws)
+        assert state is not None
+        assert state['state'] == 'succeeded'
+        assert state['objective'] == 'New run'
+
+
+class TestRunStateLabelSuffix:
+    def test_running_returns_dot(self, tmp_path):
+        acc = tmp_path / 'acc-runs'
+        acc.mkdir()
+        ws = tmp_path / 'home-dc-1'
+        ws.mkdir()
+        _write_sidecar(acc, 's', work_dir=ws, heartbeat_age=10)
+        with patch.object(hive, '_ACC_RUNS_DIR', acc):
+            assert hive._run_state_label_suffix(ws) == '●'
+
+    def test_failed_returns_cross(self, tmp_path):
+        acc = tmp_path / 'acc-runs'
+        acc.mkdir()
+        ws = tmp_path / 'home-dc-1'
+        ws.mkdir()
+        _write_sidecar(acc, 's', work_dir=ws, status=False)
+        with patch.object(hive, '_ACC_RUNS_DIR', acc):
+            assert hive._run_state_label_suffix(ws) == '✗'
+
+    def test_interrupted_returns_ellipsis(self, tmp_path):
+        acc = tmp_path / 'acc-runs'
+        acc.mkdir()
+        ws = tmp_path / 'home-dc-1'
+        ws.mkdir()
+        _write_sidecar(acc, 's', work_dir=ws,
+                       heartbeat_age=hive._RUN_HEARTBEAT_TTL + 100)
+        with patch.object(hive, '_ACC_RUNS_DIR', acc):
+            assert hive._run_state_label_suffix(ws) == '…'
+
+    def test_succeeded_returns_empty(self, tmp_path):
+        # Recent-success is informational only — keep the label clean.
+        acc = tmp_path / 'acc-runs'
+        acc.mkdir()
+        ws = tmp_path / 'home-dc-1'
+        ws.mkdir()
+        _write_sidecar(acc, 's', work_dir=ws, status=True)
+        with patch.object(hive, '_ACC_RUNS_DIR', acc):
+            assert hive._run_state_label_suffix(ws) == ''
+
+    def test_no_runs_returns_empty(self, tmp_path):
+        ws = tmp_path / 'home-dc-1'
+        ws.mkdir()
+        with patch.object(hive, '_ACC_RUNS_DIR', tmp_path / 'nonexistent'):
+            assert hive._run_state_label_suffix(ws) == ''
+
+
+class TestTmuxRunsPopup:
+    def test_empty_hive_shows_no_runs_message(self, fake_hive, tmp_path, capsys):
+        with patch.object(hive, '_ACC_RUNS_DIR', tmp_path / 'nonexistent'):
+            hive._tmux_runs(fake_hive)
+        out = capsys.readouterr().out
+        assert 'Runs in' in out
+        assert 'no run-dsl runs' in out
+
+    def test_lists_workspaces_with_runs(self, fake_hive, tmp_path, capsys):
+        acc = tmp_path / 'acc-runs'
+        acc.mkdir()
+        _write_sidecar(acc, 'a', work_dir=fake_hive / 'home-dc-1',
+                       status=True, program='channel-review',
+                       objective='Review the thing')
+        _write_sidecar(acc, 'b', work_dir=fake_hive / 'home-dc-2',
+                       heartbeat_age=5, program='channel-brainstorm',
+                       objective='Brainstorm thing')
+        with patch.object(hive, '_ACC_RUNS_DIR', acc):
+            hive._tmux_runs(fake_hive)
+        out = capsys.readouterr().out
+        assert 'home-dc-1' in out and 'succeeded' in out
+        assert 'home-dc-2' in out and 'running' in out
+        assert 'channel-review' in out
+        assert 'Brainstorm thing' in out
+
+    def test_omits_workspaces_without_runs(self, fake_hive, tmp_path, capsys):
+        acc = tmp_path / 'acc-runs'
+        acc.mkdir()
+        _write_sidecar(acc, 'a', work_dir=fake_hive / 'home-dc-2', status=True)
+        with patch.object(hive, '_ACC_RUNS_DIR', acc):
+            hive._tmux_runs(fake_hive)
+        out = capsys.readouterr().out
+        assert 'home-dc-2' in out
+        # home-dc-1 and home-dc-3 have no runs — must not appear in the body.
+        # (The "Runs in <hive>" header itself doesn't mention workspace names.)
+        body = out.split('\n', 2)[-1] if '\n' in out else out
+        assert 'home-dc-1' not in body
+        assert 'home-dc-3' not in body
+
+
+class TestLabelWindowRunSuffix:
+    def test_appends_running_suffix(self, tmp_path):
+        ws = tmp_path / 'home-dc-1'
+        (ws / '.git').mkdir(parents=True)
+        acc = tmp_path / 'acc-runs'
+        acc.mkdir()
+        _write_sidecar(acc, 's', work_dir=ws, heartbeat_age=10)
+
+        renames = []
+
+        def fake_run(cmd, **kw):
+            if cmd[:2] == ['tmux', 'rename-window']:
+                renames.append(cmd[-1])
+            return MagicMock(returncode=0, stdout='')
+
+        def fake_git_out(args, cwd=None):
+            if args[:2] == ['rev-parse', '--show-toplevel']:
+                return str(ws)
+            if args[:2] == ['rev-parse', '--abbrev-ref']:
+                return 'main'
+            return None
+
+        with patch.object(hive, '_TMUX_DIR', tmp_path / 'hive-tmux'), \
+             patch.object(hive, '_ACC_RUNS_DIR', acc), \
+             patch.object(hive, '_git_out', side_effect=fake_git_out), \
+             patch.object(hive, '_default_branch', return_value='main'), \
+             patch.object(hive.subprocess, 'run', side_effect=fake_run):
+            hive._tmux_label_window(str(ws), '@1')
+
+        assert renames == ['home-dc-1 ●']
+
+    def test_no_suffix_when_no_run(self, tmp_path):
+        ws = tmp_path / 'home-dc-1'
+        (ws / '.git').mkdir(parents=True)
+
+        renames = []
+
+        def fake_run(cmd, **kw):
+            if cmd[:2] == ['tmux', 'rename-window']:
+                renames.append(cmd[-1])
+            return MagicMock(returncode=0, stdout='')
+
+        def fake_git_out(args, cwd=None):
+            if args[:2] == ['rev-parse', '--show-toplevel']:
+                return str(ws)
+            if args[:2] == ['rev-parse', '--abbrev-ref']:
+                return 'main'
+            return None
+
+        with patch.object(hive, '_TMUX_DIR', tmp_path / 'hive-tmux'), \
+             patch.object(hive, '_ACC_RUNS_DIR', tmp_path / 'no-such-dir'), \
+             patch.object(hive, '_git_out', side_effect=fake_git_out), \
+             patch.object(hive, '_default_branch', return_value='main'), \
+             patch.object(hive.subprocess, 'run', side_effect=fake_run):
+            hive._tmux_label_window(str(ws), '@1')
+
+        assert renames == ['home-dc-1']
