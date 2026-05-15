@@ -318,7 +318,17 @@ def _api_get(base_url: str, token: str, path: str) -> list | dict:
     try:
         with urlopen(req, timeout=8) as resp:
             return json.loads(resp.read().decode())
-    except (HTTPError, Exception) as e:
+    except HTTPError as e:
+        # 404 is expected when looking up a per-repo resource that doesn't
+        # exist at the requested index — most commonly _get_pr_state querying
+        # /pulls/{N} where N came from a run's `prettyref` but isn't a valid
+        # PR index on this repo (cross-repo triggers, issue refs, or other
+        # cases where Forgejo's prettyref doesn't map to a real PR here).
+        # Treat as no-data rather than printing popup-noise error lines.
+        if e.code != 404:
+            print(f'\033[31mAPI error: {e}\033[0m')
+        return []
+    except Exception as e:
         print(f'\033[31mAPI error: {e}\033[0m')
         return []
 

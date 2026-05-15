@@ -239,6 +239,40 @@ class TestGetTokenFromCredentials:
         assert token is None
 
 
+class TestApiGet:
+    """Tests for _api_get() error handling — silence 404 noise."""
+
+    def _http_error(self, code):
+        from urllib.error import HTTPError
+        return HTTPError('http://x', code, 'Not Found', {}, None)
+
+    def test_silences_404(self, monkeypatch, capsys):
+        """A 404 is an expected 'no data at that index' outcome and must
+        not print to the popup."""
+        monkeypatch.setattr(hive_ci_popup, 'urlopen',
+                            mock.MagicMock(side_effect=self._http_error(404)))
+        result = hive_ci_popup._api_get('https://x', 'tok', '/pulls/9999')
+        assert result == []
+        assert capsys.readouterr().out == ''
+
+    def test_prints_non_404_http_errors(self, monkeypatch, capsys):
+        """A 500 (or other non-404 HTTP error) is genuine and is reported."""
+        monkeypatch.setattr(hive_ci_popup, 'urlopen',
+                            mock.MagicMock(side_effect=self._http_error(500)))
+        result = hive_ci_popup._api_get('https://x', 'tok', '/pulls/1')
+        assert result == []
+        assert 'API error' in capsys.readouterr().out
+
+    def test_prints_network_errors(self, monkeypatch, capsys):
+        """A non-HTTP exception (timeout / DNS / connection) is reported."""
+        from urllib.error import URLError
+        monkeypatch.setattr(hive_ci_popup, 'urlopen',
+                            mock.MagicMock(side_effect=URLError('refused')))
+        result = hive_ci_popup._api_get('https://x', 'tok', '/anything')
+        assert result == []
+        assert 'API error' in capsys.readouterr().out
+
+
 class TestVisLen:
     """Tests for _vis_len()."""
 
