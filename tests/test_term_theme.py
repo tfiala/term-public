@@ -10,6 +10,7 @@ returns nothing and the tests fail.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -43,19 +44,52 @@ echo "$result"
 """
 
 
+# Stub tmux: by default there is no server (`tmux ls` fails), so the hive
+# restyle hook must stay quiet. Tests that want a live server overwrite the
+# stub with the WITH_SERVER variant.
+FAKE_TMUX_NO_SERVER = """#!/bin/bash
+exit 1
+"""
+
+FAKE_TMUX_WITH_SERVER = """#!/bin/bash
+exit 0
+"""
+
+# Stub hive: records every invocation so tests can assert the restyle hook.
+FAKE_HIVE = """#!/bin/bash
+echo "$@" >> "$FAKE_HIVE_LOG"
+"""
+
+
 @pytest.fixture
 def fake_mac(tmp_path):
-    """A PATH with a stubbed osascript plus the dark-mode state file."""
+    """A PATH with a stubbed osascript plus the dark-mode state file.
+
+    HOME and XDG_CACHE_HOME point into tmp_path so the script's side
+    effects (mode state file, claude theme edit) never touch the real
+    environment, and tmux/hive are stubbed so the restyle hook never
+    reaches a real tmux server.
+    """
     bindir = tmp_path / 'bin'
     bindir.mkdir()
     stub = bindir / 'osascript'
     stub.write_text(FAKE_OSASCRIPT)
     stub.chmod(0o755)
+    tmux = bindir / 'tmux'
+    tmux.write_text(FAKE_TMUX_NO_SERVER)
+    tmux.chmod(0o755)
+    hive_stub = bindir / 'hive'
+    hive_stub.write_text(FAKE_HIVE)
+    hive_stub.chmod(0o755)
     state = tmp_path / 'dark-mode'
     state.write_text('true\n')
+    (tmp_path / 'home').mkdir()
     env = dict(os.environ)
     env['PATH'] = f'{bindir}:{env["PATH"]}'
     env['FAKE_DARK_MODE_FILE'] = str(state)
+    env['FAKE_HIVE_LOG'] = str(tmp_path / 'hive-log')
+    env['HOME'] = str(tmp_path / 'home')
+    env['XDG_CACHE_HOME'] = str(tmp_path / 'cache')
     return env, state
 
 
@@ -160,3 +194,90 @@ def test_osascript_failure_surfaces_stderr(fake_mac, tmp_path):
     assert result.returncode == 1
     assert 'osascript failed' in result.stderr
     assert 'Automation' in result.stderr  # the remediation hint
+
+
+def mode_file(env) -> Path:
+    return Path(env['XDG_CACHE_HOME']) / 'term-theme' / 'mode'
+
+
+class TestModeStateFile:
+    def test_written_on_switch(self, fake_mac):
+        env, _ = fake_mac
+        run(env, 'day')
+        assert mode_file(env).read_text() == 'day\n'
+        run(env, 'night')
+        assert mode_file(env).read_text() == 'night\n'
+
+    def test_written_on_status(self, fake_mac):
+        env, _ = fake_mac
+        run(env, 'status')
+        assert mode_file(env).read_text() == 'night\n'
+
+
+class TestClaudeThemeSync:
+    def _config(self, env) -> Path:
+        return Path(env['HOME']) / '.claude.json'
+
+    def test_flips_theme_for_future_sessions(self, fake_mac):
+        env, _ = fake_mac
+        self._config(env).write_text('{"theme": "dark", "other": 1}')
+        run(env, 'day')
+        cfg = json.loads(self._config(env).read_text())
+        assert cfg['theme'] == 'light'
+        assert cfg['other'] == 1  # unrelated keys survive
+        run(env, 'night')
+        assert json.loads(self._config(env).read_text())['theme'] == 'dark'
+
+    def test_unset_theme_means_dark(self, fake_mac):
+        env, _ = fake_mac
+        self._config(env).write_text('{}')
+        run(env, 'night')
+        cfg = json.loads(self._config(env).read_text())
+        assert cfg.get('theme', 'dark') == 'dark'
+        run(env, 'day')
+        assert json.loads(self._config(env).read_text())['theme'] == 'light'
+
+    def test_preserves_variant_suffix(self, fake_mac):
+        env, _ = fake_mac
+        self._config(env).write_text('{"theme": "dark-daltonized"}')
+        run(env, 'day')
+        assert (json.loads(self._config(env).read_text())['theme']
+                == 'light-daltonized')
+
+    def test_leaves_auto_and_custom_alone(self, fake_mac):
+        env, _ = fake_mac
+        for theme in ('auto', 'custom:dracula'):
+            self._config(env).write_text(json.dumps({'theme': theme}))
+            run(env, 'day')
+            assert json.loads(self._config(env).read_text())['theme'] == theme
+
+    def test_missing_config_is_fine(self, fake_mac):
+        env, _ = fake_mac
+        result = run(env, 'day')
+        assert result.returncode == 0
+        assert not self._config(env).exists()
+
+    def test_status_does_not_touch_theme(self, fake_mac):
+        env, _ = fake_mac
+        self._config(env).write_text('{"theme": "dark"}')
+        run(env, 'status')
+        assert json.loads(self._config(env).read_text())['theme'] == 'dark'
+
+
+class TestHiveRestyle:
+    def test_skipped_without_tmux_server(self, fake_mac):
+        env, _ = fake_mac
+        run(env, 'day')
+        assert not Path(env['FAKE_HIVE_LOG']).exists()
+
+    def test_invoked_with_tmux_server(self, fake_mac, tmp_path):
+        env, _ = fake_mac
+        (tmp_path / 'bin' / 'tmux').write_text(FAKE_TMUX_WITH_SERVER)
+        run(env, 'day')
+        assert Path(env['FAKE_HIVE_LOG']).read_text().strip() == 'tmux restyle'
+
+    def test_skipped_on_status(self, fake_mac, tmp_path):
+        env, _ = fake_mac
+        (tmp_path / 'bin' / 'tmux').write_text(FAKE_TMUX_WITH_SERVER)
+        run(env, 'status')
+        assert not Path(env['FAKE_HIVE_LOG']).exists()
