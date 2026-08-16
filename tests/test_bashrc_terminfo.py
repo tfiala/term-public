@@ -1,4 +1,4 @@
-"""Tests for the TERM/TERMINFO fixup in zsh/zshenv."""
+"""Tests for the TERM/TERMINFO fixup in bash/bashrc."""
 
 import os
 import subprocess
@@ -7,13 +7,12 @@ from pathlib import Path
 import pytest
 
 
-ZSHENV = str(Path(__file__).resolve().parents[1] / "zsh" / "zshenv")
-ZSHRC = str(Path(__file__).resolve().parents[1] / "zsh" / "zshrc")
+BASHRC = str(Path(__file__).resolve().parents[1] / "bash" / "bashrc")
 
 # The terminfo guard block, extracted so tests can run it in isolation
-# without sourcing the rest of zshrc (which needs oh-my-zsh, etc.).
+# without sourcing the rest of bashrc (which needs starship, etc.).
 _TERMINFO_GUARD = """\
-if (( $+commands[infocmp] )) && ! infocmp "$TERM" &>/dev/null; then
+if command -v infocmp >/dev/null 2>&1 && ! infocmp "$TERM" >/dev/null 2>&1; then
   if [[ "$TERM" == *ghostty* \\
       && -d /Applications/Ghostty.app/Contents/Resources/terminfo ]]; then
     export TERMINFO=/Applications/Ghostty.app/Contents/Resources/terminfo
@@ -24,10 +23,10 @@ fi
 """
 
 
-def _run_zsh_snippet(snippet: str, env: dict[str, str]) -> subprocess.CompletedProcess:
-    """Run a zsh snippet with the given environment, return the result."""
+def _run_bash_snippet(snippet: str, env: dict[str, str]) -> subprocess.CompletedProcess:
+    """Run a bash snippet with the given environment, return the result."""
     return subprocess.run(
-        ["zsh", "-f", "-c", snippet],
+        ["bash", "--norc", "-c", snippet],
         capture_output=True,
         text=True,
         env=env,
@@ -35,7 +34,7 @@ def _run_zsh_snippet(snippet: str, env: dict[str, str]) -> subprocess.CompletedP
 
 
 def _base_env(**overrides: str) -> dict[str, str]:
-    """Minimal env for zsh with optional overrides."""
+    """Minimal env for bash with optional overrides."""
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": os.environ.get("HOME", "/tmp"),
@@ -44,18 +43,19 @@ def _base_env(**overrides: str) -> dict[str, str]:
     return env
 
 
-class TestTerminfoGuardLocation:
-    """Verify the terminfo guard lives in zshenv, not zshrc."""
+class TestTerminfoGuardPresent:
+    """The guard block in bashrc must match the one under test."""
 
-    def test_guard_block_in_zshenv(self):
-        text = Path(ZSHENV).read_text()
-        assert "infocmp" in text
-        assert "xterm-256color" in text
+    def test_guard_block_in_bashrc(self):
+        text = Path(BASHRC).read_text()
+        assert _TERMINFO_GUARD in text, (
+            "bash/bashrc terminfo guard drifted from the block these tests run"
+        )
 
-    def test_guard_not_in_zshrc(self):
-        """The guard must live in zshenv (before terminal init), not zshrc."""
-        text = Path(ZSHRC).read_text()
-        assert "infocmp" not in text
+    def test_guard_precedes_prompt_setup(self):
+        """The guard must run before anything talks to the terminal."""
+        text = Path(BASHRC).read_text()
+        assert text.index("infocmp") < text.index("starship")
 
 
 class TestTerminfoResolvable:
@@ -64,7 +64,7 @@ class TestTerminfoResolvable:
     def test_known_term_unchanged(self):
         """xterm-256color is universally available — should not be altered."""
         env = _base_env(TERM="xterm-256color")
-        r = _run_zsh_snippet(
+        r = _run_bash_snippet(
             _TERMINFO_GUARD + 'echo "TERM=$TERM TERMINFO=${TERMINFO:-unset}"',
             env,
         )
@@ -75,7 +75,7 @@ class TestTerminfoResolvable:
     def test_terminfo_env_not_overwritten_when_already_set(self):
         """If TERMINFO is already set and infocmp succeeds, leave it alone."""
         env = _base_env(TERM="xterm-256color", TERMINFO="/custom/path")
-        r = _run_zsh_snippet(
+        r = _run_bash_snippet(
             _TERMINFO_GUARD + 'echo "TERMINFO=$TERMINFO"',
             env,
         )
@@ -84,12 +84,16 @@ class TestTerminfoResolvable:
 
 
 class TestTerminfoUnresolvable:
-    """When TERM has no terminfo entry and no Ghostty bundle exists."""
+    """When TERM has no terminfo entry and no Ghostty bundle exists.
 
-    def test_falls_back_to_xterm_256color(self):
+    HOME points at an empty tmp dir so a real ~/.terminfo (installed by
+    setup.sh) can't make infocmp succeed and short-circuit the guard.
+    """
+
+    def test_falls_back_to_xterm_256color(self, tmp_path):
         """Simulates SSH to a Linux host: unknown TERM, no Ghostty app."""
-        env = _base_env(TERM="xterm-ghostty")
-        r = _run_zsh_snippet(
+        env = _base_env(TERM="xterm-ghostty", HOME=str(tmp_path))
+        r = _run_bash_snippet(
             _TERMINFO_GUARD + 'echo "TERM=$TERM"',
             env,
         )
@@ -105,7 +109,7 @@ class TestTerminfoUnresolvable:
     def test_bogus_term_falls_back(self):
         """A non-ghostty unknown TERM always falls back to xterm-256color."""
         env = _base_env(TERM="xterm-totally-bogus-12345")
-        r = _run_zsh_snippet(
+        r = _run_bash_snippet(
             _TERMINFO_GUARD + 'echo "TERM=$TERM TERMINFO=${TERMINFO:-unset}"',
             env,
         )
@@ -123,10 +127,10 @@ class TestTerminfoGhosttyBundle:
         not Path("/Applications/Ghostty.app/Contents/Resources/terminfo").is_dir(),
         reason="Ghostty app bundle not installed",
     )
-    def test_sets_terminfo_to_ghostty_bundle(self):
+    def test_sets_terminfo_to_ghostty_bundle(self, tmp_path):
         """On a macOS host with Ghostty, TERMINFO should point to the bundle."""
-        env = _base_env(TERM="xterm-ghostty")
-        r = _run_zsh_snippet(
+        env = _base_env(TERM="xterm-ghostty", HOME=str(tmp_path))
+        r = _run_bash_snippet(
             _TERMINFO_GUARD + 'echo "TERMINFO=${TERMINFO:-unset}"',
             env,
         )
@@ -137,10 +141,10 @@ class TestTerminfoGhosttyBundle:
         not Path("/Applications/Ghostty.app/Contents/Resources/terminfo").is_dir(),
         reason="Ghostty app bundle not installed",
     )
-    def test_term_preserved_when_bundle_found(self):
+    def test_term_preserved_when_bundle_found(self, tmp_path):
         """TERM should remain xterm-ghostty when the bundle resolves it."""
-        env = _base_env(TERM="xterm-ghostty")
-        r = _run_zsh_snippet(
+        env = _base_env(TERM="xterm-ghostty", HOME=str(tmp_path))
+        r = _run_bash_snippet(
             _TERMINFO_GUARD + 'echo "TERM=$TERM"',
             env,
         )
@@ -151,11 +155,11 @@ class TestTerminfoGhosttyBundle:
         not Path("/Applications/Ghostty.app/Contents/Resources/terminfo").is_dir(),
         reason="Ghostty app bundle not installed",
     )
-    def test_terminfo_resolves_after_fixup(self):
+    def test_terminfo_resolves_after_fixup(self, tmp_path):
         """After the guard, infocmp should succeed for xterm-ghostty."""
-        env = _base_env(TERM="xterm-ghostty")
-        r = _run_zsh_snippet(
-            _TERMINFO_GUARD + 'infocmp "$TERM" &>/dev/null && echo OK || echo FAIL',
+        env = _base_env(TERM="xterm-ghostty", HOME=str(tmp_path))
+        r = _run_bash_snippet(
+            _TERMINFO_GUARD + 'infocmp "$TERM" >/dev/null 2>&1 && echo OK || echo FAIL',
             env,
         )
         assert r.returncode == 0
@@ -167,32 +171,23 @@ class TestNoInfocmp:
 
     def test_term_unchanged_without_infocmp(self, tmp_path):
         """If infocmp isn't in PATH, don't touch TERM or TERMINFO."""
-        # Create a shadow directory with a fake infocmp that doesn't exist,
-        # effectively hiding the real one.  We prepend it so zsh's
-        # $+commands[infocmp] check fails.
-        shadow = tmp_path / "shadow"
-        shadow.mkdir()
-        # Build a PATH that has zsh but not infocmp: put shadow first
-        # (no infocmp there) then only the directory containing zsh.
-        zsh_path = subprocess.run(
-            ["which", "zsh"], capture_output=True, text=True
+        # Build a PATH that has bash but not infocmp.
+        bash_path = subprocess.run(
+            ["which", "bash"], capture_output=True, text=True
         ).stdout.strip()
-        zsh_dir = str(Path(zsh_path).parent)
-        # Exclude directories containing infocmp
+        bash_dir = str(Path(bash_path).parent)
         infocmp_result = subprocess.run(
             ["which", "infocmp"], capture_output=True, text=True
         )
-        infocmp_dir = str(Path(infocmp_result.stdout.strip()).parent) if infocmp_result.returncode == 0 else None
-        path_dirs = [zsh_dir]
-        if infocmp_dir and infocmp_dir != zsh_dir:
-            # infocmp is in a different dir than zsh, so just use zsh's dir
-            pass
-        else:
-            # infocmp is in the same dir as zsh — can't easily separate;
-            # skip this test on such systems
-            pytest.skip("infocmp and zsh share the same directory")
-        env = _base_env(TERM="xterm-ghostty", PATH=":".join(path_dirs))
-        r = _run_zsh_snippet(
+        infocmp_dir = (
+            str(Path(infocmp_result.stdout.strip()).parent)
+            if infocmp_result.returncode == 0
+            else None
+        )
+        if infocmp_dir == bash_dir:
+            pytest.skip("infocmp and bash share the same directory")
+        env = _base_env(TERM="xterm-ghostty", PATH=bash_dir)
+        r = _run_bash_snippet(
             _TERMINFO_GUARD + 'echo "TERM=$TERM TERMINFO=${TERMINFO:-unset}"',
             env,
         )

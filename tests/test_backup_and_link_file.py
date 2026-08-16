@@ -1,4 +1,4 @@
-"""Tests for the backup_and_link_file function in setup.sh."""
+"""Tests for the backup_and_link_file function and link layout in setup.sh."""
 
 import os
 import re
@@ -25,7 +25,7 @@ _FUNCTION_DEF = _extract_function()
 def run_backup_and_link(source: str, dest: str) -> subprocess.CompletedProcess:
     script = _FUNCTION_DEF + '\nbackup_and_link_file "$1" "$2"'
     return subprocess.run(
-        ["zsh", "-f", "-c", script, "zsh", source, dest],
+        ["bash", "--norc", "-c", script, "bash", source, dest],
         capture_output=True,
         text=True,
     )
@@ -103,90 +103,7 @@ def test_backs_up_directory(tmp_path):
     assert (backup / "precious.txt").read_text() == "keep me"
 
 
-def test_setup_creates_local_overlay_skeleton(tmp_path):
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    home = tmp_path / "home"
-    home.mkdir()
-
-    (repo_root / "setup.sh").write_text(Path(SETUP_SH).read_text())
-    (repo_root / "ghostty").mkdir()
-    (repo_root / "zsh").mkdir()
-    (repo_root / "scripts").mkdir()
-    (repo_root / "tmux").mkdir()
-    (repo_root / "ghostty" / "config").write_text("ghostty = true\n")
-    (repo_root / "zsh" / "zshenv").write_text("# zshenv\n")
-    (repo_root / "zsh" / "zshrc").write_text("export TEST_ZSHRC=1\n")
-    (repo_root / "tmux" / "tmux.conf").write_text("# tmux\n")
-    (repo_root / "p10k.zsh").write_text("# p10k\n")
-    (repo_root / "scripts" / "hive.py").write_text("#!/usr/bin/env python3\n")
-    (repo_root / "scripts" / "hive-ci-popup.py").write_text("#!/usr/bin/env python3\n")
-
-    result = subprocess.run(
-        ["zsh", "setup.sh"],
-        cwd=repo_root,
-        env={**os.environ, "HOME": str(home)},
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode == 0
-    assert (repo_root / "local" / "bin").is_dir()
-    assert (repo_root / "local" / "env.local").exists()
-    assert (repo_root / "local" / "zshrc.local").exists()
-    assert (home / ".zshenv").is_symlink()
-    assert (home / ".zshrc").is_symlink()
-    assert (home / "bin" / "hive").is_symlink()
-
-
-def test_setup_preserves_existing_zshenv(tmp_path):
-    """A pre-existing .zshenv is backed up and sourced by the new one."""
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    home = tmp_path / "home"
-    home.mkdir()
-
-    # Pre-existing user .zshenv with critical exports
-    (home / ".zshenv").write_text('export MY_CRITICAL_VAR=hello\n')
-
-    (repo_root / "setup.sh").write_text(Path(SETUP_SH).read_text())
-    (repo_root / "ghostty").mkdir()
-    (repo_root / "zsh").mkdir()
-    (repo_root / "scripts").mkdir()
-    (repo_root / "tmux").mkdir()
-    (repo_root / "ghostty" / "config").write_text("ghostty = true\n")
-    zshenv_src = Path(__file__).resolve().parents[1] / "zsh" / "zshenv"
-    (repo_root / "zsh" / "zshenv").write_text(zshenv_src.read_text())
-    (repo_root / "zsh" / "zshrc").write_text("# zshrc\n")
-    (repo_root / "tmux" / "tmux.conf").write_text("# tmux\n")
-    (repo_root / "p10k.zsh").write_text("# p10k\n")
-    (repo_root / "scripts" / "hive.py").write_text("#!/usr/bin/env python3\n")
-    (repo_root / "scripts" / "hive-ci-popup.py").write_text("#!/usr/bin/env python3\n")
-
-    result = subprocess.run(
-        ["zsh", "setup.sh"],
-        cwd=repo_root,
-        env={**os.environ, "HOME": str(home)},
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0
-
-    # The original is backed up
-    assert (home / ".zshenv.bak").exists()
-    assert (home / ".zshenv.bak").read_text() == 'export MY_CRITICAL_VAR=hello\n'
-
-    # The new .zshenv sources the backup, so the user's var is still set
-    r = subprocess.run(
-        ["zsh", "-f", "-c",
-         f'HOME="{home}" source "{home}/.zshenv"; echo "$MY_CRITICAL_VAR"'],
-        capture_output=True,
-        text=True,
-    )
-    assert r.stdout.strip() == "hello"
-
-
-# --- Ghostty terminfo tic installation tests ---------------------------------
+# --- Full setup.sh runs -------------------------------------------------------
 
 
 def _scaffold_repo(tmp_path):
@@ -198,14 +115,16 @@ def _scaffold_repo(tmp_path):
 
     (repo_root / "setup.sh").write_text(Path(SETUP_SH).read_text())
     (repo_root / "ghostty").mkdir()
-    (repo_root / "zsh").mkdir()
+    (repo_root / "bash").mkdir()
+    (repo_root / "starship").mkdir()
     (repo_root / "scripts").mkdir()
     (repo_root / "tmux").mkdir()
     (repo_root / "ghostty" / "config").write_text("ghostty = true\n")
-    (repo_root / "zsh" / "zshenv").write_text("# zshenv\n")
-    (repo_root / "zsh" / "zshrc").write_text("# zshrc\n")
+    (repo_root / "bash" / "bash_profile").write_text("# bash_profile\n")
+    (repo_root / "bash" / "bashrc").write_text("export TEST_BASHRC=1\n")
+    (repo_root / "bash" / "inputrc").write_text("# inputrc\n")
+    (repo_root / "starship" / "starship.toml").write_text("# starship\n")
     (repo_root / "tmux" / "tmux.conf").write_text("# tmux\n")
-    (repo_root / "p10k.zsh").write_text("# p10k\n")
     (repo_root / "scripts" / "hive.py").write_text("#!/usr/bin/env python3\n")
     (repo_root / "scripts" / "hive-ci-popup.py").write_text("#!/usr/bin/env python3\n")
 
@@ -216,18 +135,96 @@ def _run_setup(repo_root, home, extra_env=None):
     """Run setup.sh in a fake repo with the given HOME.
 
     Inherits the real environment (including TERMINFO if set by Ghostty)
-    so tests exercise the same code path a user would hit.
+    so tests exercise the same code path a user would hit.  HOME and
+    XDG_CONFIG_HOME are overridden so nothing touches the real home.
     """
-    env = {**os.environ, "HOME": str(home)}
+    env = {**os.environ, "HOME": str(home),
+           "XDG_CONFIG_HOME": str(home / ".config")}
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
-        ["zsh", "setup.sh"],
+        ["bash", "setup.sh"],
         cwd=repo_root,
         env=env,
         capture_output=True,
         text=True,
     )
+
+
+def test_setup_creates_local_overlay_skeleton(tmp_path):
+    repo_root, home = _scaffold_repo(tmp_path)
+
+    result = _run_setup(repo_root, home)
+
+    assert result.returncode == 0
+    assert (repo_root / "local" / "bin").is_dir()
+    assert (repo_root / "local" / "env.local").exists()
+    assert (repo_root / "local" / "bashrc.local").exists()
+    assert (home / ".bash_profile").is_symlink()
+    assert (home / ".bashrc").is_symlink()
+    assert (home / ".inputrc").is_symlink()
+    assert (home / ".config" / "starship.toml").is_symlink()
+    assert (home / "bin" / "hive").is_symlink()
+
+
+def test_setup_backs_up_existing_bashrc(tmp_path):
+    """A pre-existing .bashrc is preserved as .bashrc.bak."""
+    repo_root, home = _scaffold_repo(tmp_path)
+    (home / ".bashrc").write_text("export MY_CRITICAL_VAR=hello\n")
+
+    result = _run_setup(repo_root, home)
+
+    assert result.returncode == 0
+    assert (home / ".bashrc").is_symlink()
+    assert (home / ".bashrc.bak").read_text() == "export MY_CRITICAL_VAR=hello\n"
+
+
+class TestStaleZshLinkCleanup:
+    """setup.sh removes symlinks left by the zsh era (pre-#15)."""
+
+    def test_removes_stale_zsh_links(self, tmp_path):
+        repo_root, home = _scaffold_repo(tmp_path)
+
+        # Simulate links from an old checkout (targets no longer exist).
+        old_checkout = tmp_path / "old-checkout"
+        (home / ".zshrc").symlink_to(old_checkout / "zsh" / "zshrc")
+        (home / ".zshenv").symlink_to(old_checkout / "zsh" / "zshenv")
+        (home / ".p10k.zsh").symlink_to(old_checkout / "p10k.zsh")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0
+        assert not os.path.lexists(home / ".zshrc")
+        assert not os.path.lexists(home / ".zshenv")
+        assert not os.path.lexists(home / ".p10k.zsh")
+
+    def test_restores_pre_term_public_backup(self, tmp_path):
+        """The .bak made when the zsh link was first created comes back."""
+        repo_root, home = _scaffold_repo(tmp_path)
+
+        old_checkout = tmp_path / "old-checkout"
+        (home / ".zshrc").symlink_to(old_checkout / "zsh" / "zshrc")
+        (home / ".zshrc.bak").write_text("# my original zshrc\n")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0
+        assert not (home / ".zshrc").is_symlink()
+        assert (home / ".zshrc").read_text() == "# my original zshrc\n"
+
+    def test_leaves_foreign_zshrc_alone(self, tmp_path):
+        """A user-managed .zshrc (not a term-public link) is untouched."""
+        repo_root, home = _scaffold_repo(tmp_path)
+        (home / ".zshrc").write_text("# hand-written\n")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0
+        assert not (home / ".zshrc").is_symlink()
+        assert (home / ".zshrc").read_text() == "# hand-written\n"
+
+
+# --- Ghostty terminfo tic installation tests ---------------------------------
 
 
 _GHOSTTY_TI = Path("/Applications/Ghostty.app/Contents/Resources/terminfo")
@@ -248,14 +245,6 @@ class TestTerminfoTicInstall:
         assert result.returncode == 0
         assert "Installed xterm-ghostty terminfo" in result.stdout
 
-        # Verify infocmp can resolve it from the user terminfo dir
-        r = subprocess.run(
-            ["infocmp", "xterm-ghostty"],
-            env={**os.environ, "HOME": str(home), "TERMINFO": ""},
-            capture_output=True,
-            text=True,
-        )
-        # The entry should exist under home's .terminfo
         ti_dir = home / ".terminfo"
         assert ti_dir.is_dir()
         # Find the compiled entry (stored under first-char subdir or hex subdir)

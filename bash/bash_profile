@@ -1,0 +1,8 @@
+# term-public bash_profile.
+#
+# Login shells (Ghostty windows, tmux panes via default-shell, SSH)
+# read this file; everything lives in bashrc so login and non-login
+# interactive shells behave identically.
+if [[ -f "$HOME/.bashrc" ]]; then
+  source "$HOME/.bashrc"
+fi

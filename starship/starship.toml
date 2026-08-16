@@ -1,0 +1,88 @@
+# term-public Starship prompt.
+#
+# Ports the old p10k layout: [hive-N] badge, dir, git on the left with a
+# ╭─/╰─ frame; hive PR, exit status, duration, jobs, clock on the right.
+#
+# Palette rule (day/night issue #14): every color here must stay legible
+# on BOTH backgrounds — palenight (dark) and GitHub Light High Contrast
+# (near-white).  Prefer the mid-range 256-color cube; avoid bright
+# yellows (220/226) and pale blues (75+) that wash out on white.
+
+add_newline = true
+palette = "term_public"
+
+format = "[╭─](fg:frame)${custom.hive_badge}$directory$git_branch$git_status$line_break[╰─](fg:frame)$character"
+right_format = "${custom.hive_pr}$status$cmd_duration$jobs$time"
+
+[palettes.term_public]
+frame = "240"
+dir = "31"
+clean = "70"
+dirty = "166"
+ok = "76"
+err = "196"
+hive = "32"
+clock = "66"
+dur = "136"
+
+[directory]
+style = "fg:dir"
+truncation_length = 4
+truncate_to_repo = true
+
+[git_branch]
+symbol = " "
+style = "fg:clean"
+format = "[$symbol$branch(:$remote_branch)]($style) "
+
+[git_status]
+style = "fg:dirty"
+format = '([$all_status$ahead_behind]($style) )'
+ahead = '⇡${count}'
+behind = '⇣${count}'
+diverged = '⇣${behind_count}⇡${ahead_count}'
+conflicted = '~${count}'
+staged = '+${count}'
+modified = '!${count}'
+untracked = '?${count}'
+stashed = '*${count}'
+
+[character]
+success_symbol = "[❯](fg:ok)"
+error_symbol = "[❯](fg:err)"
+
+[status]
+disabled = false
+style = "fg:err"
+format = '[$symbol$status]($style) '
+
+[cmd_duration]
+min_time = 1000
+style = "fg:dur"
+format = '[$duration]($style) '
+
+[jobs]
+style = "fg:hive"
+
+[time]
+disabled = false
+time_format = "%H:%M"
+style = "fg:clock"
+format = '[$time]($style)'
+
+# --- Hive-aware segments (ported from the p10k custom segments) ---------------
+
+[custom.hive_badge]
+when = 'test -n "$HIVE_NAME"'
+command = 'printf "[%s-%s]" "$HIVE_NAME" "$HIVE_NUMBER"'
+style = "bold fg:hive"
+format = "[$output]($style) "
+shell = ["sh"]
+
+[custom.hive_pr]
+# hive-ci-popup caches the open PR number per workspace; surface it.
+when = 'test -n "$HIVE_NAME" && test -s "/tmp/hive-tmux/${HIVE_NAME}-${HIVE_NUMBER}.pr"'
+command = 'cat "/tmp/hive-tmux/${HIVE_NAME}-${HIVE_NUMBER}.pr"'
+style = "fg:hive"
+format = "[#$output]($style) "
+shell = ["sh"]
