@@ -1,0 +1,82 @@
+#!/bin/bash
+# term-theme — switch the terminal between low-light (night) and
+# high-ambient-light (day) modes.
+#
+# ghostty/config uses an appearance-pair theme
+# (`theme = dark:palenight,light:GitHub Light High Contrast`), which follows
+# the macOS system appearance and restyles every live Ghostty window
+# instantly — including panes inside a running tmux session. Switching
+# terminal mode is therefore just flipping the macOS appearance, which is
+# all this script does.
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+usage: term-theme [day|night|toggle|status]
+
+  day     high-ambient-light mode (light background, dark text)
+  night   low-light mode (dark background, light text)
+  toggle  switch to the other mode (default)
+  status  print the current mode without changing it
+EOF
+}
+
+# Run AppleScript statements against System Events' appearance preferences
+# and print the result of the last one ("true"/"false" for dark mode).
+appearance() {
+  local args=() stmt out
+  for stmt in "$@"; do
+    args+=(-e "tell application \"System Events\" to tell appearance preferences to $stmt")
+  done
+  if ! out=$(osascript "${args[@]}" 2>&1); then
+    echo "term-theme: osascript failed: $out" >&2
+    case $out in
+      *1743* | *[Aa]uthoriz*)
+        echo "term-theme: grant automation access in System Settings ->" \
+          "Privacy & Security -> Automation (allow your terminal to control" \
+          "System Events), then retry." >&2
+        ;;
+    esac
+    return 1
+  fi
+  printf '%s\n' "$out"
+}
+
+# Map osascript's dark-mode boolean to the mode name.
+report() {
+  case $1 in
+    true) echo night ;;
+    false) echo day ;;
+    *)
+      echo "term-theme: unexpected appearance state: '$1'" >&2
+      return 1
+      ;;
+  esac
+}
+
+main() {
+  if ! command -v osascript >/dev/null 2>&1; then
+    echo "term-theme: requires macOS (osascript not found)" >&2
+    exit 1
+  fi
+
+  local action=${1-toggle} state
+  case $action in
+    day) state=$(appearance 'set dark mode to false' 'get dark mode') ;;
+    night) state=$(appearance 'set dark mode to true' 'get dark mode') ;;
+    toggle) state=$(appearance 'set dark mode to not dark mode' 'get dark mode') ;;
+    status) state=$(appearance 'get dark mode') ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "term-theme: unknown mode: $action" >&2
+      usage
+      exit 2
+      ;;
+  esac
+  report "$state"
+}
+
+main "$@"

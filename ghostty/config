@@ -1,10 +1,14 @@
 # Ghostty configuration
 
-theme = palenight
+# Appearance-pair theme: palenight in low light, a high-contrast light theme
+# for bright rooms. Ghostty follows the macOS system appearance and restyles
+# live windows (including tmux panes) instantly; flip it with `term-theme`.
+theme = dark:palenight,light:GitHub Light High Contrast
 font-size = 14
 
 background-opacity = 0.90
-window-theme = dark
+# Window chrome follows the terminal background, so day mode gets light tabs.
+window-theme = auto
 
 macos-titlebar-style = tabs
 macos-option-as-alt = true

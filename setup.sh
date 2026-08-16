@@ -33,6 +33,7 @@ backup_and_link_file "$ROOT_DIR/zsh/zshrc" "$HOME/.zshrc"
 backup_and_link_file "$ROOT_DIR/p10k.zsh" "$HOME/.p10k.zsh"
 backup_and_link_file "$ROOT_DIR/scripts/hive.py" "$HOME/bin/hive"
 backup_and_link_file "$ROOT_DIR/scripts/hive-ci-popup.py" "$HOME/bin/hive-ci-popup"
+backup_and_link_file "$ROOT_DIR/scripts/term-theme" "$HOME/bin/term-theme"
 backup_and_link_file "$ROOT_DIR/tmux/tmux.conf" "$HOME/.tmux/tmux.conf"
 backup_and_link_file "$ROOT_DIR/tmux/tmux.conf" "$HOME/.tmux.conf"
 

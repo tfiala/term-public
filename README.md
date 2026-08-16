@@ -53,6 +53,28 @@ Template files in `local/` may be committed as examples using the normal
 
 This is the place for things like Node path tweaks, k3s helper scripts, or workstation-only tooling that should not be committed back to the public repo.
 
+## Day / night mode
+
+`ghostty/config` uses an appearance-pair theme: `palenight` in dark mode and
+`GitHub Light High Contrast` in light mode — a near-white, high-contrast
+theme that stays readable under bright ambient light and glare. Ghostty
+follows the macOS system appearance and restyles all live windows instantly,
+including everything inside tmux sessions.
+
+Switch modes with:
+
+```bash
+term-theme          # toggle day <-> night
+term-theme day      # high-ambient-light mode (light background)
+term-theme night    # low-light mode (dark background)
+term-theme status   # print the current mode
+```
+
+The script flips the macOS system appearance, so the whole OS follows — in a
+bright room that is usually what you want. For automatic switching at
+sunset/sunrise, set System Settings → Appearance → Auto. The first run may
+prompt for automation access to System Events.
+
 ## Hive tmux
 
 Examples:
