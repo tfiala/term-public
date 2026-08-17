@@ -87,12 +87,12 @@ records the mode in `~/.cache/term-theme/mode` and nudges each consumer:
   are styled for the current mode at creation, and `term-theme` restyles
   live sessions via `hive tmux restyle`. Existing shells keep the
   `HIVE_COLOR_*` env they started with until a new pane/window.
-- **Claude Code** — pins its theme in `~/.claude.json` (no auto-detection);
-  `term-theme` flips it between `light`/`dark`, preserving a
-  daltonized/ansi variant and leaving `auto`/custom themes alone. Restart
-  running sessions (or use `/theme`) to repaint; a running session may
-  clobber the flip when it saves state — re-run `term-theme` if a later
-  session comes up wrong.
+- **Claude Code** — stores its theme in `~/.claude/settings.json` (the
+  `/config` preferences moved there in 2.1.119); `term-theme` flips it
+  between `light`/`dark`, preserving a daltonized/ansi variant and leaving
+  `auto`/custom themes alone — the supported `auto` theme already follows
+  the terminal appearance by itself, so on `auto` there is nothing to
+  sync. Restart running sessions (or use `/theme`) to repaint.
 - **codex** — detects the background itself at startup; restart it after a
   flip.
 - **neovim** — follows the appearance at startup via the nvim config

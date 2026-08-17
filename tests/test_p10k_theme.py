@@ -100,21 +100,61 @@ def test_invalid_state_file_is_night(tmp_path):
 
 
 def test_watch_mode_applies_newer_state_file(tmp_path):
+    # No mtime nudging: a write landing in the same second the shell
+    # started must be enough (regression for the clock-watermark bug).
     env = _env(tmp_path, DEFAULTS_DARK)
     mode = _mode_file(env)
     snippet = (
         f'source {P10K} && '
         'print -r -- "before:$_term_public_p10k_mode" && '
         f'print day > {mode} && '
-        # Push the file mtime past the load-time watermark, as a
-        # term-theme flip after shell startup would.
-        f'touch -t 203801010000 {mode} && '
         '_term_public_p10k_watch_mode && '
         'print -r -- "after:$_term_public_p10k_mode $POWERLEVEL9K_BACKGROUND"'
     )
     r = _run(env, snippet)
     assert 'before:night' in r.stdout, r.stderr
     assert 'after:day 254' in r.stdout
+
+
+def test_watch_mode_equal_mtime_flip_applies(tmp_path):
+    # Regression: the state file already exists and is rewritten with an
+    # mtime identical to the startup snapshot's (a flip landing in the
+    # same second, pinned here with touch -t for determinism). The mtime
+    # comparison alone cannot see this write — the content check must.
+    env = _env(tmp_path, DEFAULTS_DARK)
+    mode = _mode_file(env)
+    stamp = '202601010000'
+    snippet = (
+        f'print night > {mode} && touch -t {stamp} {mode} && '
+        f'source {P10K} && '
+        'print -r -- "before:$_term_public_p10k_mode" && '
+        f'print day > {mode} && touch -t {stamp} {mode} && '
+        '_term_public_p10k_watch_mode && '
+        'print -r -- "after:$_term_public_p10k_mode $POWERLEVEL9K_BACKGROUND"'
+    )
+    r = _run(env, snippet)
+    assert 'before:night' in r.stdout, r.stderr
+    assert 'after:day 254' in r.stdout
+
+
+def test_watch_mode_same_content_rewrite_applies(tmp_path):
+    # A stale 'day' file is rightly ignored at startup (the dark
+    # appearance wins) — but a later term-theme rewrite of that same
+    # content must still land, even though only the mtime changes.
+    env = _env(tmp_path, DEFAULTS_DARK)
+    mode = _mode_file(env)
+    mode.write_text('day\n')
+    os.utime(mode, (0, 0))
+    snippet = (
+        f'source {P10K} && '
+        'print -r -- "before:$_term_public_p10k_mode" && '
+        f'touch {mode} && '
+        '_term_public_p10k_watch_mode && '
+        'print -r -- "after:$_term_public_p10k_mode"'
+    )
+    r = _run(env, snippet)
+    assert 'before:night' in r.stdout, r.stderr
+    assert 'after:day' in r.stdout
 
 
 def test_watch_mode_ignores_stale_state_file(tmp_path):

@@ -989,9 +989,10 @@ class TestTmuxRestyle:
             return m
 
         monkeypatch.setattr(hive, '_appearance_mode', lambda: 'day')
-        with patch.object(hive, '_load_apiary', return_value=[hive_root]):
-            with patch.object(hive.subprocess, 'run', side_effect=fake_run):
-                hive._tmux_restyle()
+        with patch.object(hive, '_TMUX_DIR', tmp_path / 'hive-tmux'), \
+             patch.object(hive, '_load_apiary', return_value=[hive_root]), \
+             patch.object(hive.subprocess, 'run', side_effect=fake_run):
+            hive._tmux_restyle()
 
         day = hive._palette_for_mode(hive._SHELL_PALETTE[0], 'day')
         style_sets = [c for c in calls if c[:2] == ['tmux', 'set']]
@@ -1002,6 +1003,49 @@ class TestTmuxRestyle:
         env_sets = [c for c in calls if c[:2] == ['tmux', 'set-environment']]
         assert ['tmux', 'set-environment', '-t', 'infra-0',
                 'HIVE_COLOR_256', day['c256']] in env_sets
+        # Only the hive session's config is (re)generated.
+        assert [p.name for p in (tmp_path / 'hive-tmux').iterdir()] == [
+            'infra.conf']
+
+    def test_restyle_rewrites_config_for_reload_binding(
+            self, tmp_path, monkeypatch):
+        # backtick+r sources /tmp/hive-tmux/<name>.conf. After a restyle
+        # that file must carry the new mode's palette — otherwise the
+        # documented reload reverts the status bar to the palette from
+        # session creation.
+        hive_root = tmp_path / 'infra'
+        hive_root.mkdir()
+        tmux_dir = tmp_path / 'hive-tmux'
+        night = hive._SHELL_PALETTE[0]
+
+        def fake_run(cmd, **kwargs):
+            m = MagicMock()
+            if cmd[:2] == ['tmux', 'list-sessions']:
+                # Two sessions of the same hive share one config file.
+                m.stdout, m.returncode = 'infra-0\ninfra-1\n', 0
+            elif cmd[:2] == ['tmux', 'show-environment']:
+                m.stdout, m.returncode = f'HIVE_ROOT={hive_root}\n', 0
+            else:
+                m.stdout, m.returncode = '', 0
+            return m
+
+        monkeypatch.setattr(hive, '_appearance_mode', lambda: 'day')
+        write = MagicMock(side_effect=hive._write_tmux_config)
+        with patch.object(hive, '_TMUX_DIR', tmux_dir), \
+             patch.object(hive, '_load_apiary', return_value=[hive_root]):
+            # The config a night-mode _tmux_start would have left behind.
+            hive._write_tmux_config(hive_root, night)
+            with patch.object(hive, '_write_tmux_config', write), \
+                 patch.object(hive.subprocess, 'run', side_effect=fake_run):
+                hive._tmux_restyle()
+
+        conf = (tmux_dir / 'infra.conf').read_text()
+        day = hive._palette_for_mode(night, 'day')
+        assert day['background'] in conf
+        # The night palette is fully replaced in the reload source.
+        for key in ('primary', 'background', 'foreground', 'inactive_bg'):
+            assert night[key] not in conf
+        assert write.call_count == 1  # deduped across the session group
 
     def test_no_tmux_server_is_a_noop(self, monkeypatch):
         def fake_run(cmd, **kwargs):

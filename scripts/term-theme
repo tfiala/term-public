@@ -61,30 +61,45 @@ persist_mode() {
   mkdir -p "$dir" 2>/dev/null && printf '%s\n' "$1" >"$dir/mode" || true
 }
 
-# Claude Code pins its theme in ~/.claude.json (v2 has no CLI setter), so
-# flip it to the mode's variant for future sessions; running sessions keep
-# their palette until restarted (or switched in-app with /theme) and may
-# clobber this edit when they persist state — re-run term-theme if so.
-# Respects a daltonized/ansi variant choice and leaves auto/custom themes
-# alone. Best-effort: silently a no-op without the file or python3.
+# Claude Code reads its theme from ~/.claude/settings.json (the /config
+# preferences, theme included, moved there in 2.1.119 — an edit to the
+# legacy ~/.claude.json no longer reaches current versions), so flip the
+# setting there for future sessions; running sessions repaint after a
+# restart or an in-app /theme. When settings.json has no theme yet, the
+# variant choice is seeded from the legacy file so a pre-migration
+# daltonized/ansi preference carries over. Leaves auto/custom themes alone
+# (the supported `auto` theme already follows the terminal appearance by
+# itself). Best-effort: silently a no-op without a ~/.claude dir or
+# python3, and never touches a file it cannot parse.
 sync_claude_theme() {
-  local mode=$1 file=$HOME/.claude.json
-  [[ -f $file ]] || return 0
+  local mode=$1 dir=$HOME/.claude
+  [[ -d $dir ]] || return 0
   command -v python3 >/dev/null 2>&1 || return 0
-  python3 - "$file" "$mode" <<'EOF' 2>/dev/null || true
+  python3 - "$dir/settings.json" "$HOME/.claude.json" "$mode" <<'EOF' 2>/dev/null || true
 import json
+import os
 import sys
 
-path, mode = sys.argv[1], sys.argv[2]
-with open(path) as f:
-    cfg = json.load(f)
-current = cfg.get('theme', 'dark')
+path, legacy, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg = {}
+if os.path.exists(path):
+    with open(path) as f:
+        cfg = json.load(f)
+current = cfg.get('theme')
+if current is None:
+    try:
+        with open(legacy) as f:
+            current = json.load(f).get('theme')
+    except (OSError, ValueError):
+        pass
+if current is None:
+    current = 'dark'
 if current.startswith(('auto', 'custom:')):
     sys.exit(0)  # already self-adapting, or a deliberate custom theme
 suffix = next(
     (s for s in ('-daltonized', '-ansi') if current.endswith(s)), '')
 new = ('light' if mode == 'day' else 'dark') + suffix
-if new != current:
+if new != cfg.get('theme'):
     cfg['theme'] = new
     with open(path, 'w') as f:
         json.dump(cfg, f, indent=2)

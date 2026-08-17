@@ -2754,14 +2754,18 @@ def _tmux_restyle() -> None:
 
     Invoked by `term-theme` after flipping the macOS appearance, so status
     bars, window tabs and pane borders follow the day/night switch without
-    recreating sessions. New panes also see the mode's HIVE_COLOR_* env;
-    shells that already exist keep the values they started with.
+    recreating sessions. The generated /tmp/hive-tmux/<name>.conf is
+    rewritten too — the backtick+r reload binding sources it, so without
+    the rewrite a reload would revert to the palette from session
+    creation. New panes also see the mode's HIVE_COLOR_* env; shells that
+    already exist keep the values they started with.
     """
     mode = _appearance_mode()
     r = subprocess.run(['tmux', 'list-sessions', '-F', '#{session_name}'],
                        capture_output=True, text=True)
     if r.returncode != 0:
         return
+    rewritten: set[str] = set()
     for session in r.stdout.splitlines():
         env = subprocess.run(
             ['tmux', 'show-environment', '-t', session, 'HIVE_ROOT'],
@@ -2770,6 +2774,9 @@ def _tmux_restyle() -> None:
             continue
         hive = Path(env.stdout.strip().split('=', 1)[1])
         color = _palette_for_mode(_hive_color(hive), mode)
+        if _short_name(hive) not in rewritten:
+            _write_tmux_config(hive, color)
+            rewritten.add(_short_name(hive))
         for _, opt, val in _style_option_pairs(color):
             subprocess.run(['tmux', 'set', '-t', session, opt, val])
         subprocess.run(['tmux', 'set-environment', '-t', session,

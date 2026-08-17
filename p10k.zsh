@@ -123,21 +123,39 @@ _term_public_p10k_detect_mode() {
   print -r -- night
 }
 
-# Only state-file writes newer than the last applied mode count, so a stale
-# file never overrides the appearance detected at startup.
+# Only state-file writes after startup count, so a stale file never
+# overrides the appearance detected at startup. The startup snapshot is the
+# file's own (mtime, content) pair rather than the clock: mtime has only
+# second granularity, so a clock watermark would silently swallow a flip
+# written in the same second the shell started — the snapshot cannot,
+# because such a write still changes the mtime or the content.
 zmodload -F zsh/stat b:zstat 2>/dev/null
-zmodload zsh/datetime 2>/dev/null
-typeset -g _term_public_p10k_mode_mtime=${EPOCHSECONDS:-0}
+typeset -g _term_public_p10k_mode_mtime=0
+typeset -g _term_public_p10k_mode_seen=
+() {
+  (( $+builtins[zstat] )) || return 0
+  local f
+  local -a st
+  f=$(_term_public_p10k_state_file)
+  if [[ -r $f ]] && zstat -A st +mtime -- $f 2>/dev/null; then
+    typeset -g _term_public_p10k_mode_mtime=$st[1]
+    typeset -g _term_public_p10k_mode_seen=$(<$f)
+  fi
+}
 
 _term_public_p10k_watch_mode() {
   (( $+builtins[zstat] )) || return 0
   local f mode
   local -a st
   f=$(_term_public_p10k_state_file)
-  zstat -A st +mtime -- $f 2>/dev/null || return 0
-  (( st[1] > _term_public_p10k_mode_mtime )) || return 0
-  typeset -g _term_public_p10k_mode_mtime=$st[1]
+  { [[ -r $f ]] && zstat -A st +mtime -- $f 2>/dev/null } || return 0
   mode=$(<$f)
+  if (( st[1] == _term_public_p10k_mode_mtime )) &&
+     [[ $mode == "$_term_public_p10k_mode_seen" ]]; then
+    return 0
+  fi
+  typeset -g _term_public_p10k_mode_mtime=$st[1]
+  typeset -g _term_public_p10k_mode_seen=$mode
   [[ $mode == (day|night) && $mode != $_term_public_p10k_mode ]] || return 0
   _term_public_p10k_apply_palette $mode
 }

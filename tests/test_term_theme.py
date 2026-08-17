@@ -215,53 +215,105 @@ class TestModeStateFile:
 
 
 class TestClaudeThemeSync:
-    def _config(self, env) -> Path:
+    """The theme must land in ~/.claude/settings.json — the authoritative
+    store for /config preferences since Claude Code 2.1.119. The legacy
+    ~/.claude.json is read-only input (variant seeding), never a target.
+    """
+
+    def _config(self, env, content=None) -> Path:
+        settings = Path(env['HOME']) / '.claude' / 'settings.json'
+        settings.parent.mkdir(exist_ok=True)
+        if content is not None:
+            settings.write_text(content)
+        return settings
+
+    def _legacy(self, env) -> Path:
         return Path(env['HOME']) / '.claude.json'
 
     def test_flips_theme_for_future_sessions(self, fake_mac):
         env, _ = fake_mac
-        self._config(env).write_text('{"theme": "dark", "other": 1}')
+        cfg_path = self._config(env, '{"theme": "dark", "model": "opus"}')
         run(env, 'day')
-        cfg = json.loads(self._config(env).read_text())
+        cfg = json.loads(cfg_path.read_text())
         assert cfg['theme'] == 'light'
-        assert cfg['other'] == 1  # unrelated keys survive
+        assert cfg['model'] == 'opus'  # unrelated settings survive
         run(env, 'night')
-        assert json.loads(self._config(env).read_text())['theme'] == 'dark'
+        assert json.loads(cfg_path.read_text())['theme'] == 'dark'
 
     def test_unset_theme_means_dark(self, fake_mac):
         env, _ = fake_mac
-        self._config(env).write_text('{}')
+        cfg_path = self._config(env, '{}')
         run(env, 'night')
-        cfg = json.loads(self._config(env).read_text())
+        cfg = json.loads(cfg_path.read_text())
         assert cfg.get('theme', 'dark') == 'dark'
         run(env, 'day')
-        assert json.loads(self._config(env).read_text())['theme'] == 'light'
+        assert json.loads(cfg_path.read_text())['theme'] == 'light'
 
     def test_preserves_variant_suffix(self, fake_mac):
         env, _ = fake_mac
-        self._config(env).write_text('{"theme": "dark-daltonized"}')
+        cfg_path = self._config(env, '{"theme": "dark-daltonized"}')
         run(env, 'day')
-        assert (json.loads(self._config(env).read_text())['theme']
-                == 'light-daltonized')
+        assert json.loads(cfg_path.read_text())['theme'] == 'light-daltonized'
 
     def test_leaves_auto_and_custom_alone(self, fake_mac):
         env, _ = fake_mac
         for theme in ('auto', 'custom:dracula'):
-            self._config(env).write_text(json.dumps({'theme': theme}))
+            cfg_path = self._config(env, json.dumps({'theme': theme}))
             run(env, 'day')
-            assert json.loads(self._config(env).read_text())['theme'] == theme
+            assert json.loads(cfg_path.read_text())['theme'] == theme
 
-    def test_missing_config_is_fine(self, fake_mac):
+    def test_missing_claude_dir_is_fine(self, fake_mac):
         env, _ = fake_mac
         result = run(env, 'day')
         assert result.returncode == 0
-        assert not self._config(env).exists()
+        assert not (Path(env['HOME']) / '.claude').exists()
+
+    def test_creates_settings_when_dir_exists(self, fake_mac):
+        # An installed Claude Code without an explicit theme setting still
+        # gets the binding — in the authoritative file.
+        env, _ = fake_mac
+        cfg_path = self._config(env)
+        assert not cfg_path.exists()
+        run(env, 'day')
+        assert json.loads(cfg_path.read_text())['theme'] == 'light'
+
+    def test_seeds_variant_from_legacy_config(self, fake_mac):
+        # Pre-2.1.119 the theme lived in ~/.claude.json; a daltonized
+        # variant chosen there must carry into the migrated setting.
+        env, _ = fake_mac
+        cfg_path = self._config(env, '{}')
+        self._legacy(env).write_text('{"theme": "dark-daltonized"}')
+        run(env, 'day')
+        assert json.loads(cfg_path.read_text())['theme'] == 'light-daltonized'
+
+    def test_legacy_auto_respected_when_settings_unset(self, fake_mac):
+        env, _ = fake_mac
+        cfg_path = self._config(env, '{}')
+        self._legacy(env).write_text('{"theme": "auto"}')
+        run(env, 'day')
+        assert 'theme' not in json.loads(cfg_path.read_text())
+
+    def test_legacy_file_is_never_written(self, fake_mac):
+        env, _ = fake_mac
+        self._config(env, '{"theme": "dark"}')
+        legacy = self._legacy(env)
+        legacy.write_text('{"theme": "dark", "sessions": {}}')
+        run(env, 'day')
+        assert json.loads(legacy.read_text()) == {
+            'theme': 'dark', 'sessions': {}}
+
+    def test_unparseable_settings_left_untouched(self, fake_mac):
+        env, _ = fake_mac
+        cfg_path = self._config(env, '{not json')
+        result = run(env, 'day')
+        assert result.returncode == 0
+        assert cfg_path.read_text() == '{not json'
 
     def test_status_does_not_touch_theme(self, fake_mac):
         env, _ = fake_mac
-        self._config(env).write_text('{"theme": "dark"}')
+        cfg_path = self._config(env, '{"theme": "dark"}')
         run(env, 'status')
-        assert json.loads(self._config(env).read_text())['theme'] == 'dark'
+        assert json.loads(cfg_path.read_text())['theme'] == 'dark'
 
 
 class TestHiveRestyle:
