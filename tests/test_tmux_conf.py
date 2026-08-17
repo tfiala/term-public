@@ -7,10 +7,13 @@ dark-on-dark (an invisible mouse-drag selection). The base config must
 pin every style it sets in truecolor hex so the palette remap can't
 reach it.
 
-The guard fails closed: a line that sets a ``*-style`` option but does
-not match the canonical parser below is itself reported as a violation,
-so unrecognized-but-valid tmux syntax can never smuggle a named color
-past the sweep.
+The guard works on logical lines (tmux's backslash-newline
+continuations joined exactly as tmux joins them) and fails closed: any
+non-comment command containing a ``*-style`` token that the canonical
+direct-``set`` parser does not handle — nested commands like
+``if-shell '...' 'set ...'`` or ``bind X set ...`` included — is
+itself reported as a violation, so unrecognized-but-valid tmux syntax
+can never smuggle a named color past the sweep.
 """
 
 import re
@@ -44,12 +47,11 @@ _STYLE_LINE = re.compile(
     r"([\w-]+-style)\s+(.+?)\s*$"
 )
 
-# Broad detector: any set-form line that mentions a *-style option at
-# all. Lines it sees that the canonical parser cannot handle are
-# reported as violations rather than skipped (fail closed).
-_STYLE_MENTION = re.compile(
-    r"^\s*set(?:-option|-[\w-]+|w)?\s+(?=.*[\w-]+-style)"
-)
+# Broad detector: a style-option-shaped token anywhere in a command.
+# Non-comment logical lines it matches that the canonical parser cannot
+# handle are reported as violations rather than skipped (fail closed) —
+# this is what catches nested payloads and unforeseen command shapes.
+_STYLE_TOKEN = re.compile(r"[\w-]+-style\b")
 
 # The value tail must be exactly one double-quoted, single-quoted, or
 # bare token, followed by nothing but an optional comment.
@@ -62,6 +64,32 @@ _VALUE_FORMS = (
 _HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
+def _continues(line: str) -> bool:
+    """True if the line ends in an unescaped backslash (continuation)."""
+    return (len(line) - len(line.rstrip("\\"))) % 2 == 1
+
+
+def _logical_lines(text: str) -> list[str]:
+    """Join backslash-newline continuations exactly as tmux does.
+
+    The backslash and newline are removed with nothing inserted — a
+    token split across the boundary joins back into one token, keeping
+    this view faithful to what tmux executes. Joining happens before
+    comment detection, matching tmux's parse order.
+    """
+    logical: list[str] = []
+    pending = ""
+    for line in text.splitlines():
+        if _continues(line):
+            pending += line[:-1]
+        else:
+            logical.append(pending + line)
+            pending = ""
+    if pending:
+        logical.append(pending)
+    return logical
+
+
 def _parse_value(tail: str) -> str | None:
     """The style value from a set line's tail, or None if unparseable."""
     for form in _VALUE_FORMS:
@@ -72,10 +100,13 @@ def _parse_value(tail: str) -> str | None:
 
 
 def _style_assignments(text: str) -> tuple[list[tuple[str, str]], list[str]]:
-    """All style assignments in order, plus unparseable style lines."""
+    """All style assignments in order, plus unhandled style-bearing lines."""
     settings: list[tuple[str, str]] = []
     malformed: list[str] = []
-    for line in text.splitlines():
+    for line in _logical_lines(text):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
         m = _STYLE_LINE.match(line)
         if m:
             value = _parse_value(m.group(2))
@@ -83,7 +114,7 @@ def _style_assignments(text: str) -> tuple[list[tuple[str, str]], list[str]]:
                 malformed.append(line)
             else:
                 settings.append((m.group(1), value))
-        elif _STYLE_MENTION.match(line):
+        elif _STYLE_TOKEN.search(line):
             malformed.append(line)
     return settings, malformed
 
@@ -101,8 +132,9 @@ def _color_violations(text: str) -> list[str]:
     """Color-valued style attributes that are not truecolor hex.
 
     Scans every assignment (not last-wins), so a later good line can't
-    mask an earlier bad one. Unparseable style lines are violations in
-    their own right — the guard never skips what it can't read.
+    mask an earlier bad one. Style-bearing lines the parser can't read
+    are violations in their own right — the guard never skips what it
+    can't read.
     """
     settings, malformed = _style_assignments(text)
     violations = [f"unparseable style assignment: {ln.strip()}"
@@ -179,6 +211,11 @@ def test_no_style_in_config_uses_non_truecolor_colors():
         "set -g mode-style 'fg=red,bg=#607d8b' # comment",
         # Bare values can carry a trailing comment too.
         "set -g mode-style fg=red,bg=#607d8b # comment",
+        # A backslash continuation after the option name is one logical
+        # command to tmux; joining must expose the assignment.
+        'set -g mode-style \\\n  "fg=red,bg=#607d8b"',
+        # Continuation can split the command even before the option.
+        'set -g \\\n  mode-style "fg=red,bg=#607d8b"',
     ],
 )
 def test_mutated_config_fails_the_color_sweep(mutation):
@@ -199,12 +236,18 @@ def test_mutated_config_fails_the_color_sweep(mutation):
         # An escaped quote defeats the simple quote scanner.
         'set -g mode-style "fg=\\"x\\""',
         # A flag taking an argument (-t target) breaks the canonical
-        # flag parse; the mention detector must still see the style.
+        # flag parse; the token detector must still see the style.
         "set -t work mode-style fg=red",
+        # Nested command payloads execute style assignments too — the
+        # base config already uses if-shell around set for
+        # default-shell, so this shape is not hypothetical.
+        "if-shell 'true' 'set -g mode-style \"fg=red,bg=#607d8b\"'",
+        # A key binding can carry a set command as its action.
+        'bind M set -g mode-style "fg=red,bg=#607d8b"',
     ],
 )
-def test_unparseable_style_lines_fail_closed(unparseable):
-    """A style assignment the parser can't read is itself a violation."""
+def test_unhandled_style_lines_fail_closed(unparseable):
+    """A style-bearing command the parser can't read is a violation."""
     mutated = TMUX_CONF.read_text() + "\n" + unparseable + "\n"
     assert any(
         v.startswith("unparseable style assignment")
@@ -223,6 +266,11 @@ def test_unparseable_style_lines_fail_closed(unparseable):
         'set -g mode-style "fg=#eceff1,bg=#607d8b" # why',
         "set -g mode-style fg=#eceff1,bg=#607d8b # why",
         'set -g message-style "noattr fg=#292d3e bg=#ffcb6b fill=#ffcb6b"',
+        # A compliant continued command parses instead of failing closed.
+        'set -g mode-style \\\n  "fg=#eceff1,bg=#607d8b"',
+        # Joining is faithful: a token split across the continuation
+        # boundary reassembles without an inserted space, as in tmux.
+        'set -g mode-sty\\\nle "fg=#eceff1,bg=#607d8b"',
     ],
 )
 def test_compliant_syntax_variants_pass_the_sweep(compliant):
@@ -240,7 +288,7 @@ def test_dropping_fill_from_message_style_is_caught():
     message_styles = ("message-style", "message-command-style")
     lines = []
     stripped = 0
-    for line in TMUX_CONF.read_text().splitlines():
+    for line in _logical_lines(TMUX_CONF.read_text()):
         m = _STYLE_LINE.match(line)
         if m and m.group(1) in message_styles:
             line, n = re.subn(r",?fill=#[0-9a-fA-F]{6}", "", line)
