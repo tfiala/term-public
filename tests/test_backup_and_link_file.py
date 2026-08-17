@@ -73,8 +73,8 @@ def test_backs_up_changed_file(tmp_path):
 
 
 def test_replaces_identical_file_with_symlink(tmp_path):
-    # Leaving an identical copy in place lets it silently go stale as the
-    # repo moves on (bit ~/bin/hive); it must become a symlink. No backup
+    # Leaving an identical copy in place lets a linked dotfile silently go
+    # stale as the repo moves on; it must become a symlink. No backup
     # is taken since no content would be lost.
     src = tmp_path / "source.txt"
     src.write_text("same")
@@ -192,6 +192,7 @@ def _scaffold_repo(tmp_path):
     (repo_root / "tmux" / "tmux.conf").write_text("# tmux\n")
     (repo_root / "scripts" / "hive.py").write_text("#!/usr/bin/env python3\n")
     (repo_root / "scripts" / "hive-ci-popup.py").write_text("#!/usr/bin/env python3\n")
+    (repo_root / "scripts" / "term-theme").write_text("#!/usr/bin/env bash\n")
 
     return repo_root, home
 
@@ -229,7 +230,47 @@ def test_setup_creates_local_overlay_skeleton(tmp_path):
     assert (home / ".bashrc").is_symlink()
     assert (home / ".inputrc").is_symlink()
     assert (home / ".config" / "starship.toml").is_symlink()
-    assert (home / "bin" / "hive").is_symlink()
+    assert (home / "bin" / "hive").is_file()
+    assert not (home / "bin" / "hive").is_symlink()
+
+
+def test_setup_installs_bin_scripts_as_copies(tmp_path):
+    """~/bin executables are copies, not symlinks — an external installer
+    (infra/home-dc copy-scripts.py) overwriting ~/bin must not write
+    through into the repo's canonical scripts/ (2026-08-16 incident)."""
+    repo_root, home = _scaffold_repo(tmp_path)
+
+    result = _run_setup(repo_root, home)
+
+    assert result.returncode == 0
+    for name, src in [("hive", "hive.py"),
+                      ("hive-ci-popup", "hive-ci-popup.py"),
+                      ("term-theme", "term-theme")]:
+        dest = home / "bin" / name
+        assert dest.is_file() and not dest.is_symlink()
+        assert os.access(dest, os.X_OK)
+        assert dest.read_bytes() == (repo_root / "scripts" / src).read_bytes()
+        # The decisive property: writing the installed copy must not
+        # reach the repo source.
+        dest.write_text("clobbered by external installer\n")
+        assert (repo_root / "scripts" / src).read_text() \
+            != "clobbered by external installer\n"
+
+
+def test_setup_migrates_bin_symlink_to_copy(tmp_path):
+    """A legacy symlinked ~/bin/hive from an earlier setup.sh becomes a
+    copy, without .bak churn."""
+    repo_root, home = _scaffold_repo(tmp_path)
+    bin_dir = home / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "hive").symlink_to(repo_root / "scripts" / "hive.py")
+
+    result = _run_setup(repo_root, home)
+
+    assert result.returncode == 0
+    dest = bin_dir / "hive"
+    assert dest.is_file() and not dest.is_symlink()
+    assert not (bin_dir / "hive.bak").exists()
 
 
 def test_setup_backs_up_existing_bashrc(tmp_path):
