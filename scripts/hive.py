@@ -9,7 +9,7 @@ and reports status or pulls.
 
 Subcommands:
   status       Show branch, sync, and working-tree status for all repos
-  pull         Pull --rebase all repos (skips dirty ones) [--push]
+  pull         Fast-forward all repos (skips dirty/diverged/held ones) [--push]
   pr-check     Check PR status for repos on non-default branches [--clean]
   issues       List open Forgejo issues for each unique repo
   create       Clone a new repo into the hive with auto-numbered naming
@@ -24,6 +24,10 @@ Subcommands:
 Apiary mode (--apiary):
   Operates across all configured hives defined in ~/.config/hive/apiary.json.
   Implicit for read-only commands (status) when run from outside any hive.
+
+Hold marker:
+  git config hive.hold "<reason>"    # pull sweeps skip this repo, printing the reason
+  git config --unset hive.hold       # release the hold
 
 Examples:
   hive.py status
@@ -214,6 +218,9 @@ class SyncAction(Enum):
     PUSH = 'push'
     PULL = 'pull'
     SKIP_DIRTY = 'skip_dirty'
+    SKIP_DIVERGED = 'skip_diverged'
+    SKIP_IN_PROGRESS = 'skip_in_progress'
+    SKIP_HELD = 'skip_held'
     SKIP_NOT_DEFAULT = 'skip_not_default'
     SKIP_NO_REMOTE = 'skip_no_remote'
     SKIP_NO_BRANCH_ON_REMOTE = 'skip_no_branch_on_remote'
@@ -245,10 +252,24 @@ class RepoStatus:
     error_lines: list[str] = field(default_factory=list)
     pushed: bool = False
     push_failed: bool = False
+    in_progress_op: str = ''
+    hold_reason: str = ''
 
     @property
     def skipped(self) -> bool:
         return self.action == SyncAction.SKIP_DIRTY
+
+    @property
+    def diverged(self) -> bool:
+        return self.action == SyncAction.SKIP_DIVERGED
+
+    @property
+    def in_progress(self) -> bool:
+        return self.action == SyncAction.SKIP_IN_PROGRESS
+
+    @property
+    def held(self) -> bool:
+        return self.action == SyncAction.SKIP_HELD
 
     @property
     def pull_failed(self) -> bool:
@@ -753,8 +774,58 @@ def cmd_status(args: argparse.Namespace) -> None:
 
 _ORIGIN_REMOTE = RemoteProfile(
     name='origin',
-    pull_args=('pull', '--rebase'),
+    pull_args=('pull', '--ff-only'),
 )
+
+
+def _hold_reason(repo_path: Path) -> str | None:
+    """Return the hive.hold reason if set, else None.
+
+    A set-but-empty value still counts as a hold — the marker is the claim,
+    the reason is a courtesy.
+    """
+    reason = _git_out(['config', '--get', 'hive.hold'], cwd=repo_path)
+    if reason is None:
+        return None
+    return reason or '(no reason given)'
+
+
+def _operation_in_progress(repo_path: Path) -> str | None:
+    """Detect an in-flight history rewrite (rebase/merge/cherry-pick).
+
+    Returns the operation name, or None when no operation is in progress.
+    A checkout mid-rebase can have a clean worktree, so the dirty check
+    alone cannot protect it.
+    """
+    git_dir_out = _git_out(['rev-parse', '--git-dir'], cwd=repo_path)
+    if not git_dir_out:
+        return None
+    git_dir = Path(git_dir_out)
+    if not git_dir.is_absolute():
+        git_dir = repo_path / git_dir
+    if (git_dir / 'rebase-merge').exists() or (git_dir / 'rebase-apply').exists():
+        return 'rebase'
+    if (git_dir / 'MERGE_HEAD').exists():
+        return 'merge'
+    if (git_dir / 'CHERRY_PICK_HEAD').exists():
+        return 'cherry-pick'
+    return None
+
+
+def _is_diverged(repo_path: Path, upstream: str) -> bool:
+    """True when HEAD and upstream have each moved past the other.
+
+    Only claims divergence when the upstream ref actually resolves and both
+    ancestry checks answer definitively "no" (exit 1) — any other failure
+    (missing ref, git error) is not evidence of divergence.
+    """
+    if not _git_out(['rev-parse', '--verify', upstream], cwd=repo_path):
+        return False
+    behind = _git(['merge-base', '--is-ancestor', 'HEAD', upstream],
+                  cwd=repo_path)
+    ahead = _git(['merge-base', '--is-ancestor', upstream, 'HEAD'],
+                 cwd=repo_path)
+    return behind.returncode == 1 and ahead.returncode == 1
 
 
 def analyze_repo(repo_path: Path, remote_profile: RemoteProfile,
@@ -772,6 +843,22 @@ def analyze_repo(repo_path: Path, remote_profile: RemoteProfile,
         remote_url=remote_url,
         action=SyncAction.PULL,
     )
+
+    # An explicit hold wins over everything else — an agent has claimed
+    # this checkout across a multi-step operation.
+    hold = _hold_reason(repo_path)
+    if hold is not None:
+        status.action = SyncAction.SKIP_HELD
+        status.hold_reason = hold
+        return status
+
+    # An in-flight rebase/merge/cherry-pick can present a clean worktree,
+    # so it must be checked before (not via) the dirty check.
+    op = _operation_in_progress(repo_path)
+    if op:
+        status.action = SyncAction.SKIP_IN_PROGRESS
+        status.in_progress_op = op
+        return status
 
     # Check for uncommitted changes before anything else — a dirty repo
     # must always be reported as dirty, even if its HEAD matches the cache.
@@ -802,14 +889,21 @@ def execute_sync(status: RepoStatus, remote_cache: RemoteCache | None = None,
     if status.action != SyncAction.PULL:
         return status
 
-    # Pull --rebase
+    # Fast-forward pull. Never rebase or merge in a sweep: divergence means
+    # an in-flight history rewrite or genuinely unpushed work — both are
+    # report-worthy, neither is auto-fixable (issue #26).
     r = _git(
         [*status.remote_profile.pull_args, status.remote_profile.name, status.branch],
         cwd=status.path,
         timeout=30,
     )
     if r.returncode != 0:
-        _git(['rebase', '--abort'], cwd=status.path)
+        # The pull's fetch already updated the remote-tracking ref, so a
+        # definitive divergence check is possible even after the failure.
+        upstream = f'{status.remote_profile.name}/{status.branch}'
+        if _is_diverged(status.path, upstream):
+            status.action = SyncAction.SKIP_DIVERGED
+            return status
         status.action = SyncAction.ERROR
         stderr = r.stderr.strip()
         if stderr:
@@ -850,13 +944,26 @@ def _pull_repo(repo_path: Path, push: bool, indent: str = '  ',
         push=push,
     )
 
+    if result.held:
+        print(f'{indent}{CROSS()} skipped — held: {result.hold_reason}')
+        return False
+
+    if result.in_progress:
+        print(f'{indent}{CROSS()} skipped — {result.in_progress_op} in progress')
+        return False
+
     if result.skipped:
         n = result.dirty_count
         print(f'{indent}{CROSS()} skipped — {n} uncommitted file{"s" if n != 1 else ""}')
         return False
 
+    if result.diverged:
+        print(f'{indent}{CROSS()} skipped — {result.branch} diverged from '
+              f'{result.remote_profile.name}')
+        return False
+
     if result.pull_failed:
-        print(f'{indent}{CROSS()} pull --rebase failed on {result.branch}')
+        print(f'{indent}{CROSS()} pull failed on {result.branch}')
         for line in result.error_lines:
             print(f'{indent}  {C.dim(line)}')
         return False
@@ -880,13 +987,23 @@ def _pull_repo(repo_path: Path, push: bool, indent: str = '  ',
 def _format_pull_segment(result: RepoStatus) -> str:
     """Format a compact one-line segment from a pull result.
 
-    Examples: "✓ main — up to date", "✗ skipped 3!", "✓ main — pulled + pushed"
+    Examples: "✓ main — up to date", "✗ skipped 3!", "✓ main — pulled + pushed",
+    "✗ feature — diverged, skipped"
     """
+    if result.held:
+        return f'{CROSS()} {result.branch} — held: {result.hold_reason}'
+
+    if result.in_progress:
+        return f'{CROSS()} {result.branch} — {result.in_progress_op} in progress, skipped'
+
     if result.skipped:
         return f'{CROSS()} skipped {result.dirty_count}!'
 
+    if result.diverged:
+        return f'{CROSS()} {result.branch} — diverged, skipped'
+
     if result.pull_failed:
-        return f'{CROSS()} {result.branch} — rebase failed'
+        return f'{CROSS()} {result.branch} — pull failed'
 
     parts = []
     if result.up_to_date:
@@ -910,6 +1027,9 @@ def _is_notable(result: RepoStatus, default_branch: str) -> bool:
     return (
         result.branch != default_branch
         or result.skipped
+        or result.diverged
+        or result.in_progress
+        or result.held
         or result.pull_failed
         or result.push_failed
     )
@@ -1406,11 +1526,12 @@ def _clean_pr_branch(repo_path: Path, branch: str) -> dict:
     if r.returncode != 0:
         return {'success': False, 'error': f'checkout {default} failed'}
 
-    # Pull
-    r = _git(['pull', '--rebase', 'origin', default], cwd=repo_path, timeout=30)
+    # Pull (fast-forward only — a sweep never resolves divergence)
+    r = _git(['pull', '--ff-only', 'origin', default], cwd=repo_path, timeout=30)
     if r.returncode != 0:
-        _git(['rebase', '--abort'], cwd=repo_path)
-        return {'success': False, 'error': 'pull --rebase failed'}
+        if _is_diverged(repo_path, f'origin/{default}'):
+            return {'success': False, 'error': f'{default} diverged from origin'}
+        return {'success': False, 'error': 'fast-forward pull failed'}
 
     # Delete old branch
     r = _git(['branch', '-D', branch], cwd=repo_path)
@@ -2993,7 +3114,7 @@ def main():
         help='One-line-per-repo summary',
     )
 
-    pull_parser = sub.add_parser('pull', help='Pull --rebase all repos')
+    pull_parser = sub.add_parser('pull', help='Fast-forward all repos')
     pull_parser.add_argument(
         '--push', action='store_true',
         help='Push to origin after successful pull',
