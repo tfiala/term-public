@@ -137,8 +137,13 @@ records the mode in `~/.cache/term-theme/mode` and nudges each consumer:
   `auto`/custom themes alone — the supported `auto` theme already follows
   the terminal appearance by itself, so on `auto` there is nothing to
   sync. Restart running sessions (or use `/theme`) to repaint.
-- **codex** — detects the background itself at startup; restart it after a
-  flip.
+- **codex** — its accent palette (status line, inline code, links) comes
+  from its syntax theme, not the terminal: background detection gets no
+  answer inside tmux and falls back to the dark default, whose pastel
+  truecolors wash out on the day background. `term-theme` flips
+  `tui.theme` in `~/.codex/config.toml` between `catppuccin-latte` (day)
+  and `catppuccin-mocha` (night), leaving any other deliberately pinned
+  theme alone. Restart codex after a flip.
 - **neovim** — follows the appearance at startup via the nvim config
   (`vim.o.background` resolved from the macOS appearance, tokyonight picks
   its day/night style from it). Restart nvim after a flip.
