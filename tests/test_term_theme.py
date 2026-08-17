@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -314,6 +315,99 @@ class TestClaudeThemeSync:
         cfg_path = self._config(env, '{"theme": "dark"}')
         run(env, 'status')
         assert json.loads(cfg_path.read_text())['theme'] == 'dark'
+
+
+class TestCodexThemeSync:
+    """Codex's accent palette comes from its syntax theme (tui.theme in
+    ~/.codex/config.toml) — its light/dark background detection gets no
+    answer inside tmux and defaults to the dark catppuccin-mocha — so
+    term-theme flips the catppuccin pair per mode.  Both pair names were
+    verified against the bundled list in codex's /theme picker (v0.147.0).
+    """
+
+    # The shape of the user's real config: a [tui] table with unrelated
+    # keys plus a [tui.*] sub-table that must not receive the theme.
+    REALISTIC = (
+        'model_reasoning_effort = "xhigh"\n'
+        '\n'
+        '[tui]\n'
+        'status_line = ["model-with-reasoning", "git-branch"]\n'
+        '\n'
+        '[tui.model_availability_nux]\n'
+        '"gpt-5.5" = 4\n'
+    )
+
+    def _config(self, env, content=None) -> Path:
+        cfg = Path(env['HOME']) / '.codex' / 'config.toml'
+        cfg.parent.mkdir(exist_ok=True)
+        if content is not None:
+            cfg.write_text(content)
+        return cfg
+
+    def test_day_flips_unset_theme_to_latte(self, fake_mac):
+        """No tui.theme means codex's dark default — day must override it,
+        landing in [tui] itself, never a [tui.*] sub-table."""
+        env, _ = fake_mac
+        cfg_path = self._config(env, self.REALISTIC)
+        run(env, 'day')
+        cfg = tomllib.loads(cfg_path.read_text())
+        assert cfg['tui']['theme'] == 'catppuccin-latte'
+        assert cfg['tui']['status_line'] == [
+            'model-with-reasoning', 'git-branch']  # unrelated keys survive
+        assert 'theme' not in cfg['tui']['model_availability_nux']
+        assert cfg['model_reasoning_effort'] == 'xhigh'
+
+    def test_night_flips_latte_back_to_mocha(self, fake_mac):
+        env, _ = fake_mac
+        cfg_path = self._config(env, '[tui]\ntheme = "catppuccin-latte"\n')
+        run(env, 'night')
+        cfg = tomllib.loads(cfg_path.read_text())
+        assert cfg['tui']['theme'] == 'catppuccin-mocha'
+
+    def test_night_with_unset_theme_writes_nothing(self, fake_mac):
+        """Unset already means the dark default — no gratuitous edit."""
+        env, _ = fake_mac
+        cfg_path = self._config(env, self.REALISTIC)
+        run(env, 'night')
+        assert cfg_path.read_text() == self.REALISTIC
+
+    def test_pinned_theme_is_respected(self, fake_mac):
+        """A /theme pick outside the pair is deliberate — leave it."""
+        env, _ = fake_mac
+        content = '[tui]\ntheme = "zenburn"\n'
+        cfg_path = self._config(env, content)
+        for mode in ('day', 'night'):
+            run(env, mode)
+            assert cfg_path.read_text() == content
+
+    def test_missing_codex_dir_is_fine(self, fake_mac):
+        env, _ = fake_mac
+        result = run(env, 'day')
+        assert result.returncode == 0
+        assert not (Path(env['HOME']) / '.codex').exists()
+
+    def test_creates_config_when_dir_exists(self, fake_mac):
+        """An installed codex without a config.toml still gets the binding."""
+        env, _ = fake_mac
+        cfg_path = self._config(env)
+        assert not cfg_path.exists()
+        run(env, 'day')
+        cfg = tomllib.loads(cfg_path.read_text())
+        assert cfg['tui']['theme'] == 'catppuccin-latte'
+
+    def test_unparseable_config_left_untouched(self, fake_mac):
+        env, _ = fake_mac
+        content = 'not [ valid toml\n'
+        cfg_path = self._config(env, content)
+        result = run(env, 'day')
+        assert result.returncode == 0
+        assert cfg_path.read_text() == content
+
+    def test_status_does_not_touch_theme(self, fake_mac):
+        env, _ = fake_mac
+        cfg_path = self._config(env, self.REALISTIC)
+        run(env, 'status')
+        assert cfg_path.read_text() == self.REALISTIC
 
 
 class TestHiveRestyle:
