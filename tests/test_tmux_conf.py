@@ -14,6 +14,15 @@ direct-``set`` parser does not handle — nested commands like
 ``if-shell '...' 'set ...'`` or ``bind X set ...`` included — is
 itself reported as a violation, so unrecognized-but-valid tmux syntax
 can never smuggle a named color past the sweep.
+
+tmux also resolves unambiguous option-name abbreviations (``mode-sty``
+sets ``mode-style``), which carry no literal ``-style`` token. Policy:
+this config must spell style option names in full. Any token that is a
+proper prefix of a known style option name — in a direct set or a
+nested payload — fails closed, backed by a frozen list of tmux 3.7's
+style option names. Complete option names that happen to prefix a
+style name (``status``, ``status-left``, ...) stay exempt, since tmux
+resolves exact names before abbreviations.
 """
 
 import re
@@ -52,6 +61,72 @@ _STYLE_LINE = re.compile(
 # handle are reported as violations rather than skipped (fail closed) —
 # this is what catches nested payloads and unforeseen command shapes.
 _STYLE_TOKEN = re.compile(r"[\w-]+-style\b")
+
+# Every style-valued option name in tmux 3.7 (from show-options on a
+# pristine server). A style option added by a future tmux is still
+# caught by _STYLE_TOKEN when spelled in full; only its abbreviations
+# would need this list extended.
+STYLE_OPTIONS = frozenset({
+    "clock-mode-style",
+    "copy-mode-current-line-number-style",
+    "copy-mode-current-match-style",
+    "copy-mode-line-number-style",
+    "copy-mode-mark-style",
+    "copy-mode-match-style",
+    "copy-mode-position-style",
+    "copy-mode-selection-style",
+    "cursor-style",
+    "menu-border-style",
+    "menu-selected-style",
+    "menu-style",
+    "message-command-style",
+    "message-style",
+    "mode-style",
+    "pane-active-border-style",
+    "pane-border-style",
+    "pane-scrollbars-style",
+    "pane-status-current-style",
+    "pane-status-style",
+    "popup-border-style",
+    "popup-style",
+    "prompt-command-cursor-style",
+    "prompt-cursor-style",
+    "session-status-current-style",
+    "session-status-style",
+    "status-left-style",
+    "status-right-style",
+    "status-style",
+    "tree-mode-preview-style",
+    "window-active-style",
+    "window-status-activity-style",
+    "window-status-bell-style",
+    "window-status-current-style",
+    "window-status-last-style",
+    "window-status-style",
+    "window-style",
+})
+
+# Complete tmux option names that are proper prefixes of a style name.
+# tmux resolves an exact option name before considering abbreviations,
+# so these are legitimate targets, never style abbreviations.
+_ABBREV_EXEMPT = frozenset({
+    "pane-scrollbars",
+    "status",
+    "status-left",
+    "status-right",
+})
+
+# Any token tmux could accept as an abbreviation of a style option.
+# Proper prefixes shorter than 4 characters are always ambiguous in
+# tmux's option table, so 4 is a safe floor that keeps the net from
+# matching stray short words.
+_STYLE_ABBREVS = frozenset(
+    name[:i]
+    for name in STYLE_OPTIONS
+    for i in range(4, len(name))
+) - _ABBREV_EXEMPT
+
+_TOKEN = re.compile(r"[\w-]+")
 
 # The value tail must be exactly one double-quoted, single-quoted, or
 # bare token, followed by nothing but an optional comment.
@@ -99,6 +174,13 @@ def _parse_value(tail: str) -> str | None:
     return None
 
 
+def _mentions_style(line: str) -> bool:
+    """True if the line carries a style option, spelled out or abbreviated."""
+    if _STYLE_TOKEN.search(line):
+        return True
+    return any(t in _STYLE_ABBREVS for t in _TOKEN.findall(line))
+
+
 def _style_assignments(text: str) -> tuple[list[tuple[str, str]], list[str]]:
     """All style assignments in order, plus unhandled style-bearing lines."""
     settings: list[tuple[str, str]] = []
@@ -114,7 +196,7 @@ def _style_assignments(text: str) -> tuple[list[tuple[str, str]], list[str]]:
                 malformed.append(line)
             else:
                 settings.append((m.group(1), value))
-        elif _STYLE_TOKEN.search(line):
+        elif _mentions_style(line):
             malformed.append(line)
     return settings, malformed
 
@@ -244,6 +326,19 @@ def test_mutated_config_fails_the_color_sweep(mutation):
         "if-shell 'true' 'set -g mode-style \"fg=red,bg=#607d8b\"'",
         # A key binding can carry a set command as its action.
         'bind M set -g mode-style "fg=red,bg=#607d8b"',
+        # tmux resolves unambiguous option-name abbreviations, which
+        # carry no literal -style token — each of these sets the real
+        # option on tmux 3.7b.
+        'set -g mode-sty "fg=red,bg=#607d8b"',
+        'set -g copy-mode-match-sty "fg=red,bg=#607d8b"',
+        'set -g copy-mode-current-match-sty "fg=red,bg=#607d8b"',
+        'set -g copy-mode-mark-sty "fg=red,bg=#607d8b"',
+        'set -g message-sty "fg=red,bg=#607d8b"',
+        'set -g message-command-sty "fg=red,bg=#607d8b"',
+        # Abbreviations can cut far deeper than the -style suffix.
+        'set -g mode-s "fg=red,bg=#607d8b"',
+        # An abbreviation inside a nested payload must be seen too.
+        "if-shell 'true' 'set -g message-sty \"fg=red,bg=#607d8b\"'",
     ],
 )
 def test_unhandled_style_lines_fail_closed(unparseable):
@@ -271,6 +366,12 @@ def test_unhandled_style_lines_fail_closed(unparseable):
         # Joining is faithful: a token split across the continuation
         # boundary reassembles without an inserted space, as in tmux.
         'set -g mode-sty\\\nle "fg=#eceff1,bg=#607d8b"',
+        # Complete option names that happen to prefix a style name are
+        # exact matches to tmux, not abbreviations — they must not trip
+        # the abbreviation net.
+        "set -g status off",
+        'set -g status-left " #{session_name} "',
+        'set -g status-right " %H:%M "',
     ],
 )
 def test_compliant_syntax_variants_pass_the_sweep(compliant):
