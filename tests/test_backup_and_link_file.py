@@ -159,6 +159,180 @@ def test_backs_up_directory(tmp_path):
 _SCAFFOLD_ORIGIN = "git@github.com:example/term-public.git"
 
 
+# --- backup_and_copy_file unit tests ------------------------------------------
+
+
+def _extract_copy_function() -> str:
+    with open(SETUP_SH) as f:
+        text = f.read()
+    match = re.search(
+        r"^(backup_and_copy_file\(\) \{.*?^})", text, re.MULTILINE | re.DOTALL)
+    assert match, "Could not find backup_and_copy_file in setup.sh"
+    return match.group(1)
+
+
+_COPY_FUNCTION_DEF = _extract_copy_function()
+
+
+def run_backup_and_copy(source: str, dest: str) -> subprocess.CompletedProcess:
+    script = _COPY_FUNCTION_DEF + '\nbackup_and_copy_file "$1" "$2"'
+    return subprocess.run(
+        ["bash", "--norc", "-c", script, "bash", source, dest],
+        capture_output=True,
+        text=True,
+    )
+
+
+def _assert_installed_copy(src: Path, dest: Path):
+    assert dest.is_file() and not dest.is_symlink()
+    assert os.access(dest, os.X_OK)
+    assert dest.read_bytes() == src.read_bytes()
+
+
+def test_copy_creates_regular_file_for_new_destination(tmp_path):
+    src = tmp_path / "source.txt"
+    src.write_text("content")
+    dest = tmp_path / "bin" / "tool"
+
+    result = run_backup_and_copy(str(src), str(dest))
+
+    assert result.returncode == 0
+    _assert_installed_copy(src, dest)
+    # The decisive property: writing the copy must not reach the source.
+    dest.write_text("clobbered")
+    assert src.read_text() == "content"
+
+
+def test_copy_identical_noop_normalizes_executable_bit(tmp_path):
+    """An identical destination is left in place (same inode) but must
+    still come out executable — a bare copy may have lost the bit."""
+    src = tmp_path / "source.txt"
+    src.write_text("same")
+    dest = tmp_path / "dest.txt"
+    dest.write_text("same")
+    dest.chmod(0o644)
+    ino_before = os.stat(dest).st_ino
+
+    result = run_backup_and_copy(str(src), str(dest))
+
+    assert result.returncode == 0
+    assert os.stat(dest).st_ino == ino_before
+    assert os.access(dest, os.X_OK)
+    assert not (tmp_path / "dest.txt.bak").exists()
+
+
+def test_copy_replaces_hard_link_alias_to_source(tmp_path):
+    """A hard link to the source passes cmp but is still a write-through
+    alias: it must be replaced by an independent inode, with no hard-link
+    backup keeping the shared inode alive."""
+    src = tmp_path / "source.txt"
+    src.write_text("content")
+    dest = tmp_path / "dest.txt"
+    os.link(src, dest)
+    assert os.stat(dest).st_ino == os.stat(src).st_ino
+
+    result = run_backup_and_copy(str(src), str(dest))
+
+    assert result.returncode == 0
+    _assert_installed_copy(src, dest)
+    assert os.stat(dest).st_ino != os.stat(src).st_ino
+    assert not (tmp_path / "dest.txt.bak").exists()
+    dest.write_text("clobbered")
+    assert src.read_text() == "content"
+
+
+def test_copy_backs_up_changed_file(tmp_path):
+    src = tmp_path / "source.txt"
+    src.write_text("new content")
+    dest = tmp_path / "dest.txt"
+    dest.write_text("old content")
+
+    result = run_backup_and_copy(str(src), str(dest))
+
+    assert result.returncode == 0
+    _assert_installed_copy(src, dest)
+    backup = tmp_path / "dest.txt.bak"
+    assert backup.read_text() == "old content"
+
+
+def test_copy_migrates_symlink_to_source(tmp_path):
+    """The legacy install shape — a symlink to our own source — becomes
+    a copy without .bak churn."""
+    src = tmp_path / "source.txt"
+    src.write_text("content")
+    dest = tmp_path / "dest.txt"
+    dest.symlink_to(src)
+
+    result = run_backup_and_copy(str(src), str(dest))
+
+    assert result.returncode == 0
+    _assert_installed_copy(src, dest)
+    assert not (tmp_path / "dest.txt.bak").exists()
+
+
+def test_copy_migrates_relative_symlink_to_source(tmp_path):
+    """A relative link resolving to the source is still our own install
+    shape — identity is by resolution (-ef), not readlink text."""
+    src = tmp_path / "source.txt"
+    src.write_text("content")
+    dest = tmp_path / "dest.txt"
+    os.symlink("source.txt", dest)
+
+    result = run_backup_and_copy(str(src), str(dest))
+
+    assert result.returncode == 0
+    _assert_installed_copy(src, dest)
+    assert not (tmp_path / "dest.txt.bak").exists()
+
+
+def test_copy_replaces_dangling_symlink(tmp_path):
+    src = tmp_path / "source.txt"
+    src.write_text("content")
+    dest = tmp_path / "dest.txt"
+    dest.symlink_to(tmp_path / "nonexistent")
+
+    result = run_backup_and_copy(str(src), str(dest))
+
+    assert result.returncode == 0
+    _assert_installed_copy(src, dest)
+    assert not (tmp_path / "dest.txt.bak").exists()
+
+
+def test_copy_preserves_live_foreign_symlink_as_bak(tmp_path):
+    """A destination symlink into another location is preserved: the link
+    itself becomes the .bak, still pointing at the foreign file."""
+    foreign = tmp_path / "foreign.txt"
+    foreign.write_text("foreign content")
+    src = tmp_path / "source.txt"
+    src.write_text("content")
+    dest = tmp_path / "dest.txt"
+    dest.symlink_to(foreign)
+
+    result = run_backup_and_copy(str(src), str(dest))
+
+    assert result.returncode == 0
+    _assert_installed_copy(src, dest)
+    backup = tmp_path / "dest.txt.bak"
+    assert backup.is_symlink()
+    assert backup.read_text() == "foreign content"
+
+
+def test_copy_backs_up_directory(tmp_path):
+    src = tmp_path / "source.txt"
+    src.write_text("content")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "inner.txt").write_text("inner")
+
+    result = run_backup_and_copy(str(src), str(dest))
+
+    assert result.returncode == 0
+    _assert_installed_copy(src, dest)
+    backup = tmp_path / "dest.bak"
+    assert backup.is_dir()
+    assert (backup / "inner.txt").read_text() == "inner"
+
+
 def _git_init_with_origin(path, url):
     """Make path a git repo whose origin is url (no commits needed)."""
     subprocess.run(["git", "init", "-q", str(path)], check=True)

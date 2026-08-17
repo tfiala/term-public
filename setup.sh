@@ -55,22 +55,32 @@ backup_and_copy_file() {
   mkdir -p "$(dirname "$2")"
 
   if [[ -L "$2" ]]; then
-    if [[ -e "$2" && "$(readlink "$2")" != "$1" ]]; then
+    if [[ -e "$2" ]] && ! [[ "$2" -ef "$1" ]]; then
       # Live link to something else — preserve it; the link itself
       # moves, so the backup keeps pointing at the user's real file.
       rm -rf "$2.bak"
       mv "$2" "$2.bak"
     else
-      # A link to our own source is the legacy install shape being
-      # migrated; a dangling link preserves nothing. Remove either.
+      # A link resolving to our own source (the legacy install shape,
+      # in any spelling) preserves nothing worth backing up, and a
+      # dangling link preserves nothing at all. Remove either.
       unlink "$2"
     fi
   elif [[ -e "$2" ]]; then
-    if [[ ! -d "$2" ]] && cmp -s "$1" "$2"; then
+    if [[ "$1" -ef "$2" ]]; then
+      # A hard link to the source is another write-through alias — and
+      # backing it up would keep the shared inode alive under a new
+      # name. Remove it and copy fresh; the content is our own.
+      rm -f "$2"
+    elif [[ ! -d "$2" ]] && cmp -s "$1" "$2"; then
+      # Same content already installed — still normalize the executable
+      # bit, which a bare copy may have lost.
+      chmod +x "$2"
       return 0
+    else
+      rm -rf "$2.bak"
+      mv "$2" "$2.bak"
     fi
-    rm -rf "$2.bak"
-    mv "$2" "$2.bak"
   fi
   cp "$1" "$2"
   chmod +x "$2"
