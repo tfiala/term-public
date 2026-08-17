@@ -77,6 +77,13 @@ remove_stale_link() {
     */"$suffix") ;;
     *) return 0 ;;
   esac
+  # A relative symlink target resolves from the link's directory, not
+  # from this process's cwd — resolving from cwd would let identity be
+  # read off whatever happens to sit at the cwd-relative path.
+  case "$target" in
+    /*) ;;
+    *) target="$(dirname "$link")/$target" ;;
+  esac
   root="${target%/"$suffix"}"
   this_id="$(_repo_identity "$ROOT_DIR")"
   target_id="$(_repo_identity "$root")"

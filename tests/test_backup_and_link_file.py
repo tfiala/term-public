@@ -411,6 +411,46 @@ class TestStaleZshLinkCleanup:
         assert (home / ".zshrc").read_text() == "# someone else's zshrc\n"
         assert "could not be verified" in result.stderr
 
+    def test_removes_relative_link_to_verified_checkout(self, tmp_path):
+        """A relative symlink target into a same-origin checkout is
+        resolved from the link's directory and removed."""
+        repo_root, home = _scaffold_repo(tmp_path)
+        old_checkout = tmp_path / "old-checkout"
+        _make_old_term_public_checkout(old_checkout)
+        # Relative to $HOME: tmp_path/home/../old-checkout/zsh/zshrc
+        (home / ".zshrc").symlink_to("../old-checkout/zsh/zshrc")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0
+        assert not os.path.lexists(home / ".zshrc")
+
+    def test_relative_target_resolved_from_link_dir_not_cwd(self, tmp_path):
+        """The #19 review probe: a relative link whose cwd-relative
+        resolution hits a same-origin decoy while its real target (from
+        the link's directory) is a live foreign repo.  Identity must
+        describe the actual target, so the link survives."""
+        repo_root, _ = _scaffold_repo(tmp_path)
+        nested = tmp_path / "nested"
+        home = nested / "home"
+        home.mkdir(parents=True)
+        # Actual target, resolved from $HOME: a live foreign dotfiles repo.
+        foreign = nested / "foreign"
+        (foreign / "zsh").mkdir(parents=True)
+        (foreign / "zsh" / "zshrc").write_text("# someone else's zshrc\n")
+        _git_init_with_origin(foreign, "git@github.com:someone/dotfiles.git")
+        # Decoy at the path a cwd-relative resolution would hit
+        # (setup runs with cwd=tmp_path/repo): a same-origin checkout.
+        _make_old_term_public_checkout(tmp_path / "foreign")
+        (home / ".zshrc").symlink_to("../foreign/zsh/zshrc")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0
+        assert (home / ".zshrc").is_symlink()
+        assert (home / ".zshrc").read_text() == "# someone else's zshrc\n"
+        assert "could not be verified" in result.stderr
+
     def test_forged_marker_does_not_grant_provenance(self, tmp_path):
         """A foreign repo containing scripts/hive.py (the #19 review probe)
         is still foreign: identity is the git origin, not path contents."""
