@@ -233,6 +233,75 @@ class TestBashrcEnvironment:
         assert "OVERLAY=yes" in r.stdout
 
 
+class TestHistory:
+    """zsh-era history parity: oh-my-zsh's extended_history, ignore
+    dups/space, hist_verify, and share_history have bash equivalents."""
+
+    def _interactive(self, home, input_text):
+        return subprocess.run(
+            ["bash", "--rcfile", str(BASHRC), "-i"],
+            input=input_text,
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                 "HOME": str(home), "TERM": "xterm-256color"},
+            timeout=15,
+        )
+
+    def test_history_options_set(self, tmp_path):
+        r = subprocess.run(
+            ["bash", "--rcfile", str(BASHRC), "-i", "-c",
+             'shopt histappend histverify; echo "HC=$HISTCONTROL"; '
+             'echo "HT=${HISTTIMEFORMAT:+set}"'],
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                 "HOME": str(tmp_path), "TERM": "xterm-256color"},
+        )
+        assert r.returncode == 0
+        assert re.search(r"histappend\s+on", r.stdout)
+        assert re.search(r"histverify\s+on", r.stdout)
+        assert "HC=ignoreboth" in r.stdout
+        assert "HT=set" in r.stdout
+
+    def test_command_flushed_before_exit(self, tmp_path):
+        """share_history, half 1: a command reaches $HISTFILE at the next
+        prompt — a killed tmux pane loses nothing.  The grep runs before
+        its own line is flushed, so it sees exactly the echo entry."""
+        r = self._interactive(
+            tmp_path,
+            'echo tp_hist_one\n'
+            'grep -c tp_hist_one "$HISTFILE"\n')
+        assert r.returncode == 0
+        assert r.stdout.splitlines()[-1].strip() == "1"
+        # extended_history parity: the entry is timestamped in the file.
+        content = (tmp_path / ".bash_history").read_text()
+        assert "echo tp_hist_one" in content
+        assert re.search(r"^#\d+$", content, re.M)
+
+    def test_history_shared_across_sessions(self, tmp_path):
+        """share_history, half 2: entries another shell appends to
+        $HISTFILE appear in this shell's history at the next prompt.  The
+        marker is assembled from parts so no other history line matches
+        the grep literally."""
+        r = self._interactive(
+            tmp_path,
+            'marker=tp_hist_in\n'
+            'printf "%s\\n" "${marker}jected" >> "$HISTFILE"\n'
+            'history | grep -c "${marker}jected"\n')
+        assert r.returncode == 0
+        assert r.stdout.splitlines()[-1].strip() == "1"
+
+    def test_bak_prompt_command_preserved(self, tmp_path):
+        """A PROMPT_COMMAND from .bashrc.bak keeps running next to the
+        history sync instead of being clobbered."""
+        (tmp_path / ".bashrc.bak").write_text(
+            "PROMPT_COMMAND='echo FROM_BAK_PC'\n")
+        r = self._interactive(tmp_path, "true\n")
+        assert r.returncode == 0
+        assert "FROM_BAK_PC" in r.stdout
+
+
 class TestStartupReentry:
     """Re-entry guards suppress duplicate init but permit manual reloads."""
 

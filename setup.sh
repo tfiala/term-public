@@ -170,5 +170,14 @@ if [[ -n "$_zsh_leftovers" ]]; then
   echo "      $LOCAL_DIR/bashrc.local, then delete them."
 fi
 
+# Offer the one-shot history import while zsh history is still around and
+# the import has not already run (the importer leaves the .zsh-import.bak
+# backup behind as its done-marker).
+if [[ -f "$HOME/.zsh_history" && ! -f "$HOME/.bash_history.zsh-import.bak" ]]; then
+  echo "NOTE: zsh command history found at $HOME/.zsh_history."
+  echo "      Import it into bash history with:"
+  echo "      $ROOT_DIR/scripts/import-zsh-history.py"
+fi
+
 echo "Linked config into place."
 echo "Local machine overlay is available in $LOCAL_DIR"

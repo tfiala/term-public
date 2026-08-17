@@ -52,6 +52,16 @@ vi editing mode with `jk` to escape is set in `bash/bashrc` (bash only);
 are unaffected. Fish-style autosuggestions (ble.sh) were considered and left
 out for now; Starship + bash-completion covers the daily flow.
 
+History matches the zsh-era behavior (which came from oh-my-zsh's
+`lib/history.zsh`): entries are timestamped, duplicates and space-prefixed
+commands stay out, history expansions (`!!`, `!$`) are loaded for review
+instead of run blind, and — the bash spelling of zsh's `share_history` —
+every command is flushed to `~/.bash_history` as it runs and the merged
+file is reloaded at each prompt, so tmux panes share one live history and
+a killed pane loses nothing. `scripts/import-zsh-history.py` does a
+one-shot import of an existing `~/.zsh_history` into bash's timestamped
+format (`setup.sh` reminds you while one is present).
+
 Preview the shell without installing anything:
 
 ```bash
