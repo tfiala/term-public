@@ -89,6 +89,41 @@ def test_replaces_identical_file_with_symlink(tmp_path):
     assert not (tmp_path / "dest.txt.bak").exists()
 
 
+def test_preserves_live_foreign_symlink_as_bak(tmp_path):
+    """A destination symlink into another dotfiles repo is preserved:
+    the link itself becomes the .bak, still pointing at the foreign file."""
+    src = tmp_path / "source.txt"
+    src.write_text("ours")
+    foreign = tmp_path / "unrelated-dotfiles" / "bashrc"
+    foreign.parent.mkdir()
+    foreign.write_text("export THEIRS=1\n")
+    dest = tmp_path / "dest.txt"
+    dest.symlink_to(foreign)
+
+    result = run_backup_and_link(str(src), str(dest))
+
+    assert result.returncode == 0
+    assert dest.is_symlink()
+    assert os.readlink(str(dest)) == str(src)
+    bak = tmp_path / "dest.txt.bak"
+    assert bak.is_symlink()
+    assert bak.read_text() == "export THEIRS=1\n"
+
+
+def test_leaves_already_correct_symlink(tmp_path):
+    """An idempotent re-run neither relinks nor creates a backup."""
+    src = tmp_path / "source.txt"
+    src.write_text("ours")
+    dest = tmp_path / "dest.txt"
+    dest.symlink_to(src)
+
+    result = run_backup_and_link(str(src), str(dest))
+
+    assert result.returncode == 0
+    assert os.readlink(str(dest)) == str(src)
+    assert not os.path.lexists(tmp_path / "dest.txt.bak")
+
+
 def test_replaces_dangling_symlink(tmp_path):
     """A dangling destination symlink must be replaced, not break ln -s."""
     src = tmp_path / "source.txt"
@@ -121,12 +156,27 @@ def test_backs_up_directory(tmp_path):
 # --- Full setup.sh runs -------------------------------------------------------
 
 
+_SCAFFOLD_ORIGIN = "git@github.com:example/term-public.git"
+
+
+def _git_init_with_origin(path, url):
+    """Make path a git repo whose origin is url (no commits needed)."""
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "remote", "add", "origin", url], check=True)
+
+
 def _scaffold_repo(tmp_path):
-    """Create a minimal fake repo and home for setup.sh tests."""
+    """Create a minimal fake repo and home for setup.sh tests.
+
+    The scaffold is a git repo with an origin remote because setup.sh
+    proves zsh-era link provenance by comparing normalized origins.
+    """
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     home = tmp_path / "home"
     home.mkdir()
+    _git_init_with_origin(repo_root, _SCAFFOLD_ORIGIN)
 
     (repo_root / "setup.sh").write_text(Path(SETUP_SH).read_text())
     (repo_root / "ghostty").mkdir()
@@ -261,6 +311,33 @@ class TestPriorConfigStaysEffective:
         assert r.returncode == 0
         assert "VAR=world" in r.stdout
 
+    def test_prior_symlinked_configs_survive(self, tmp_path):
+        """Prior .bashrc/.bash_profile that are live symlinks into another
+        dotfiles repo (the #19 review probe) stay effective via the .bak
+        links after setup."""
+        repo_root, home = _scaffold_repo(tmp_path)
+        _use_real_bash_config(repo_root)
+        foreign = tmp_path / "unrelated-dotfiles"
+        foreign.mkdir()
+        (foreign / "bashrc").write_text("export MY_CRITICAL_VAR=hello\n")
+        (foreign / "bash_profile").write_text("export MY_LOGIN_VAR=world\n")
+        (home / ".bashrc").symlink_to(foreign / "bashrc")
+        (home / ".bash_profile").symlink_to(foreign / "bash_profile")
+
+        assert _run_setup(repo_root, home).returncode == 0
+
+        assert (home / ".bashrc.bak").is_symlink()
+        assert (home / ".bash_profile.bak").is_symlink()
+        r = subprocess.run(
+            ["bash", "--norc", "-c",
+             'source "$HOME/.bash_profile"; '
+             'echo "RC=$MY_CRITICAL_VAR LOGIN=$MY_LOGIN_VAR"'],
+            capture_output=True, text=True,
+            env={**os.environ, "HOME": str(home)},
+        )
+        assert r.returncode == 0
+        assert "RC=hello LOGIN=world" in r.stdout
+
     def test_migration_notice_for_zsh_config(self, tmp_path):
         """Leftover zsh config gets explicit migration guidance."""
         repo_root, home = _scaffold_repo(tmp_path)
@@ -274,13 +351,17 @@ class TestPriorConfigStaysEffective:
 
 
 def _make_old_term_public_checkout(path):
-    """Create a fake zsh-era term-public checkout with its provenance marker."""
+    """Create a fake zsh-era checkout of the SAME repository.
+
+    Its origin uses the https form while the scaffold uses the scp form,
+    so the test also proves origin normalization.  Deliberately contains
+    no scripts/hive.py: identity must come from git, not path contents.
+    """
     (path / "zsh").mkdir(parents=True)
-    (path / "scripts").mkdir()
     (path / "zsh" / "zshrc").write_text("# old term-public zshrc\n")
     (path / "zsh" / "zshenv").write_text("# old term-public zshenv\n")
     (path / "p10k.zsh").write_text("# old term-public p10k\n")
-    (path / "scripts" / "hive.py").write_text("#!/usr/bin/env python3\n")
+    _git_init_with_origin(path, "https://github.com/example/term-public.git")
 
 
 class TestStaleZshLinkCleanup:
@@ -321,6 +402,25 @@ class TestStaleZshLinkCleanup:
         foreign = tmp_path / "unrelated-dotfiles"
         (foreign / "zsh").mkdir(parents=True)
         (foreign / "zsh" / "zshrc").write_text("# someone else's zshrc\n")
+        (home / ".zshrc").symlink_to(foreign / "zsh" / "zshrc")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0
+        assert (home / ".zshrc").is_symlink()
+        assert (home / ".zshrc").read_text() == "# someone else's zshrc\n"
+        assert "could not be verified" in result.stderr
+
+    def test_forged_marker_does_not_grant_provenance(self, tmp_path):
+        """A foreign repo containing scripts/hive.py (the #19 review probe)
+        is still foreign: identity is the git origin, not path contents."""
+        repo_root, home = _scaffold_repo(tmp_path)
+        foreign = tmp_path / "unrelated-dotfiles"
+        (foreign / "zsh").mkdir(parents=True)
+        (foreign / "scripts").mkdir()
+        (foreign / "zsh" / "zshrc").write_text("# someone else's zshrc\n")
+        (foreign / "scripts" / "hive.py").write_text("# forged marker\n")
+        _git_init_with_origin(foreign, "git@github.com:someone/dotfiles.git")
         (home / ".zshrc").symlink_to(foreign / "zsh" / "zshrc")
 
         result = _run_setup(repo_root, home)

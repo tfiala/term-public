@@ -15,6 +15,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BASHRC = REPO_ROOT / "bash" / "bashrc"
+BASH_PROFILE = REPO_ROOT / "bash" / "bash_profile"
 TMUX_CONF = REPO_ROOT / "tmux" / "tmux.conf"
 STARSHIP_TOML = REPO_ROOT / "starship" / "starship.toml"
 BOOTSTRAP = REPO_ROOT / "setup" / "bootstrap-macos.sh"
@@ -230,3 +231,75 @@ class TestBashrcEnvironment:
         )
         assert r.returncode == 0
         assert "OVERLAY=yes" in r.stdout
+
+
+class TestStartupReentry:
+    """Re-entry guards suppress duplicate init but permit manual reloads."""
+
+    def _install_fake_home(self, tmp_path):
+        """Real bash config linked into a fake home, with a counting
+        env.local so duplicate initialization is observable."""
+        repo = tmp_path / "repo"
+        (repo / "bash").mkdir(parents=True)
+        (repo / "local").mkdir()
+        (repo / "bash" / "bashrc").write_text(BASHRC.read_text())
+        (repo / "bash" / "bash_profile").write_text(BASH_PROFILE.read_text())
+        (repo / "local" / "env.local").write_text(
+            "export ENV_LOCAL_COUNT=$(( ${ENV_LOCAL_COUNT:-0} + 1 ))\n")
+        (tmp_path / ".bashrc").symlink_to(repo / "bash" / "bashrc")
+        (tmp_path / ".bash_profile").symlink_to(repo / "bash" / "bash_profile")
+
+    def _run(self, snippet, home):
+        return subprocess.run(
+            ["bash", "--norc", "-c", snippet],
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                 "HOME": str(home), "TERM": "xterm-256color"},
+            timeout=15,
+        )
+
+    def test_conventional_prior_profile_initializes_once(self, tmp_path):
+        """A prior .bash_profile that re-sources ~/.bashrc (the common
+        convention) must not run the full init twice (#19 review)."""
+        self._install_fake_home(tmp_path)
+        (tmp_path / ".bash_profile.bak").write_text(
+            'source "$HOME/.bashrc"\nexport FROM_PROFILE_BAK=1\n')
+
+        r = self._run(
+            'source "$HOME/.bash_profile"; '
+            'echo "COUNT=$ENV_LOCAL_COUNT BAK=$FROM_PROFILE_BAK"',
+            tmp_path,
+        )
+        assert r.returncode == 0
+        assert "COUNT=1 BAK=1" in r.stdout
+
+    def test_guards_cleared_after_startup(self, tmp_path):
+        """Guards must not survive init, or later reloads would no-op."""
+        self._install_fake_home(tmp_path)
+        (tmp_path / ".bash_profile.bak").write_text(
+            'source "$HOME/.bashrc"\n')
+
+        r = self._run(
+            'source "$HOME/.bash_profile"; '
+            'echo "RC=${_TERM_PUBLIC_BASHRC_ACTIVE:-unset} '
+            'PROFILE=${_TERM_PUBLIC_PROFILE_ACTIVE:-unset}"',
+            tmp_path,
+        )
+        assert r.returncode == 0
+        assert "RC=unset PROFILE=unset" in r.stdout
+
+    def test_manual_reload_reruns_everything(self, tmp_path):
+        """An intentional later `source ~/.bashrc` reloads the full
+        config including the prior-config backup (#19 review)."""
+        self._install_fake_home(tmp_path)
+        (tmp_path / ".bashrc.bak").write_text(
+            "export BAK_COUNT=$(( ${BAK_COUNT:-0} + 1 ))\n")
+
+        r = self._run(
+            'source "$HOME/.bashrc"; source "$HOME/.bashrc"; '
+            'echo "ENV=$ENV_LOCAL_COUNT BAK=$BAK_COUNT"',
+            tmp_path,
+        )
+        assert r.returncode == 0
+        assert "ENV=2 BAK=2" in r.stdout

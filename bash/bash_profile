@@ -3,14 +3,26 @@
 # Login shells (Ghostty windows, tmux panes via default-shell, SSH)
 # read this file; everything lives in bashrc so login and non-login
 # interactive shells behave identically.
+
+# Stack-scoped re-entry guard, mirroring the one in bashrc: unset on
+# every exit path so a later intentional reload still works.
+if [[ -n "${_TERM_PUBLIC_PROFILE_ACTIVE:-}" ]]; then
+  return 0
+fi
+_TERM_PUBLIC_PROFILE_ACTIVE=1
+
 if [[ -f "$HOME/.bashrc" ]]; then
   source "$HOME/.bashrc"
 fi
 
 # Source the user's prior .bash_profile if setup.sh backed it up
-# (mirrors the old zshenv.bak pattern).  The guard prevents re-entry
-# when the backup itself sources ~/.bash_profile.
-if [[ -z "${_TERM_PUBLIC_PROFILE_BAK:-}" && -f "$HOME/.bash_profile.bak" ]]; then
-  _TERM_PUBLIC_PROFILE_BAK=1
+# (mirrors the old zshenv.bak pattern).  A conventional prior profile
+# re-sources ~/.bashrc; ours just ran, so hold the bashrc guard for the
+# duration to absorb that into a no-op instead of a second full init.
+if [[ -f "$HOME/.bash_profile.bak" ]]; then
+  _TERM_PUBLIC_BASHRC_ACTIVE=1
   source "$HOME/.bash_profile.bak"
+  unset _TERM_PUBLIC_BASHRC_ACTIVE
 fi
+
+unset _TERM_PUBLIC_PROFILE_ACTIVE

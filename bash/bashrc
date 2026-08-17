@@ -4,6 +4,17 @@
 # shells).  Environment setup at the top runs for every source; the
 # interactive-only chrome lives below the interactivity gate.
 
+# Stack-scoped re-entry guard: while this file is actively executing, a
+# nested `source ~/.bashrc` (e.g. from the .bashrc.bak sourced below, or
+# from a prior .bash_profile) is a no-op instead of a duplicate full
+# initialization.  The guard is unset on EVERY exit path — keep it that
+# way if you add an early return — so a later intentional
+# `source ~/.bashrc` reloads everything, including the backups.
+if [[ -n "${_TERM_PUBLIC_BASHRC_ACTIVE:-}" ]]; then
+  return 0
+fi
+_TERM_PUBLIC_BASHRC_ACTIVE=1
+
 # --- TERM/TERMINFO fixup ------------------------------------------------------
 # The primary terminfo fix is in setup.sh, which installs xterm-ghostty
 # into ~/.terminfo.  This fallback handles the case where setup.sh was
@@ -51,15 +62,20 @@ fi
 # Source the user's prior .bashrc if setup.sh backed it up (mirrors the
 # old zshenv.bak pattern), so pre-existing config stays effective, not
 # just archived.  Runs before the prompt setup below so term-public
-# chrome wins where the two conflict.  The guard prevents re-entry when
-# the backup itself sources ~/.bashrc.
-if [[ -z "${_TERM_PUBLIC_BASHRC_BAK:-}" && -f "$HOME/.bashrc.bak" ]]; then
-  _TERM_PUBLIC_BASHRC_BAK=1
+# chrome wins where the two conflict.  If the backup re-sources
+# ~/.bashrc, the active guard at the top of this file absorbs it.
+if [[ -f "$HOME/.bashrc.bak" ]]; then
   source "$HOME/.bashrc.bak"
 fi
 
 # Everything below is interactive-only chrome.
-case $- in *i*) ;; *) return ;; esac
+case $- in
+  *i*) ;;
+  *)
+    unset _TERM_PUBLIC_BASHRC_ACTIVE
+    return
+    ;;
+esac
 
 # --- History ------------------------------------------------------------------
 shopt -s histappend checkwinsize
@@ -137,3 +153,5 @@ fi
 if [[ -f "${TERM_PUBLIC_LOCAL_DIR}/bashrc.local" ]]; then
   source "${TERM_PUBLIC_LOCAL_DIR}/bashrc.local"
 fi
+
+unset _TERM_PUBLIC_BASHRC_ACTIVE

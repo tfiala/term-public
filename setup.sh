@@ -4,14 +4,25 @@ set -euo pipefail
 # backup_and_link_file
 # $1 - source path
 # $2 - destination path
+# Destination symlinks are classified: already-correct links are left
+# alone, dangling links are replaced (ln -s onto one fails and there is
+# nothing to preserve), and live links to anything else are preserved as
+# "$2.bak" — the link itself moves, so the backup keeps pointing into
+# the user's other dotfiles repo and stays sourceable.
 backup_and_link_file() {
   mkdir -p "$(dirname "$2")"
 
-  # -L first: a symlink destination (live or dangling) is always replaced.
-  # The -e check alone misses dangling symlinks, and ln -s onto one fails.
   if [[ -L "$2" ]]; then
-    unlink "$2"
-    ln -s "$1" "$2"
+    if [[ "$(readlink "$2")" == "$1" ]]; then
+      return 0
+    elif [[ ! -e "$2" ]]; then
+      unlink "$2"
+      ln -s "$1" "$2"
+    else
+      rm -rf "$2.bak"
+      mv "$2" "$2.bak"
+      ln -s "$1" "$2"
+    fi
   elif [[ -e "$2" ]]; then
     if [[ -d "$2" ]] || ! cmp -s "$1" "$2"; then
       rm -rf "$2.bak"
@@ -30,15 +41,36 @@ backup_and_link_file() {
   fi
 }
 
+# _repo_identity
+# $1 - path to a checkout root
+# Prints the checkout's git origin normalized to host/owner/repo, or
+# nothing when there is no repo or no origin.  Normalization covers the
+# scp (git@host:o/r), ssh://, and https:// forms, with or without .git.
+_repo_identity() {
+  local url
+  url="$(git -C "$1" remote get-url origin 2>/dev/null || true)"
+  [[ -n "$url" ]] || return 0
+  url="${url%/}"
+  url="${url%.git}"
+  url="${url#ssh://}"
+  url="${url#git://}"
+  url="${url#https://}"
+  url="${url#http://}"
+  url="${url#*@}"
+  url="${url/://}"
+  printf '%s\n' "$url"
+}
+
 # remove_stale_link
 # $1 - home dotfile that may be a symlink from the zsh era
 # $2 - repo-relative suffix the old link pointed at
-# Only removes a link whose target checkout can be proven to be
-# term-public (its root contains scripts/hive.py).  Anything else —
-# foreign dotfiles repos with the same layout, or dangling links to a
-# deleted checkout — is left in place with an actionable warning.
+# Only removes a link whose target checkout has the same normalized git
+# origin as this checkout — repository identity, not a path shape any
+# dotfiles repo could contain.  Anything else — foreign repos, dangling
+# links to a deleted checkout, or no provable origin on either side —
+# is left in place with an actionable warning.
 remove_stale_link() {
-  local link="$1" suffix="$2" target root
+  local link="$1" suffix="$2" target root this_id target_id
   [[ -L "$link" ]] || return 0
   target="$(readlink "$link")"
   case "$target" in
@@ -46,14 +78,16 @@ remove_stale_link() {
     *) return 0 ;;
   esac
   root="${target%/"$suffix"}"
-  if [[ -e "$root/scripts/hive.py" ]]; then
+  this_id="$(_repo_identity "$ROOT_DIR")"
+  target_id="$(_repo_identity "$root")"
+  if [[ -n "$this_id" && "$target_id" == "$this_id" ]]; then
     unlink "$link"
     if [[ -e "$link.bak" ]]; then
       mv "$link.bak" "$link"
     fi
   else
     echo "warning: $link -> $target looks like a zsh-era term-public link," >&2
-    echo "  but its checkout could not be verified (no scripts/hive.py at $root)." >&2
+    echo "  but its checkout's git origin could not be verified as this repository." >&2
     echo "  Leaving it in place; remove it manually if it belonged to term-public." >&2
   fi
 }
