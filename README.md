@@ -123,9 +123,10 @@ own colors need help — the appearance-pair theme only remaps the 16 ANSI
 colors, not the 256-color cube or truecolor values most TUIs use. `term-theme`
 records the mode in `~/.cache/term-theme/mode` and nudges each consumer:
 
-- **zsh prompt (p10k)** — `p10k.zsh` carries day/night palettes; new shells
-  detect the appearance at startup, and running shells pick up a flip at
-  their next prompt via the mode file.
+- **bash prompt (Starship)** — needs no nudge: the palette is named ANSI
+  colors only, so Ghostty's restyle recolors the prompt instantly, running
+  shells included. That constraint is what removed the old p10k mode
+  watcher; keep it when changing prompt colors.
 - **hive tmux** — `scripts/hive.py` carries per-hive day palettes; sessions
   are styled for the current mode at creation, and `term-theme` restyles
   live sessions via `hive tmux restyle`. Existing shells keep the
@@ -146,7 +147,8 @@ Flips made outside `term-theme` (System Settings, scheduled Auto) restyle
 Ghostty but skip these hooks. Afterwards, run `term-theme day` or
 `term-theme night` to match — setting the mode it is already in is
 idempotent and runs all the hooks. `term-theme status` only refreshes the
-mode file (enough for the zsh prompt, not for hive/Claude).
+mode file (the non-macOS fallback `hive tmux` reads), not the hive/Claude
+hooks.
 
 ## Hive tmux
 
