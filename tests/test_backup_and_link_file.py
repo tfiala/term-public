@@ -174,8 +174,11 @@ def _extract_copy_function() -> str:
 _COPY_FUNCTION_DEF = _extract_copy_function()
 
 
-def run_backup_and_copy(source: str, dest: str) -> subprocess.CompletedProcess:
+def run_backup_and_copy(source: str, dest: str,
+                        umask: int | None = None) -> subprocess.CompletedProcess:
     script = _COPY_FUNCTION_DEF + '\nbackup_and_copy_file "$1" "$2"'
+    if umask is not None:
+        script = f'umask {umask:03o}\n' + script
     return subprocess.run(
         ["bash", "--norc", "-c", script, "bash", source, dest],
         capture_output=True,
@@ -203,9 +206,26 @@ def test_copy_creates_regular_file_for_new_destination(tmp_path):
     assert src.read_text() == "content"
 
 
+def test_copy_fresh_file_executable_under_restrictive_umask(tmp_path):
+    """A caller umask that masks bare +x must not prevent user execute.
+
+    The destination parent already exists so this isolates file-mode
+    normalization from mkdir's separate umask behavior.
+    """
+    src = tmp_path / "source.txt"
+    src.write_text("content")
+    dest = tmp_path / "tool"
+
+    result = run_backup_and_copy(str(src), str(dest), umask=0o111)
+
+    assert result.returncode == 0
+    _assert_installed_copy(src, dest)
+
+
 def test_copy_identical_noop_normalizes_executable_bit(tmp_path):
     """An identical destination is left in place (same inode) but must
-    still come out executable — a bare copy may have lost the bit."""
+    still come out executable under a restrictive umask — a bare copy may
+    have lost the bit."""
     src = tmp_path / "source.txt"
     src.write_text("same")
     dest = tmp_path / "dest.txt"
@@ -213,7 +233,7 @@ def test_copy_identical_noop_normalizes_executable_bit(tmp_path):
     dest.chmod(0o644)
     ino_before = os.stat(dest).st_ino
 
-    result = run_backup_and_copy(str(src), str(dest))
+    result = run_backup_and_copy(str(src), str(dest), umask=0o111)
 
     assert result.returncode == 0
     assert os.stat(dest).st_ino == ino_before

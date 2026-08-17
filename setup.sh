@@ -75,7 +75,7 @@ backup_and_copy_file() {
     elif [[ ! -d "$2" ]] && cmp -s "$1" "$2"; then
       # Same content already installed — still normalize the executable
       # bit, which a bare copy may have lost.
-      chmod +x "$2"
+      chmod u+x "$2"
       return 0
     else
       rm -rf "$2.bak"
@@ -83,7 +83,7 @@ backup_and_copy_file() {
     fi
   fi
   cp "$1" "$2"
-  chmod +x "$2"
+  chmod u+x "$2"
 }
 
 # _repo_identity
