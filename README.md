@@ -49,8 +49,8 @@ sessions run it even before (or without) the `chsh`.
 
 vi editing mode with `jk` to escape is set in `bash/bashrc` (bash only);
 `bash/inputrc` keeps only mild readline defaults so other readline programs
-are unaffected. Fish-style autosuggestions (ble.sh) were considered and left
-out for now; Starship + bash-completion covers the daily flow.
+are unaffected. Ghost-text autosuggestions (ble.sh) were considered and left
+out for now; the recall bindings below cover that role.
 
 History matches the zsh-era behavior (which came from oh-my-zsh's
 `lib/history.zsh`): entries are timestamped, duplicates and space-prefixed
@@ -61,6 +61,15 @@ file is reloaded at each prompt, so tmux panes share one live history and
 a killed pane loses nothing. `scripts/import-zsh-history.py` does a
 one-shot import of an existing `~/.zsh_history` into bash's timestamped
 format (`setup.sh` reminds you while one is present).
+
+Recall — the role zsh-autosuggestions played in the zsh era — comes from
+two bindings in `bash/bashrc`. Up/Down prefix-search the history: with
+`claude ` typed, Up cycles through only the history lines that start with
+`claude `. And [fzf](https://github.com/junegunn/fzf)'s keybindings add
+Ctrl-R (fuzzy full-history search — match any fragments in any order),
+Ctrl-T (fuzzy-insert a file path), and Alt-C (fuzzy cd). Alt-C works
+because `ghostty/config` sets `macos-option-as-alt`; fzf itself is
+installed by `setup/bootstrap-macos.sh`.
 
 Preview the shell without installing anything:
 

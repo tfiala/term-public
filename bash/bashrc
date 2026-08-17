@@ -122,6 +122,38 @@ unset _tp_bc
 set -o vi
 bind '"jk": vi-movement-mode'
 
+# --- History recall (prefix search + fzf) -------------------------------------
+# The zsh-era suggest-as-you-type recall (zsh-autosuggestions) has no
+# readline equivalent; its role is covered two ways:
+#   - Up/Down prefix search: with `claude ` typed, Up cycles through only
+#     the history lines that start with `claude `.  Bound for both CSI
+#     (\e[A) and SS3 (\eOA) encodings, since terminals switch to SS3 in
+#     application cursor mode, and in both vi keymaps so recall also
+#     works from command mode.
+#   - fzf keybindings: Ctrl-R fuzzy history search, Ctrl-T fuzzy file
+#     insert, Alt-C fuzzy cd.  Alt-C reaches the shell because
+#     ghostty/config sets macos-option-as-alt.  fzf binds the emacs and
+#     both vi keymaps itself, so its position relative to `set -o vi`
+#     above is not load-bearing.
+for _tp_map in vi-insert vi-command; do
+  bind -m "$_tp_map" '"\e[A": history-search-backward'
+  bind -m "$_tp_map" '"\e[B": history-search-forward'
+  bind -m "$_tp_map" '"\eOA": history-search-backward'
+  bind -m "$_tp_map" '"\eOB": history-search-forward'
+done
+unset _tp_map
+
+for _tp_fzf in \
+    /opt/homebrew/opt/fzf/shell/key-bindings.bash \
+    /usr/local/opt/fzf/shell/key-bindings.bash \
+    /usr/share/doc/fzf/examples/key-bindings.bash; do
+  if [[ -r "$_tp_fzf" ]]; then
+    source "$_tp_fzf"
+    break
+  fi
+done
+unset _tp_fzf
+
 # --- nvim ---------------------------------------------------------------------
 if [[ -x "$HOME/apps/nvim.appimage" ]]; then
   alias nvim="$HOME/apps/nvim.appimage"
