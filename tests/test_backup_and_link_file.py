@@ -1,4 +1,4 @@
-"""Tests for the backup_and_link_file function in setup.sh."""
+"""Tests for the backup_and_link_file function and link layout in setup.sh."""
 
 import os
 import re
@@ -25,7 +25,7 @@ _FUNCTION_DEF = _extract_function()
 def run_backup_and_link(source: str, dest: str) -> subprocess.CompletedProcess:
     script = _FUNCTION_DEF + '\nbackup_and_link_file "$1" "$2"'
     return subprocess.run(
-        ["zsh", "-f", "-c", script, "zsh", source, dest],
+        ["bash", "--norc", "-c", script, "bash", source, dest],
         capture_output=True,
         text=True,
     )
@@ -89,6 +89,56 @@ def test_replaces_identical_file_with_symlink(tmp_path):
     assert not (tmp_path / "dest.txt.bak").exists()
 
 
+def test_preserves_live_foreign_symlink_as_bak(tmp_path):
+    """A destination symlink into another dotfiles repo is preserved:
+    the link itself becomes the .bak, still pointing at the foreign file."""
+    src = tmp_path / "source.txt"
+    src.write_text("ours")
+    foreign = tmp_path / "unrelated-dotfiles" / "bashrc"
+    foreign.parent.mkdir()
+    foreign.write_text("export THEIRS=1\n")
+    dest = tmp_path / "dest.txt"
+    dest.symlink_to(foreign)
+
+    result = run_backup_and_link(str(src), str(dest))
+
+    assert result.returncode == 0
+    assert dest.is_symlink()
+    assert os.readlink(str(dest)) == str(src)
+    bak = tmp_path / "dest.txt.bak"
+    assert bak.is_symlink()
+    assert bak.read_text() == "export THEIRS=1\n"
+
+
+def test_leaves_already_correct_symlink(tmp_path):
+    """An idempotent re-run neither relinks nor creates a backup."""
+    src = tmp_path / "source.txt"
+    src.write_text("ours")
+    dest = tmp_path / "dest.txt"
+    dest.symlink_to(src)
+
+    result = run_backup_and_link(str(src), str(dest))
+
+    assert result.returncode == 0
+    assert os.readlink(str(dest)) == str(src)
+    assert not os.path.lexists(tmp_path / "dest.txt.bak")
+
+
+def test_replaces_dangling_symlink(tmp_path):
+    """A dangling destination symlink must be replaced, not break ln -s."""
+    src = tmp_path / "source.txt"
+    src.write_text("new")
+    dest = tmp_path / "dest.txt"
+    dest.symlink_to(tmp_path / "deleted-target.txt")
+
+    result = run_backup_and_link(str(src), str(dest))
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert dest.is_symlink()
+    assert os.readlink(str(dest)) == str(src)
+
+
 def test_backs_up_directory(tmp_path):
     src = tmp_path / "source_dir"
     src.mkdir()
@@ -103,109 +153,43 @@ def test_backs_up_directory(tmp_path):
     assert (backup / "precious.txt").read_text() == "keep me"
 
 
-def test_setup_creates_local_overlay_skeleton(tmp_path):
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    home = tmp_path / "home"
-    home.mkdir()
-
-    (repo_root / "setup.sh").write_text(Path(SETUP_SH).read_text())
-    (repo_root / "ghostty").mkdir()
-    (repo_root / "zsh").mkdir()
-    (repo_root / "scripts").mkdir()
-    (repo_root / "tmux").mkdir()
-    (repo_root / "ghostty" / "config").write_text("ghostty = true\n")
-    (repo_root / "zsh" / "zshenv").write_text("# zshenv\n")
-    (repo_root / "zsh" / "zshrc").write_text("export TEST_ZSHRC=1\n")
-    (repo_root / "tmux" / "tmux.conf").write_text("# tmux\n")
-    (repo_root / "p10k.zsh").write_text("# p10k\n")
-    (repo_root / "scripts" / "hive.py").write_text("#!/usr/bin/env python3\n")
-    (repo_root / "scripts" / "hive-ci-popup.py").write_text("#!/usr/bin/env python3\n")
-
-    result = subprocess.run(
-        ["zsh", "setup.sh"],
-        cwd=repo_root,
-        env={**os.environ, "HOME": str(home)},
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode == 0
-    assert (repo_root / "local" / "bin").is_dir()
-    assert (repo_root / "local" / "env.local").exists()
-    assert (repo_root / "local" / "zshrc.local").exists()
-    assert (home / ".zshenv").is_symlink()
-    assert (home / ".zshrc").is_symlink()
-    assert (home / "bin" / "hive").is_symlink()
+# --- Full setup.sh runs -------------------------------------------------------
 
 
-def test_setup_preserves_existing_zshenv(tmp_path):
-    """A pre-existing .zshenv is backed up and sourced by the new one."""
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    home = tmp_path / "home"
-    home.mkdir()
-
-    # Pre-existing user .zshenv with critical exports
-    (home / ".zshenv").write_text('export MY_CRITICAL_VAR=hello\n')
-
-    (repo_root / "setup.sh").write_text(Path(SETUP_SH).read_text())
-    (repo_root / "ghostty").mkdir()
-    (repo_root / "zsh").mkdir()
-    (repo_root / "scripts").mkdir()
-    (repo_root / "tmux").mkdir()
-    (repo_root / "ghostty" / "config").write_text("ghostty = true\n")
-    zshenv_src = Path(__file__).resolve().parents[1] / "zsh" / "zshenv"
-    (repo_root / "zsh" / "zshenv").write_text(zshenv_src.read_text())
-    (repo_root / "zsh" / "zshrc").write_text("# zshrc\n")
-    (repo_root / "tmux" / "tmux.conf").write_text("# tmux\n")
-    (repo_root / "p10k.zsh").write_text("# p10k\n")
-    (repo_root / "scripts" / "hive.py").write_text("#!/usr/bin/env python3\n")
-    (repo_root / "scripts" / "hive-ci-popup.py").write_text("#!/usr/bin/env python3\n")
-
-    result = subprocess.run(
-        ["zsh", "setup.sh"],
-        cwd=repo_root,
-        env={**os.environ, "HOME": str(home)},
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0
-
-    # The original is backed up
-    assert (home / ".zshenv.bak").exists()
-    assert (home / ".zshenv.bak").read_text() == 'export MY_CRITICAL_VAR=hello\n'
-
-    # The new .zshenv sources the backup, so the user's var is still set
-    r = subprocess.run(
-        ["zsh", "-f", "-c",
-         f'HOME="{home}" source "{home}/.zshenv"; echo "$MY_CRITICAL_VAR"'],
-        capture_output=True,
-        text=True,
-    )
-    assert r.stdout.strip() == "hello"
+_SCAFFOLD_ORIGIN = "git@github.com:example/term-public.git"
 
 
-# --- Ghostty terminfo tic installation tests ---------------------------------
+def _git_init_with_origin(path, url):
+    """Make path a git repo whose origin is url (no commits needed)."""
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "remote", "add", "origin", url], check=True)
 
 
 def _scaffold_repo(tmp_path):
-    """Create a minimal fake repo and home for setup.sh tests."""
+    """Create a minimal fake repo and home for setup.sh tests.
+
+    The scaffold is a git repo with an origin remote because setup.sh
+    proves zsh-era link provenance by comparing normalized origins.
+    """
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     home = tmp_path / "home"
     home.mkdir()
+    _git_init_with_origin(repo_root, _SCAFFOLD_ORIGIN)
 
     (repo_root / "setup.sh").write_text(Path(SETUP_SH).read_text())
     (repo_root / "ghostty").mkdir()
-    (repo_root / "zsh").mkdir()
+    (repo_root / "bash").mkdir()
+    (repo_root / "starship").mkdir()
     (repo_root / "scripts").mkdir()
     (repo_root / "tmux").mkdir()
     (repo_root / "ghostty" / "config").write_text("ghostty = true\n")
-    (repo_root / "zsh" / "zshenv").write_text("# zshenv\n")
-    (repo_root / "zsh" / "zshrc").write_text("# zshrc\n")
+    (repo_root / "bash" / "bash_profile").write_text("# bash_profile\n")
+    (repo_root / "bash" / "bashrc").write_text("export TEST_BASHRC=1\n")
+    (repo_root / "bash" / "inputrc").write_text("# inputrc\n")
+    (repo_root / "starship" / "starship.toml").write_text("# starship\n")
     (repo_root / "tmux" / "tmux.conf").write_text("# tmux\n")
-    (repo_root / "p10k.zsh").write_text("# p10k\n")
     (repo_root / "scripts" / "hive.py").write_text("#!/usr/bin/env python3\n")
     (repo_root / "scripts" / "hive-ci-popup.py").write_text("#!/usr/bin/env python3\n")
 
@@ -216,18 +200,300 @@ def _run_setup(repo_root, home, extra_env=None):
     """Run setup.sh in a fake repo with the given HOME.
 
     Inherits the real environment (including TERMINFO if set by Ghostty)
-    so tests exercise the same code path a user would hit.
+    so tests exercise the same code path a user would hit.  HOME and
+    XDG_CONFIG_HOME are overridden so nothing touches the real home.
     """
-    env = {**os.environ, "HOME": str(home)}
+    env = {**os.environ, "HOME": str(home),
+           "XDG_CONFIG_HOME": str(home / ".config")}
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
-        ["zsh", "setup.sh"],
+        ["bash", "setup.sh"],
         cwd=repo_root,
         env=env,
         capture_output=True,
         text=True,
     )
+
+
+def test_setup_creates_local_overlay_skeleton(tmp_path):
+    repo_root, home = _scaffold_repo(tmp_path)
+
+    result = _run_setup(repo_root, home)
+
+    assert result.returncode == 0
+    assert (repo_root / "local" / "bin").is_dir()
+    assert (repo_root / "local" / "env.local").exists()
+    assert (repo_root / "local" / "bashrc.local").exists()
+    assert (home / ".bash_profile").is_symlink()
+    assert (home / ".bashrc").is_symlink()
+    assert (home / ".inputrc").is_symlink()
+    assert (home / ".config" / "starship.toml").is_symlink()
+    assert (home / "bin" / "hive").is_symlink()
+
+
+def test_setup_backs_up_existing_bashrc(tmp_path):
+    """A pre-existing .bashrc is preserved as .bashrc.bak."""
+    repo_root, home = _scaffold_repo(tmp_path)
+    (home / ".bashrc").write_text("export MY_CRITICAL_VAR=hello\n")
+
+    result = _run_setup(repo_root, home)
+
+    assert result.returncode == 0
+    assert (home / ".bashrc").is_symlink()
+    assert (home / ".bashrc.bak").read_text() == "export MY_CRITICAL_VAR=hello\n"
+
+
+def test_setup_repairs_dangling_bashrc_link(tmp_path):
+    """A dangling ~/.bashrc symlink is replaced, not left broken."""
+    repo_root, home = _scaffold_repo(tmp_path)
+    (home / ".bashrc").symlink_to(tmp_path / "gone" / "bashrc")
+
+    result = _run_setup(repo_root, home)
+
+    assert result.returncode == 0
+    assert (home / ".bashrc").is_symlink()
+    assert os.readlink(home / ".bashrc") == str(repo_root / "bash" / "bashrc")
+
+
+def test_setup_fails_fast_on_link_error(tmp_path):
+    """setup.sh must exit nonzero when a step fails, not report success."""
+    repo_root, home = _scaffold_repo(tmp_path)
+    # mkdir -p "$HOME/bin" collides with a regular file.
+    (home / "bin").write_text("not a directory\n")
+
+    result = _run_setup(repo_root, home)
+
+    assert result.returncode != 0
+    assert "Linked config into place." not in result.stdout
+
+
+def _use_real_bash_config(repo_root):
+    """Copy the real bash config into the scaffold for behavior tests."""
+    real = Path(SETUP_SH).resolve().parent
+    (repo_root / "bash" / "bashrc").write_text((real / "bash" / "bashrc").read_text())
+    (repo_root / "bash" / "bash_profile").write_text(
+        (real / "bash" / "bash_profile").read_text())
+
+
+class TestPriorConfigStaysEffective:
+    """Backed-up bash config must keep working, not just exist as bytes."""
+
+    def test_prior_bashrc_export_survives(self, tmp_path):
+        repo_root, home = _scaffold_repo(tmp_path)
+        _use_real_bash_config(repo_root)
+        (home / ".bashrc").write_text("export MY_CRITICAL_VAR=hello\n")
+
+        assert _run_setup(repo_root, home).returncode == 0
+
+        r = subprocess.run(
+            ["bash", "--norc", "-c",
+             'source "$HOME/.bashrc"; echo "VAR=$MY_CRITICAL_VAR"'],
+            capture_output=True, text=True,
+            env={**os.environ, "HOME": str(home)},
+        )
+        assert r.returncode == 0
+        assert "VAR=hello" in r.stdout
+
+    def test_prior_bash_profile_export_survives(self, tmp_path):
+        repo_root, home = _scaffold_repo(tmp_path)
+        _use_real_bash_config(repo_root)
+        (home / ".bash_profile").write_text("export MY_LOGIN_VAR=world\n")
+
+        assert _run_setup(repo_root, home).returncode == 0
+
+        r = subprocess.run(
+            ["bash", "--norc", "-c",
+             'source "$HOME/.bash_profile"; echo "VAR=$MY_LOGIN_VAR"'],
+            capture_output=True, text=True,
+            env={**os.environ, "HOME": str(home)},
+        )
+        assert r.returncode == 0
+        assert "VAR=world" in r.stdout
+
+    def test_prior_symlinked_configs_survive(self, tmp_path):
+        """Prior .bashrc/.bash_profile that are live symlinks into another
+        dotfiles repo (the #19 review probe) stay effective via the .bak
+        links after setup."""
+        repo_root, home = _scaffold_repo(tmp_path)
+        _use_real_bash_config(repo_root)
+        foreign = tmp_path / "unrelated-dotfiles"
+        foreign.mkdir()
+        (foreign / "bashrc").write_text("export MY_CRITICAL_VAR=hello\n")
+        (foreign / "bash_profile").write_text("export MY_LOGIN_VAR=world\n")
+        (home / ".bashrc").symlink_to(foreign / "bashrc")
+        (home / ".bash_profile").symlink_to(foreign / "bash_profile")
+
+        assert _run_setup(repo_root, home).returncode == 0
+
+        assert (home / ".bashrc.bak").is_symlink()
+        assert (home / ".bash_profile.bak").is_symlink()
+        r = subprocess.run(
+            ["bash", "--norc", "-c",
+             'source "$HOME/.bash_profile"; '
+             'echo "RC=$MY_CRITICAL_VAR LOGIN=$MY_LOGIN_VAR"'],
+            capture_output=True, text=True,
+            env={**os.environ, "HOME": str(home)},
+        )
+        assert r.returncode == 0
+        assert "RC=hello LOGIN=world" in r.stdout
+
+    def test_migration_notice_for_zsh_config(self, tmp_path):
+        """Leftover zsh config gets explicit migration guidance."""
+        repo_root, home = _scaffold_repo(tmp_path)
+        (home / ".zshrc").write_text("export FROM_ZSH=1\n")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0
+        assert "zsh-era config remains" in result.stdout
+        assert "env.local" in result.stdout
+
+
+def _make_old_term_public_checkout(path):
+    """Create a fake zsh-era checkout of the SAME repository.
+
+    Its origin uses the https form while the scaffold uses the scp form,
+    so the test also proves origin normalization.  Deliberately contains
+    no scripts/hive.py: identity must come from git, not path contents.
+    """
+    (path / "zsh").mkdir(parents=True)
+    (path / "zsh" / "zshrc").write_text("# old term-public zshrc\n")
+    (path / "zsh" / "zshenv").write_text("# old term-public zshenv\n")
+    (path / "p10k.zsh").write_text("# old term-public p10k\n")
+    _git_init_with_origin(path, "https://github.com/example/term-public.git")
+
+
+class TestStaleZshLinkCleanup:
+    """setup.sh removes zsh-era links only with proven term-public provenance."""
+
+    def test_removes_links_to_verified_checkout(self, tmp_path):
+        repo_root, home = _scaffold_repo(tmp_path)
+        old_checkout = tmp_path / "old-checkout"
+        _make_old_term_public_checkout(old_checkout)
+        (home / ".zshrc").symlink_to(old_checkout / "zsh" / "zshrc")
+        (home / ".zshenv").symlink_to(old_checkout / "zsh" / "zshenv")
+        (home / ".p10k.zsh").symlink_to(old_checkout / "p10k.zsh")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0
+        assert not os.path.lexists(home / ".zshrc")
+        assert not os.path.lexists(home / ".zshenv")
+        assert not os.path.lexists(home / ".p10k.zsh")
+
+    def test_restores_pre_term_public_backup(self, tmp_path):
+        """The .bak made when the zsh link was first created comes back."""
+        repo_root, home = _scaffold_repo(tmp_path)
+        old_checkout = tmp_path / "old-checkout"
+        _make_old_term_public_checkout(old_checkout)
+        (home / ".zshrc").symlink_to(old_checkout / "zsh" / "zshrc")
+        (home / ".zshrc.bak").write_text("# my original zshrc\n")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0
+        assert not (home / ".zshrc").is_symlink()
+        assert (home / ".zshrc").read_text() == "# my original zshrc\n"
+
+    def test_keeps_foreign_link_with_warning(self, tmp_path):
+        """A live link into a non-term-public dotfiles repo is never removed."""
+        repo_root, home = _scaffold_repo(tmp_path)
+        foreign = tmp_path / "unrelated-dotfiles"
+        (foreign / "zsh").mkdir(parents=True)
+        (foreign / "zsh" / "zshrc").write_text("# someone else's zshrc\n")
+        (home / ".zshrc").symlink_to(foreign / "zsh" / "zshrc")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0
+        assert (home / ".zshrc").is_symlink()
+        assert (home / ".zshrc").read_text() == "# someone else's zshrc\n"
+        assert "could not be verified" in result.stderr
+
+    def test_removes_relative_link_to_verified_checkout(self, tmp_path):
+        """A relative symlink target into a same-origin checkout is
+        resolved from the link's directory and removed."""
+        repo_root, home = _scaffold_repo(tmp_path)
+        old_checkout = tmp_path / "old-checkout"
+        _make_old_term_public_checkout(old_checkout)
+        # Relative to $HOME: tmp_path/home/../old-checkout/zsh/zshrc
+        (home / ".zshrc").symlink_to("../old-checkout/zsh/zshrc")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0
+        assert not os.path.lexists(home / ".zshrc")
+
+    def test_relative_target_resolved_from_link_dir_not_cwd(self, tmp_path):
+        """The #19 review probe: a relative link whose cwd-relative
+        resolution hits a same-origin decoy while its real target (from
+        the link's directory) is a live foreign repo.  Identity must
+        describe the actual target, so the link survives."""
+        repo_root, _ = _scaffold_repo(tmp_path)
+        nested = tmp_path / "nested"
+        home = nested / "home"
+        home.mkdir(parents=True)
+        # Actual target, resolved from $HOME: a live foreign dotfiles repo.
+        foreign = nested / "foreign"
+        (foreign / "zsh").mkdir(parents=True)
+        (foreign / "zsh" / "zshrc").write_text("# someone else's zshrc\n")
+        _git_init_with_origin(foreign, "git@github.com:someone/dotfiles.git")
+        # Decoy at the path a cwd-relative resolution would hit
+        # (setup runs with cwd=tmp_path/repo): a same-origin checkout.
+        _make_old_term_public_checkout(tmp_path / "foreign")
+        (home / ".zshrc").symlink_to("../foreign/zsh/zshrc")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0
+        assert (home / ".zshrc").is_symlink()
+        assert (home / ".zshrc").read_text() == "# someone else's zshrc\n"
+        assert "could not be verified" in result.stderr
+
+    def test_forged_marker_does_not_grant_provenance(self, tmp_path):
+        """A foreign repo containing scripts/hive.py (the #19 review probe)
+        is still foreign: identity is the git origin, not path contents."""
+        repo_root, home = _scaffold_repo(tmp_path)
+        foreign = tmp_path / "unrelated-dotfiles"
+        (foreign / "zsh").mkdir(parents=True)
+        (foreign / "scripts").mkdir()
+        (foreign / "zsh" / "zshrc").write_text("# someone else's zshrc\n")
+        (foreign / "scripts" / "hive.py").write_text("# forged marker\n")
+        _git_init_with_origin(foreign, "git@github.com:someone/dotfiles.git")
+        (home / ".zshrc").symlink_to(foreign / "zsh" / "zshrc")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0
+        assert (home / ".zshrc").is_symlink()
+        assert (home / ".zshrc").read_text() == "# someone else's zshrc\n"
+        assert "could not be verified" in result.stderr
+
+    def test_keeps_dangling_link_with_warning(self, tmp_path):
+        """A dangling link (deleted checkout) has no provable provenance."""
+        repo_root, home = _scaffold_repo(tmp_path)
+        (home / ".zshrc").symlink_to(tmp_path / "deleted-checkout" / "zsh" / "zshrc")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0
+        assert os.path.lexists(home / ".zshrc")
+        assert "could not be verified" in result.stderr
+
+    def test_leaves_foreign_zshrc_alone(self, tmp_path):
+        """A user-managed .zshrc (not a term-public link) is untouched."""
+        repo_root, home = _scaffold_repo(tmp_path)
+        (home / ".zshrc").write_text("# hand-written\n")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0
+        assert not (home / ".zshrc").is_symlink()
+        assert (home / ".zshrc").read_text() == "# hand-written\n"
+
+
+# --- Ghostty terminfo tic installation tests ---------------------------------
 
 
 _GHOSTTY_TI = Path("/Applications/Ghostty.app/Contents/Resources/terminfo")
@@ -248,14 +514,6 @@ class TestTerminfoTicInstall:
         assert result.returncode == 0
         assert "Installed xterm-ghostty terminfo" in result.stdout
 
-        # Verify infocmp can resolve it from the user terminfo dir
-        r = subprocess.run(
-            ["infocmp", "xterm-ghostty"],
-            env={**os.environ, "HOME": str(home), "TERMINFO": ""},
-            capture_output=True,
-            text=True,
-        )
-        # The entry should exist under home's .terminfo
         ti_dir = home / ".terminfo"
         assert ti_dir.is_dir()
         # Find the compiled entry (stored under first-char subdir or hex subdir)

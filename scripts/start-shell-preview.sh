@@ -7,8 +7,9 @@ Usage:
   scripts/start-shell-preview.sh
   scripts/start-shell-preview.sh --ghostty
 
-Starts a fresh shell using this repo's zsh/p10k config without needing to
-install it first. With `--ghostty`, launches a new Ghostty window on macOS.
+Starts a fresh shell using this repo's bash/starship config without
+needing to install it first. With `--ghostty`, launches a new Ghostty
+window on macOS.
 EOF
 }
 
@@ -42,18 +43,26 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Prefer Homebrew bash 5.x; /bin/bash 3.2 is a last resort for preview only.
+pick_bash() {
+  local b
+  for b in /opt/homebrew/bin/bash /usr/local/bin/bash /bin/bash; do
+    if [[ -x "$b" ]]; then
+      echo "$b"
+      return
+    fi
+  done
+}
+
 launch_shell() {
-  local wrapper_dir
-  wrapper_dir="$(mktemp -d /tmp/term-public-zdotdir.XXXXXX)"
+  local bash_bin rcfile
+  bash_bin="$(pick_bash)"
+  rcfile="$(mktemp /tmp/term-public-bashrc.XXXXXX)"
 
-  cat > "${wrapper_dir}/.zshenv" <<EOF
-export TERM_PUBLIC_P10K="${REPO_ROOT}/p10k.zsh"
+  cat > "$rcfile" <<EOF
 export TERM_PUBLIC_ROOT="${REPO_ROOT}"
-export ZDOTDIR="${wrapper_dir}"
-EOF
-
-  cat > "${wrapper_dir}/.zshrc" <<EOF
-source "${REPO_ROOT}/zsh/zshrc"
+export STARSHIP_CONFIG="${REPO_ROOT}/starship/starship.toml"
+source "${REPO_ROOT}/bash/bashrc"
 EOF
 
   cd "$TARGET_CWD"
@@ -62,15 +71,12 @@ EOF
     HOME="$HOME" \
     USER="${USER:-$(id -un)}" \
     LOGNAME="${LOGNAME:-${USER:-$(id -un)}}" \
-    SHELL="${SHELL:-/bin/zsh}" \
+    SHELL="$bash_bin" \
     TERM="${TERM:-xterm-256color}" \
     LANG="${LANG:-en_US.UTF-8}" \
     LC_ALL="${LC_ALL:-en_US.UTF-8}" \
     PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/bin" \
-    ZDOTDIR="${wrapper_dir}" \
-    TERM_PUBLIC_P10K="${REPO_ROOT}/p10k.zsh" \
-    TERM_PUBLIC_ROOT="${REPO_ROOT}" \
-    /bin/zsh -l
+    "$bash_bin" --rcfile "$rcfile" -i
 }
 
 if [[ "$MODE" == "shell-only" ]]; then
@@ -86,10 +92,9 @@ on run argv
 
     set cfg to new surface configuration
     set initial working directory of cfg to target_cwd
-    set command of cfg to "/bin/zsh"
+    set command of cfg to "/bin/bash"
     set environment variables of cfg to {¬
-      "TERM_PUBLIC_ROOT=" & repo_root, ¬
-      "TERM_PUBLIC_P10K=" & repo_root & "/p10k.zsh"}
+      "TERM_PUBLIC_ROOT=" & repo_root}
     set initial input of cfg to "exec " & quoted form of (repo_root & "/scripts/start-shell-preview.sh") & " --shell-only --cwd " & quoted form of target_cwd & "\n"
 
     new window with configuration cfg

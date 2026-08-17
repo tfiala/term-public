@@ -1,0 +1,157 @@
+# term-public bash baseline.
+#
+# Sourced by interactive shells (and by bash/bash_profile for login
+# shells).  Environment setup at the top runs for every source; the
+# interactive-only chrome lives below the interactivity gate.
+
+# Stack-scoped re-entry guard: while this file is actively executing, a
+# nested `source ~/.bashrc` (e.g. from the .bashrc.bak sourced below, or
+# from a prior .bash_profile) is a no-op instead of a duplicate full
+# initialization.  The guard is unset on EVERY exit path — keep it that
+# way if you add an early return — so a later intentional
+# `source ~/.bashrc` reloads everything, including the backups.
+if [[ -n "${_TERM_PUBLIC_BASHRC_ACTIVE:-}" ]]; then
+  return 0
+fi
+_TERM_PUBLIC_BASHRC_ACTIVE=1
+
+# --- TERM/TERMINFO fixup ------------------------------------------------------
+# The primary terminfo fix is in setup.sh, which installs xterm-ghostty
+# into ~/.terminfo.  This fallback handles the case where setup.sh was
+# not run (e.g. SSH from Ghostty to a host that only has term-public
+# checked out, not bootstrapped).
+if command -v infocmp >/dev/null 2>&1 && ! infocmp "$TERM" >/dev/null 2>&1; then
+  if [[ "$TERM" == *ghostty* \
+      && -d /Applications/Ghostty.app/Contents/Resources/terminfo ]]; then
+    export TERMINFO=/Applications/Ghostty.app/Contents/Resources/terminfo
+  else
+    export TERM=xterm-256color
+  fi
+fi
+
+# --- Repo root ----------------------------------------------------------------
+# ~/.bashrc is a symlink into the repo; walk it to find the checkout.
+if [[ -z "${TERM_PUBLIC_ROOT:-}" ]]; then
+  _tp_src="${BASH_SOURCE[0]}"
+  while [[ -L "$_tp_src" ]]; do
+    _tp_target="$(readlink "$_tp_src")"
+    case "$_tp_target" in
+      /*) _tp_src="$_tp_target" ;;
+      *) _tp_src="$(dirname "$_tp_src")/$_tp_target" ;;
+    esac
+  done
+  export TERM_PUBLIC_ROOT="$(cd "$(dirname "$_tp_src")/.." && pwd)"
+  unset _tp_src _tp_target
+fi
+
+export TERM_PUBLIC_LOCAL_DIR="${TERM_PUBLIC_ROOT}/local"
+
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:=$HOME/.config}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:=$HOME/.local/share}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:=$HOME/.cache}"
+
+export PATH="$HOME/bin:$PATH"
+if [[ -d "${TERM_PUBLIC_LOCAL_DIR}/bin" ]]; then
+  export PATH="${TERM_PUBLIC_LOCAL_DIR}/bin:$PATH"
+fi
+
+if [[ -f "${TERM_PUBLIC_LOCAL_DIR}/env.local" ]]; then
+  source "${TERM_PUBLIC_LOCAL_DIR}/env.local"
+fi
+
+# Source the user's prior .bashrc if setup.sh backed it up (mirrors the
+# old zshenv.bak pattern), so pre-existing config stays effective, not
+# just archived.  Runs before the prompt setup below so term-public
+# chrome wins where the two conflict.  If the backup re-sources
+# ~/.bashrc, the active guard at the top of this file absorbs it.
+if [[ -f "$HOME/.bashrc.bak" ]]; then
+  source "$HOME/.bashrc.bak"
+fi
+
+# Everything below is interactive-only chrome.
+case $- in
+  *i*) ;;
+  *)
+    unset _TERM_PUBLIC_BASHRC_ACTIVE
+    return
+    ;;
+esac
+
+# --- History ------------------------------------------------------------------
+shopt -s histappend checkwinsize
+HISTSIZE=100000
+HISTFILESIZE=200000
+HISTCONTROL=ignoreboth
+
+# --- Completion (Homebrew bash-completion@2) ----------------------------------
+for _tp_bc in \
+    /opt/homebrew/etc/profile.d/bash_completion.sh \
+    /usr/local/etc/profile.d/bash_completion.sh \
+    /etc/profile.d/bash_completion.sh; do
+  if [[ -r "$_tp_bc" ]]; then
+    source "$_tp_bc"
+    break
+  fi
+done
+unset _tp_bc
+
+# --- vi mode ------------------------------------------------------------------
+# Kept here (bash-only) rather than in bash/inputrc so other readline
+# programs keep their own editing mode.
+set -o vi
+bind '"jk": vi-movement-mode'
+
+# --- nvim ---------------------------------------------------------------------
+if [[ -x "$HOME/apps/nvim.appimage" ]]; then
+  alias nvim="$HOME/apps/nvim.appimage"
+fi
+
+if command -v nvim >/dev/null 2>&1; then
+  alias v='nvim'
+
+  _term_public_nvim_flavor_alias() {
+    local name="$1" appname="$2"
+    if [[ -d "${XDG_CONFIG_HOME:-$HOME/.config}/${appname}" ]]; then
+      alias "${name}=NVIM_APPNAME=${appname} nvim"
+    fi
+  }
+  _term_public_nvim_flavor_alias va  nvim-astro5
+  _term_public_nvim_flavor_alias var nvim-astro
+  _term_public_nvim_flavor_alias vl  nvim-lazyvim
+  _term_public_nvim_flavor_alias vn  nvim-nvchad
+  unset -f _term_public_nvim_flavor_alias
+
+  vv() {
+    local configs=() d name
+    for d in "${XDG_CONFIG_HOME:-$HOME/.config}"/nvim-*/; do
+      [[ -d "$d" ]] || continue
+      name="$(basename "$d")"
+      configs+=("${name#nvim-}")
+    done
+    if (( ${#configs[@]} == 0 )); then
+      echo "vv: no nvim-* configs found under ${XDG_CONFIG_HOME:-$HOME/.config}" >&2
+      return 1
+    fi
+    local config
+    select config in "${configs[@]}"; do
+      [[ -n "$config" ]] && NVIM_APPNAME="nvim-${config}" nvim "$@"
+      break
+    done
+  }
+fi
+
+# --- Prompt (Starship) --------------------------------------------------------
+if command -v starship >/dev/null 2>&1; then
+  eval "$(starship init bash)"
+else
+  printf 'term-public: missing starship; run %s\n' \
+    "$TERM_PUBLIC_ROOT/setup/bootstrap-macos.sh" >&2
+  PS1='\w \$ '
+fi
+
+# --- Per-machine overlay ------------------------------------------------------
+if [[ -f "${TERM_PUBLIC_LOCAL_DIR}/bashrc.local" ]]; then
+  source "${TERM_PUBLIC_LOCAL_DIR}/bashrc.local"
+fi
+
+unset _TERM_PUBLIC_BASHRC_ACTIVE

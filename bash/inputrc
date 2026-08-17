@@ -1,0 +1,10 @@
+# term-public readline defaults.
+#
+# Deliberately mild: this file applies to every readline program
+# (python, psql, ...), so shell-specific behavior like vi mode stays in
+# bash/bashrc via `set -o vi` / `bind`.
+set completion-ignore-case on
+set show-all-if-ambiguous on
+set colored-stats on
+set mark-symlinked-directories on
+set skip-completed-text on

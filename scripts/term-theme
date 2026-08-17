@@ -54,8 +54,10 @@ report() {
   esac
 }
 
-# Record the mode for consumers that cannot query the macOS appearance at
-# the right moment (the p10k palette watcher re-reads this at each prompt).
+# Record the mode for consumers that cannot query the macOS appearance
+# themselves (hive.py's _appearance_mode falls back to this on non-macOS
+# hosts). The prompt no longer reads it: Starship's named-ANSI palette
+# restyles with the terminal.
 persist_mode() {
   local dir=${XDG_CACHE_HOME:-$HOME/.cache}/term-theme
   mkdir -p "$dir" 2>/dev/null && printf '%s\n' "$1" >"$dir/mode" || true
