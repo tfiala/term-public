@@ -91,7 +91,9 @@ class TestPrefixSearch:
         out = _pty_session(
             tmp_path, f"bind -m {keymap} -p | grep history-search-\rexit\r")
         for seq, func in self.ARROW_BINDINGS:
-            assert f'"{seq}": {func}' in out, (
+            # bind -p spells ESC as \e (macOS readline) or \M- (Linux).
+            spellings = (seq, seq.replace(r"\e", r"\M-"))
+            assert any(f'"{s}": {func}' in out for s in spellings), (
                 f"{seq} not bound to {func} in {keymap}:\n{out}")
 
     def test_up_arrow_executes_prefix_match(self, tmp_path):
@@ -154,4 +156,5 @@ class TestFzfKeybindings:
         assert "__fzf_history__" in out   # Ctrl-R
         assert "fzf-file-widget" in out   # Ctrl-T
         assert "__fzf_cd__" in out        # Alt-C target widget
-        assert '"\\ec": ' in out          # Alt-C bound in a vi keymap
+        # Alt-C bound in a vi keymap; ESC spelled \e (macOS) or \M- (Linux).
+        assert '"\\ec": ' in out or '"\\M-c": ' in out
