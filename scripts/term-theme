@@ -117,21 +117,29 @@ EOF
 # the catppuccin pair for the mode; restart codex (matching the README
 # contract) to repaint. A theme the user pinned to anything outside the
 # pair is respected. Best-effort: silently a no-op without a ~/.codex
-# dir, python3, or tomllib (python < 3.11), and never touches a file it
-# cannot parse — the edit is only written after re-parsing proves the
-# value landed at [tui].theme exactly.
+# dir, python3, or tomllib (python < 3.11). The editor handles the valid
+# TOML spellings of the setting (spaced/quoted headers and keys, dotted
+# keys, inline tables); the edit is committed atomically via a staged
+# temp file — preserving mode and writing through a symlink — and only
+# after re-parsing proves the value landed at [tui].theme exactly. When
+# a sync SHOULD happen but cannot (unparseable file, unsupported shape,
+# failed commit), a warning is printed instead of silent success.
 sync_codex_theme() {
-  local mode=$1 dir=$HOME/.codex
+  local mode=$1 dir=$HOME/.codex rc=0
   [[ -d $dir ]] || return 0
   command -v python3 >/dev/null 2>&1 || return 0
-  python3 - "$dir/config.toml" "$mode" <<'EOF' 2>/dev/null || true
+  python3 - "$dir/config.toml" "$mode" <<'EOF' 2>/dev/null || rc=$?
+import os
 import re
 import sys
+import tempfile
 
 try:
     import tomllib
 except ModuleNotFoundError:
     sys.exit(0)
+
+NOT_SYNCED = 3  # the theme should change but we could not make it change
 
 path, mode = sys.argv[1], sys.argv[2]
 PAIR = {'day': 'catppuccin-latte', 'night': 'catppuccin-mocha'}
@@ -139,11 +147,14 @@ DEFAULT = 'catppuccin-mocha'  # codex's built-in default when tui.theme is unset
 try:
     with open(path) as f:
         text = f.read()
-    cfg = tomllib.loads(text)
 except FileNotFoundError:
-    text, cfg = '', {}
-except (OSError, tomllib.TOMLDecodeError):
-    sys.exit(0)
+    text = ''
+except OSError:
+    sys.exit(NOT_SYNCED)
+try:
+    cfg = tomllib.loads(text)
+except tomllib.TOMLDecodeError:
+    sys.exit(NOT_SYNCED)  # never touch what we cannot parse — but say so
 
 current = cfg.get('tui', {}).get('theme', DEFAULT)
 if current not in PAIR.values():
@@ -152,42 +163,122 @@ new = PAIR[mode]
 if current == new:
     sys.exit(0)
 
-# Edit only the [tui] table: replace its theme line, or insert one right
-# after the header. Sub-tables like [tui.x] open new headers, so the
-# table ends at the next line starting a section.
+# --- Locate the setting textually.  TOML allows several spellings of the
+# same [tui].theme; each strategy below covers one.  The reparse check at
+# the end is the authority — these only have to hit the right line.
+TUI = r'(?:tui|"tui"|\'tui\')'
+THEME = r'(?:theme|"theme"|\'theme\')'
+HEADER = re.compile(r'\s*\[\s*' + TUI + r'\s*\]\s*(#.*)?$')
+THEME_KEY = re.compile(r'\s*' + THEME + r'\s*=')
+DOTTED = re.compile(r'\s*' + TUI + r'\s*\.\s*' + THEME + r'\s*=')
+DOTTED_ANY = re.compile(r'\s*' + TUI + r'\s*\.')
+INLINE = re.compile(
+    r'^(?P<pre>\s*' + TUI + r'\s*=\s*\{)(?P<body>.*)(?P<post>\}.*)$')
+# The lookbehind keeps a sibling key like my-theme from false-matching.
+INLINE_THEME_VAL = re.compile(
+    r'(?<![\w"\'-])' + THEME + r'\s*=\s*(?P<val>"[^"]*"|\'[^\']*\')')
+
 lines = text.splitlines(keepends=True)
+theme_line = f'theme = "{new}"\n'
+
+# Any [section] header ends the top-level prologue where dotted keys and
+# inline tables can define tui.
+prologue_end = len(lines)
+for i, line in enumerate(lines):
+    if re.match(r'\s*\[', line):
+        prologue_end = i
+        break
+
 start = end = None
 for i, line in enumerate(lines):
-    if re.match(r'\s*\[tui\]\s*(#.*)?$', line):
+    if HEADER.match(line):
         start = i
     elif start is not None and re.match(r'\s*\[', line):
         end = i
         break
 if start is not None and end is None:
     end = len(lines)
-theme_line = f'theme = "{new}"\n'
-if start is None:
-    if text and not text.endswith('\n'):
-        text += '\n'
-    text += f'\n[tui]\n{theme_line}'
-else:
+
+if start is not None:
+    # A [tui]-style table: replace its theme line or insert one.
     for i in range(start + 1, end):
-        if re.match(r'\s*theme\s*=', lines[i]):
+        if THEME_KEY.match(lines[i]):
             lines[i] = theme_line
             break
     else:
         lines.insert(start + 1, theme_line)
     text = ''.join(lines)
+else:
+    for i in range(prologue_end):
+        if DOTTED.match(lines[i]):
+            lines[i] = f'tui.theme = "{new}"\n'
+            break
+        m = INLINE.match(lines[i].rstrip('\n'))
+        if m:
+            body = m.group('body')
+            vm = INLINE_THEME_VAL.search(body)
+            if vm:
+                body = body[:vm.start('val')] + f'"{new}"' + body[vm.end('val'):]
+            elif body.strip():
+                body = body + f', theme = "{new}"'
+            else:
+                body = f' theme = "{new}" '
+            lines[i] = m.group('pre') + body + m.group('post') + '\n'
+            break
+    else:
+        # No tui table anywhere yet.  If dotted tui.* keys exist, a new
+        # [tui] header would illegally redefine the table — extend the
+        # dotted form instead.
+        dotted_at = None
+        for i in range(prologue_end):
+            if DOTTED_ANY.match(lines[i]):
+                dotted_at = i
+        if dotted_at is not None:
+            lines.insert(dotted_at + 1, f'tui.theme = "{new}"\n')
+            text = ''.join(lines)
+        else:
+            if text and not text.endswith('\n'):
+                text += '\n'
+            text += f'\n[tui]\n{theme_line}'
+            lines = None
+    if lines is not None:
+        text = ''.join(lines)
 
+# --- Prove the edit landed at the exact semantic field, then commit
+# atomically: stage in the target's directory, keep the original's mode,
+# write through a symlink rather than replacing it.
 try:
     edited = tomllib.loads(text)
 except tomllib.TOMLDecodeError:
-    sys.exit(0)
+    sys.exit(NOT_SYNCED)
 if edited.get('tui', {}).get('theme') != new:
-    sys.exit(0)
-with open(path, 'w') as f:
-    f.write(text)
+    sys.exit(NOT_SYNCED)
+
+real = os.path.realpath(path)
+try:
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real) or '.',
+                               prefix='.term-theme.')
+except OSError:
+    sys.exit(NOT_SYNCED)
+try:
+    with os.fdopen(fd, 'w') as f:
+        f.write(text)
+    try:
+        os.chmod(tmp, os.stat(real).st_mode & 0o7777)
+    except FileNotFoundError:
+        pass
+    os.replace(tmp, real)
+except OSError:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    sys.exit(NOT_SYNCED)
 EOF
+  if [[ $rc -ne 0 ]]; then
+    echo "term-theme: codex theme not synced — could not update tui.theme in" \
+      "~/.codex/config.toml; pick a ${mode} theme with codex's /theme instead" >&2
+  fi
 }
 
 # Live hive tmux sessions carry mode-specific status-bar palettes baked in

@@ -395,19 +395,112 @@ class TestCodexThemeSync:
         cfg = tomllib.loads(cfg_path.read_text())
         assert cfg['tui']['theme'] == 'catppuccin-latte'
 
-    def test_unparseable_config_left_untouched(self, fake_mac):
+    def test_unparseable_config_left_untouched_but_warned(self, fake_mac):
+        """Never touch what we cannot parse — but never claim success."""
         env, _ = fake_mac
         content = 'not [ valid toml\n'
         cfg_path = self._config(env, content)
         result = run(env, 'day')
         assert result.returncode == 0
         assert cfg_path.read_text() == content
+        assert 'not synced' in result.stderr
 
     def test_status_does_not_touch_theme(self, fake_mac):
         env, _ = fake_mac
         cfg_path = self._config(env, self.REALISTIC)
         run(env, 'status')
         assert cfg_path.read_text() == self.REALISTIC
+
+    # TOML allows several spellings of the same [tui].theme setting; the
+    # semantic reader accepts them all, so the editor must too (#20
+    # review). Each case parses to tui.theme = catppuccin-mocha.
+    ALT_SPELLINGS = [
+        '[ tui ]\ntheme = "catppuccin-mocha"\n',
+        '["tui"]\ntheme = "catppuccin-mocha"\n',
+        '[tui]\n"theme" = "catppuccin-mocha"\n',
+        'tui.theme = "catppuccin-mocha"\n',
+        'tui = { theme = "catppuccin-mocha", animations = true }\n',
+    ]
+
+    @pytest.mark.parametrize('content', ALT_SPELLINGS)
+    def test_day_syncs_alternate_toml_spellings(self, fake_mac, content):
+        env, _ = fake_mac
+        cfg_path = self._config(env, content)
+        result = run(env, 'day')
+        assert result.returncode == 0
+        cfg = tomllib.loads(cfg_path.read_text())
+        assert cfg['tui']['theme'] == 'catppuccin-latte'
+        assert 'not synced' not in result.stderr
+
+    def test_inline_table_preserves_siblings(self, fake_mac):
+        env, _ = fake_mac
+        cfg_path = self._config(
+            env, 'tui = { theme = "catppuccin-mocha", animations = true }\n')
+        run(env, 'day')
+        cfg = tomllib.loads(cfg_path.read_text())
+        assert cfg['tui']['theme'] == 'catppuccin-latte'
+        assert cfg['tui']['animations'] is True
+
+    def test_inline_table_without_theme_gains_it(self, fake_mac):
+        """No theme in the inline table means the dark default applies —
+        day must add the key without disturbing siblings."""
+        env, _ = fake_mac
+        cfg_path = self._config(env, 'tui = { animations = true }\n')
+        run(env, 'day')
+        cfg = tomllib.loads(cfg_path.read_text())
+        assert cfg['tui']['theme'] == 'catppuccin-latte'
+        assert cfg['tui']['animations'] is True
+
+    def test_dotted_siblings_without_theme(self, fake_mac):
+        """Dotted tui.* keys already define the table — a new [tui]
+        header would be illegal, so the dotted form must be extended."""
+        env, _ = fake_mac
+        cfg_path = self._config(env, 'tui.animations = true\n')
+        run(env, 'day')
+        cfg = tomllib.loads(cfg_path.read_text())
+        assert cfg['tui']['theme'] == 'catppuccin-latte'
+        assert cfg['tui']['animations'] is True
+
+    def test_failed_commit_preserves_original_and_warns(self, fake_mac):
+        """The staged atomic write must never truncate the real config:
+        when the commit cannot happen, the original bytes survive and
+        the failure is surfaced."""
+        env, _ = fake_mac
+        content = '[tui]\ntheme = "catppuccin-mocha"\n'
+        cfg_path = self._config(env, content)
+        cfg_path.parent.chmod(0o500)  # staging in the config dir fails
+        try:
+            result = run(env, 'day')
+        finally:
+            cfg_path.parent.chmod(0o755)
+        assert result.returncode == 0
+        assert cfg_path.read_text() == content
+        assert 'not synced' in result.stderr
+
+    def test_symlinked_config_edited_through_not_replaced(self, fake_mac):
+        """A dotfiles-managed symlink stays a symlink; the edit lands in
+        its target."""
+        env, _ = fake_mac
+        target_dir = Path(env['HOME']) / 'dotfiles'
+        target_dir.mkdir()
+        target = target_dir / 'codex-config.toml'
+        target.write_text('[tui]\ntheme = "catppuccin-mocha"\n')
+        cfg_path = Path(env['HOME']) / '.codex' / 'config.toml'
+        cfg_path.parent.mkdir()
+        cfg_path.symlink_to(target)
+        run(env, 'day')
+        assert cfg_path.is_symlink()
+        cfg = tomllib.loads(target.read_text())
+        assert cfg['tui']['theme'] == 'catppuccin-latte'
+
+    def test_file_mode_preserved(self, fake_mac):
+        env, _ = fake_mac
+        cfg_path = self._config(env, '[tui]\ntheme = "catppuccin-mocha"\n')
+        cfg_path.chmod(0o600)
+        run(env, 'day')
+        assert (cfg_path.stat().st_mode & 0o777) == 0o600
+        cfg = tomllib.loads(cfg_path.read_text())
+        assert cfg['tui']['theme'] == 'catppuccin-latte'
 
 
 class TestHiveRestyle:
