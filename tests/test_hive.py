@@ -880,7 +880,8 @@ class TestCleanPrBranch:
         cmds = [c.args[0] for c in mock_git.call_args_list]
         assert cmds == [
             ['checkout', 'main'],
-            ['pull', '--ff-only', 'origin', 'main'],
+            ['fetch', 'origin', 'main'],
+            ['merge', '--ff-only', 'FETCH_HEAD'],
             ['branch', '-D', 'old-branch'],
         ]
 
@@ -921,7 +922,7 @@ class TestCleanPrBranch:
     def test_pull_failure_reported_without_rebase(self):
         dispatch = self._git_dispatch({
             'checkout': self._ok(),
-            'pull': self._fail('conflict'),
+            'merge': self._fail('conflict'),
         })
         with patch.object(hive, '_default_branch', return_value='main'):
             with patch.object(hive, '_git_out', return_value=''):
@@ -935,17 +936,42 @@ class TestCleanPrBranch:
         # branch -D should NOT have been called
         assert not any(c[0] == 'branch' for c in cmds)
 
+    def test_fetch_failure_reported_not_classified(self):
+        """A failed fetch reports the fetch error — no ancestry probe, no
+        divergence claim, no integration attempt."""
+        dispatch = self._git_dispatch({
+            'checkout': self._ok(),
+            'fetch': self._fail('could not resolve host'),
+            # If classification ran anyway, this would report divergence.
+            'merge-base': self._fail(),
+        })
+
+        def fake_git_out(args, cwd=None):
+            if args[0] == 'rev-parse':
+                return 'stale123'  # stale refs still resolve
+            return ''
+
+        with patch.object(hive, '_default_branch', return_value='main'):
+            with patch.object(hive, '_git_out', side_effect=fake_git_out):
+                with patch.object(hive, '_git', side_effect=dispatch) as mock_git:
+                    result = hive._clean_pr_branch(Path('/repo'), 'old-branch')
+        assert result['success'] is False
+        assert 'fetch' in result['error']
+        assert 'diverged' not in result['error']
+        cmds = [c.args[0] for c in mock_git.call_args_list]
+        assert not any(c[0] in ('merge', 'merge-base', 'branch') for c in cmds)
+
     def test_pull_divergence_reported(self):
         """A diverged default branch is reported, never rewritten."""
         not_ancestor = subprocess.CompletedProcess([], 1, stdout='', stderr='')
         dispatch = self._git_dispatch({
             'checkout': self._ok(),
-            'pull': self._fail('Not possible to fast-forward'),
+            'merge': self._fail('Not possible to fast-forward'),
             'merge-base': not_ancestor,
         })
 
         def fake_git_out(args, cwd=None):
-            if args == ['rev-parse', '--verify', 'origin/main']:
+            if args == ['rev-parse', '--verify', 'FETCH_HEAD']:
                 return 'abc123'
             return ''
 
@@ -962,7 +988,7 @@ class TestCleanPrBranch:
     def test_branch_delete_failure(self):
         dispatch = self._git_dispatch({
             'checkout': self._ok(),
-            'pull': self._ok('Already up to date'),
+            'merge': self._ok('Already up to date'),
             'branch': self._fail(),
         })
         with patch.object(hive, '_default_branch', return_value='main'):
@@ -983,7 +1009,8 @@ class TestCleanPrBranch:
         cmds = [c.args[0] for c in mock_git.call_args_list]
         assert cmds == [
             ['checkout', 'infra-dev'],
-            ['pull', '--ff-only', 'origin', 'infra-dev'],
+            ['fetch', 'origin', 'infra-dev'],
+            ['merge', '--ff-only', 'FETCH_HEAD'],
             ['branch', '-D', 'old-branch'],
         ]
 
@@ -2379,7 +2406,7 @@ class TestPullEngine:
         assert result.cached is False
         assert result.up_to_date is True
         assert cache.get_remote_sha(origin_url, 'main') == new_sha
-        mock_git.assert_called_once()
+        assert mock_git.call_count == 2  # fetch + ff-only merge
 
     def test_no_cache_skips_cache_logic(self, tmp_path):
         """When pull_cache is None, no origin URL lookup happens."""
@@ -2439,7 +2466,7 @@ class TestPullEngine:
 
         assert r1.cached is False
         assert cache.get_remote_sha(origin_url, 'main') == head_sha
-        mock_git.assert_called_once()
+        assert mock_git.call_count == 2  # fetch + ff-only merge
 
         with patch.object(hive, '_git_out', side_effect=fake_git_out):
             with patch.object(hive, '_git') as mock_git2:
@@ -2501,7 +2528,7 @@ class TestPullEngine:
 
         assert result.cached is False
         assert result.up_to_date is True
-        mock_git.assert_called_once()
+        assert mock_git.call_count == 2  # fetch + ff-only merge
         assert cache.remote_shas == {}
 
     def test_dirty_repo_with_cache_hit_returns_skipped(self, tmp_path):
@@ -2569,7 +2596,7 @@ class TestPullEngine:
                 r2 = self._pull(repo_feat, cache=cache)
 
         assert r2.cached is False
-        mock_git.assert_called_once()
+        assert mock_git.call_count == 2  # fetch + ff-only merge
         assert cache.get_remote_sha(origin_url, 'feature') == head_sha
 
 
@@ -2625,18 +2652,19 @@ class TestPullFfOnly:
         return fake_git_out
 
     @staticmethod
-    def _diverged_git(pull_stderr='Not possible to fast-forward'):
-        """_git fake: pull fails, both ancestry checks answer 'not an ancestor'."""
+    def _diverged_git(merge_stderr='Not possible to fast-forward'):
+        """_git fake: fetch succeeds, ff-only merge fails, both ancestry
+        checks answer 'not an ancestor'."""
         def fake_git(args, cwd=None, timeout=None):
-            if args[0] == 'pull':
+            if args[0] == 'merge':
                 return subprocess.CompletedProcess(
-                    [], 1, stdout='', stderr=pull_stderr)
+                    [], 1, stdout='', stderr=merge_stderr)
             if args[0] == 'merge-base':
                 return subprocess.CompletedProcess([], 1, stdout='', stderr='')
             return subprocess.CompletedProcess([], 0, stdout='', stderr='')
         return fake_git
 
-    def test_pull_command_is_ff_only(self, tmp_path):
+    def test_pull_is_fetch_then_ff_only_merge(self, tmp_path):
         repo = tmp_path / 'repo'
         repo.mkdir()
         ok = subprocess.CompletedProcess(
@@ -2645,15 +2673,18 @@ class TestPullFfOnly:
             with patch.object(hive, '_git', return_value=ok) as mock_git:
                 result = self._pull(repo)
         assert result.up_to_date is True
-        mock_git.assert_called_once()
-        assert mock_git.call_args.args[0] == ['pull', '--ff-only', 'origin', 'main']
+        cmds = [c.args[0] for c in mock_git.call_args_list]
+        assert cmds == [
+            ['fetch', 'origin', 'main'],
+            ['merge', '--ff-only', 'FETCH_HEAD'],
+        ]
 
     def test_diverged_branch_skipped_never_rebased(self, tmp_path):
         """The #26 incident: clean tree + diverged history must not be rewritten."""
         repo = tmp_path / 'repo'
         repo.mkdir()
         git_out = self._clean_git_out(
-            {('rev-parse', '--verify', 'origin/main'): 'abc123'})
+            {('rev-parse', '--verify', 'FETCH_HEAD'): 'abc123'})
         with patch.object(hive, '_git_out', side_effect=git_out):
             with patch.object(hive, '_git',
                               side_effect=self._diverged_git()) as mock_git:
@@ -2668,7 +2699,7 @@ class TestPullFfOnly:
         repo = tmp_path / 'repo'
         repo.mkdir()
         git_out = self._clean_git_out(
-            {('rev-parse', '--verify', 'origin/main'): 'abc123'})
+            {('rev-parse', '--verify', 'FETCH_HEAD'): 'abc123'})
         with patch.object(hive, '_git_out', side_effect=git_out):
             with patch.object(hive, '_git',
                               side_effect=self._diverged_git()) as mock_git:
@@ -2683,7 +2714,7 @@ class TestPullFfOnly:
         repo.mkdir()
         cache = hive.RemoteCache()
         git_out = self._clean_git_out({
-            ('rev-parse', '--verify', 'origin/main'): 'abc123',
+            ('rev-parse', '--verify', 'FETCH_HEAD'): 'abc123',
             ('config', '--get', 'remote.origin.url'): 'ssh://git@host/org/repo',
             ('rev-parse', 'HEAD'): 'localsha',
         })
@@ -2693,34 +2724,54 @@ class TestPullFfOnly:
         assert result.diverged is True
         assert cache.remote_shas == {}
 
-    def test_pull_failure_without_upstream_is_error(self, tmp_path):
-        """A failed pull with no resolvable upstream ref is an error, not divergence."""
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        fail = subprocess.CompletedProcess(
-            [], 1, stdout='', stderr='could not resolve host')
-        with patch.object(hive, '_git_out', side_effect=self._clean_git_out()):
-            with patch.object(hive, '_git', return_value=fail):
-                result = self._pull(repo)
-        assert result.pull_failed is True
-        assert result.diverged is False
-
-    def test_behind_only_failure_is_error_not_diverged(self, tmp_path):
-        """When HEAD is an ancestor of upstream, a failed pull is not divergence."""
+    def test_fetch_failure_with_stale_divergent_ref_is_error(self, tmp_path):
+        """A failed fetch must never be classified as divergence, even when a
+        stale remote-tracking ref exists and is mutually non-ancestral with
+        HEAD — the fetch observed nothing, and its error must be preserved."""
         repo = tmp_path / 'repo'
         repo.mkdir()
 
         def fake_git(args, cwd=None, timeout=None):
-            if args[0] == 'pull':
+            if args[0] == 'fetch':
+                return subprocess.CompletedProcess(
+                    [], 1, stdout='', stderr='could not resolve host')
+            # If classification ran anyway, these would report divergence.
+            if args[0] == 'merge-base':
+                return subprocess.CompletedProcess([], 1, stdout='', stderr='')
+            return subprocess.CompletedProcess([], 0, stdout='', stderr='')
+
+        # Both a stale tracking ref and FETCH_HEAD resolve, as after an
+        # earlier successful fetch.
+        git_out = self._clean_git_out({
+            ('rev-parse', '--verify', 'FETCH_HEAD'): 'stale123',
+            ('rev-parse', '--verify', 'origin/main'): 'stale123',
+        })
+        with patch.object(hive, '_git_out', side_effect=git_out):
+            with patch.object(hive, '_git', side_effect=fake_git) as mock_git:
+                result = self._pull(repo)
+        assert result.pull_failed is True
+        assert result.diverged is False
+        assert result.error_lines == ['could not resolve host']
+        # No ancestry probe may run after a failed fetch
+        cmds = [c.args[0][0] for c in mock_git.call_args_list]
+        assert 'merge-base' not in cmds
+
+    def test_behind_only_failure_is_error_not_diverged(self, tmp_path):
+        """When HEAD is an ancestor of FETCH_HEAD, a failed merge is not divergence."""
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+
+        def fake_git(args, cwd=None, timeout=None):
+            if args[0] == 'merge':
                 return subprocess.CompletedProcess([], 1, stdout='', stderr='boom')
-            if args == ['merge-base', '--is-ancestor', 'HEAD', 'origin/main']:
+            if args == ['merge-base', '--is-ancestor', 'HEAD', 'FETCH_HEAD']:
                 return subprocess.CompletedProcess([], 0, stdout='', stderr='')
             if args[0] == 'merge-base':
                 return subprocess.CompletedProcess([], 1, stdout='', stderr='')
             return subprocess.CompletedProcess([], 0, stdout='', stderr='')
 
         git_out = self._clean_git_out(
-            {('rev-parse', '--verify', 'origin/main'): 'abc123'})
+            {('rev-parse', '--verify', 'FETCH_HEAD'): 'abc123'})
         with patch.object(hive, '_git_out', side_effect=git_out):
             with patch.object(hive, '_git', side_effect=fake_git):
                 result = self._pull(repo)

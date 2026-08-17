@@ -232,7 +232,6 @@ class RemoteProfile:
     """Remote-specific behavior for sync operations."""
 
     name: str
-    pull_args: tuple[str, ...]
     push_enabled: bool = False
 
 
@@ -774,7 +773,6 @@ def cmd_status(args: argparse.Namespace) -> None:
 
 _ORIGIN_REMOTE = RemoteProfile(
     name='origin',
-    pull_args=('pull', '--ff-only'),
 )
 
 
@@ -818,6 +816,10 @@ def _is_diverged(repo_path: Path, upstream: str) -> bool:
     Only claims divergence when the upstream ref actually resolves and both
     ancestry checks answer definitively "no" (exit 1) — any other failure
     (missing ref, git error) is not evidence of divergence.
+
+    Callers must only pass a ref whose freshness is established — e.g.
+    FETCH_HEAD immediately after a successful fetch. A stale remote-tracking
+    ref can misclassify a fetch failure as divergence.
     """
     if not _git_out(['rev-parse', '--verify', upstream], cwd=repo_path):
         return False
@@ -889,19 +891,26 @@ def execute_sync(status: RepoStatus, remote_cache: RemoteCache | None = None,
     if status.action != SyncAction.PULL:
         return status
 
-    # Fast-forward pull. Never rebase or merge in a sweep: divergence means
+    # Fast-forward pull, split into fetch + ff-only integration so a fetch
+    # failure can never be misread as divergence against a stale
+    # remote-tracking ref. Never rebase or merge in a sweep: divergence means
     # an in-flight history rewrite or genuinely unpushed work — both are
     # report-worthy, neither is auto-fixable (issue #26).
-    r = _git(
-        [*status.remote_profile.pull_args, status.remote_profile.name, status.branch],
-        cwd=status.path,
-        timeout=30,
-    )
+    f = _git(['fetch', status.remote_profile.name, status.branch],
+             cwd=status.path, timeout=30)
+    if f.returncode != 0:
+        # A failed fetch observed nothing — report its error unchanged.
+        status.action = SyncAction.ERROR
+        stderr = f.stderr.strip()
+        if stderr:
+            status.error_lines = stderr.splitlines()[:3]
+        return status
+
+    r = _git(['merge', '--ff-only', 'FETCH_HEAD'], cwd=status.path, timeout=30)
     if r.returncode != 0:
-        # The pull's fetch already updated the remote-tracking ref, so a
-        # definitive divergence check is possible even after the failure.
-        upstream = f'{status.remote_profile.name}/{status.branch}'
-        if _is_diverged(status.path, upstream):
+        # FETCH_HEAD is fresh from the fetch that just succeeded, so this
+        # ancestry check is definitive.
+        if _is_diverged(status.path, 'FETCH_HEAD'):
             status.action = SyncAction.SKIP_DIVERGED
             return status
         status.action = SyncAction.ERROR
@@ -1526,10 +1535,15 @@ def _clean_pr_branch(repo_path: Path, branch: str) -> dict:
     if r.returncode != 0:
         return {'success': False, 'error': f'checkout {default} failed'}
 
-    # Pull (fast-forward only — a sweep never resolves divergence)
-    r = _git(['pull', '--ff-only', 'origin', default], cwd=repo_path, timeout=30)
+    # Pull (fast-forward only — a sweep never resolves divergence). Fetch
+    # separately so a fetch failure is never misread as divergence against
+    # a stale remote-tracking ref.
+    r = _git(['fetch', 'origin', default], cwd=repo_path, timeout=30)
     if r.returncode != 0:
-        if _is_diverged(repo_path, f'origin/{default}'):
+        return {'success': False, 'error': f'fetch origin {default} failed'}
+    r = _git(['merge', '--ff-only', 'FETCH_HEAD'], cwd=repo_path, timeout=30)
+    if r.returncode != 0:
+        if _is_diverged(repo_path, 'FETCH_HEAD'):
             return {'success': False, 'error': f'{default} diverged from origin'}
         return {'success': False, 'error': 'fast-forward pull failed'}
 
