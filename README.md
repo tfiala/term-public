@@ -141,6 +141,13 @@ records the mode in `~/.cache/term-theme/mode` and nudges each consumer:
   are styled for the current mode at creation, and `term-theme` restyles
   live sessions via `hive tmux restyle`. Existing shells keep the
   `HIVE_COLOR_*` env they started with until a new pane/window.
+- **tmux copy-mode & messages** — needs no nudge, the opposite way from
+  Starship: tmux's defaults for the mouse-drag selection (`mode-style`),
+  search matches, and the message bar are ANSI named colors, and the day
+  theme maps yellow/cyan/magenta/red to dark shades — dark-on-dark, an
+  invisible selection. `tmux/tmux.conf` pins those styles in truecolor
+  hex, which both themes render identically, so they never flip with the
+  mode. Keep that constraint when changing them.
 - **Claude Code** — stores its theme in `~/.claude/settings.json` (the
   `/config` preferences moved there in 2.1.119); `term-theme` flips it
   between `light`/`dark`, preserving a daltonized/ansi variant and leaving
