@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
 # backup_and_link_file
 # $1 - source path
@@ -6,11 +7,13 @@
 backup_and_link_file() {
   mkdir -p "$(dirname "$2")"
 
-  if [[ -e "$2" ]]; then
-    if [[ -L "$2" ]]; then
-      unlink "$2"
-      ln -s "$1" "$2"
-    elif [[ -d "$2" ]] || ! cmp -s "$1" "$2"; then
+  # -L first: a symlink destination (live or dangling) is always replaced.
+  # The -e check alone misses dangling symlinks, and ln -s onto one fails.
+  if [[ -L "$2" ]]; then
+    unlink "$2"
+    ln -s "$1" "$2"
+  elif [[ -e "$2" ]]; then
+    if [[ -d "$2" ]] || ! cmp -s "$1" "$2"; then
       rm -rf "$2.bak"
       mv "$2" "$2.bak"
       ln -s "$1" "$2"
@@ -30,18 +33,28 @@ backup_and_link_file() {
 # remove_stale_link
 # $1 - home dotfile that may be a symlink from the zsh era
 # $2 - repo-relative suffix the old link pointed at
-# Unlinks it (from any term-public checkout, including deleted files)
-# and restores the pre-term-public backup if one exists.
+# Only removes a link whose target checkout can be proven to be
+# term-public (its root contains scripts/hive.py).  Anything else —
+# foreign dotfiles repos with the same layout, or dangling links to a
+# deleted checkout — is left in place with an actionable warning.
 remove_stale_link() {
-  if [[ -L "$1" ]]; then
-    case "$(readlink "$1")" in
-      */"$2")
-        unlink "$1"
-        if [[ -e "$1.bak" ]]; then
-          mv "$1.bak" "$1"
-        fi
-        ;;
-    esac
+  local link="$1" suffix="$2" target root
+  [[ -L "$link" ]] || return 0
+  target="$(readlink "$link")"
+  case "$target" in
+    */"$suffix") ;;
+    *) return 0 ;;
+  esac
+  root="${target%/"$suffix"}"
+  if [[ -e "$root/scripts/hive.py" ]]; then
+    unlink "$link"
+    if [[ -e "$link.bak" ]]; then
+      mv "$link.bak" "$link"
+    fi
+  else
+    echo "warning: $link -> $target looks like a zsh-era term-public link," >&2
+    echo "  but its checkout could not be verified (no scripts/hive.py at $root)." >&2
+    echo "  Leaving it in place; remove it manually if it belonged to term-public." >&2
   fi
 }
 
@@ -92,10 +105,28 @@ if command -v infocmp >/dev/null 2>&1 && command -v tic >/dev/null 2>&1; then
   if ! TERMINFO= infocmp xterm-ghostty >/dev/null 2>&1; then
     _ghostty_ti="/Applications/Ghostty.app/Contents/Resources/terminfo"
     if [[ -d "$_ghostty_ti" ]]; then
-      TERMINFO="$_ghostty_ti" infocmp -x xterm-ghostty 2>/dev/null | TERMINFO= tic -x - 2>/dev/null \
-        && echo "Installed xterm-ghostty terminfo to ~/.terminfo"
+      if TERMINFO="$_ghostty_ti" infocmp -x xterm-ghostty 2>/dev/null \
+          | TERMINFO= tic -x - 2>/dev/null; then
+        echo "Installed xterm-ghostty terminfo to ~/.terminfo"
+      fi
     fi
   fi
+fi
+
+# bash cannot safely source zsh syntax, so leftover zsh config (including
+# .bak files restored above) no longer runs after the chsh to bash.
+# Point at the sanctioned overlay instead of silently dropping it.
+_zsh_leftovers=""
+for _f in "$HOME/.zshenv" "$HOME/.zshrc" "$HOME/.zshenv.bak" "$HOME/.zshrc.bak"; do
+  if [[ -f "$_f" ]]; then
+    _zsh_leftovers="$_zsh_leftovers $_f"
+  fi
+done
+if [[ -n "$_zsh_leftovers" ]]; then
+  echo "NOTE: zsh-era config remains at:$_zsh_leftovers"
+  echo "      bash does not read these files. Migrate needed exports into"
+  echo "      $LOCAL_DIR/env.local and aliases/functions into"
+  echo "      $LOCAL_DIR/bashrc.local, then delete them."
 fi
 
 echo "Linked config into place."

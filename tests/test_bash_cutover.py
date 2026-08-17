@@ -98,6 +98,18 @@ class TestStarshipConfig:
         assert self.config["status"]["disabled"] is False
         assert self.config["time"]["disabled"] is False
 
+    def test_palette_is_theme_adaptive_ansi_only(self):
+        """Day/night legibility contract: only named ANSI colors, which
+        each Ghostty theme maps against its own background.  A numeric
+        256-cube or hex value is fixed across themes and will wash out
+        on one of the two backgrounds."""
+        ansi = re.compile(r"(bright-)?(black|red|green|yellow|blue|purple|cyan|white)")
+        palette = self.config["palettes"][self.config["palette"]]
+        for name, value in palette.items():
+            assert ansi.fullmatch(value), (
+                f"palette color {name} = {value!r} is not a named ANSI color"
+            )
+
 
 class TestBootstrap:
     """bootstrap-macos.sh installs and registers the bash stack."""
@@ -178,6 +190,31 @@ class TestBashrcEnvironment:
         )
         assert r.returncode == 0
         assert "READY" in r.stdout
+
+    def test_prior_bashrc_backup_sourced(self, tmp_path):
+        """A .bashrc.bak stays effective, not just archived (#19 review)."""
+        (tmp_path / ".bashrc.bak").write_text("export FROM_BAK=1\n")
+        r = self._run(f'source "{BASHRC}"; echo "BAK=$FROM_BAK"', tmp_path)
+        assert r.returncode == 0
+        assert "BAK=1" in r.stdout
+
+    def test_bak_sourcing_does_not_recurse(self, tmp_path):
+        """A backup that re-sources ~/.bashrc must not loop forever."""
+        link = tmp_path / ".bashrc"
+        link.symlink_to(BASHRC)
+        (tmp_path / ".bashrc.bak").write_text(
+            'source "$HOME/.bashrc"\nexport FROM_BAK=1\n')
+        r = subprocess.run(
+            ["bash", "--norc", "-c",
+             'source "$HOME/.bashrc"; echo "BAK=$FROM_BAK"'],
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                 "HOME": str(tmp_path), "TERM": "xterm-256color"},
+            timeout=15,
+        )
+        assert r.returncode == 0
+        assert "BAK=1" in r.stdout
 
     def test_env_local_overlay_sourced(self, tmp_path):
         """local/env.local from the resolved repo root is applied."""

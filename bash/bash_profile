@@ -6,3 +6,11 @@
 if [[ -f "$HOME/.bashrc" ]]; then
   source "$HOME/.bashrc"
 fi
+
+# Source the user's prior .bash_profile if setup.sh backed it up
+# (mirrors the old zshenv.bak pattern).  The guard prevents re-entry
+# when the backup itself sources ~/.bash_profile.
+if [[ -z "${_TERM_PUBLIC_PROFILE_BAK:-}" && -f "$HOME/.bash_profile.bak" ]]; then
+  _TERM_PUBLIC_PROFILE_BAK=1
+  source "$HOME/.bash_profile.bak"
+fi

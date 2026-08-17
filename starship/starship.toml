@@ -3,10 +3,13 @@
 # Ports the old p10k layout: [hive-N] badge, dir, git on the left with a
 # ╭─/╰─ frame; hive PR, exit status, duration, jobs, clock on the right.
 #
-# Palette rule (day/night issue #14): every color here must stay legible
-# on BOTH backgrounds — palenight (dark) and GitHub Light High Contrast
-# (near-white).  Prefer the mid-range 256-color cube; avoid bright
-# yellows (220/226) and pale blues (75+) that wash out on white.
+# Palette rule (day/night issue #14): every color must stay legible on
+# BOTH backgrounds — palenight (dark) and GitHub Light High Contrast
+# (near-white).  Fixed 256-cube values cannot satisfy that (bright
+# greens/yellows wash out on white), so the palette uses ONLY named ANSI
+# colors: each Ghostty theme maps ANSI 0-15 against its own background,
+# which is what makes the prompt theme-adaptive.  Never add a numeric or
+# hex color here.
 
 add_newline = true
 palette = "term_public"
@@ -15,15 +18,15 @@ format = "[╭─](fg:frame)${custom.hive_badge}$directory$git_branch$git_status
 right_format = "${custom.hive_pr}$status$cmd_duration$jobs$time"
 
 [palettes.term_public]
-frame = "240"
-dir = "31"
-clean = "70"
-dirty = "166"
-ok = "76"
-err = "196"
-hive = "32"
-clock = "66"
-dur = "136"
+frame = "bright-black"
+dir = "blue"
+clean = "green"
+dirty = "yellow"
+ok = "green"
+err = "red"
+hive = "cyan"
+clock = "bright-black"
+dur = "yellow"
 
 [directory]
 style = "fg:dir"

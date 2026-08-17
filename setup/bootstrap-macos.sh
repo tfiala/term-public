@@ -26,6 +26,12 @@ current_shell="$(dscl . -read "/Users/$USER" UserShell 2>/dev/null | awk '{print
 if [[ "$current_shell" != "$BREW_BASH" ]]; then
   echo "Changing login shell to $BREW_BASH..."
   chsh -s "$BREW_BASH"
+  echo "Login shell is now bash. Your previous shell's config no longer runs:"
+  echo "  - prior ~/.bashrc / ~/.bash_profile are preserved as .bak and still"
+  echo "    sourced by the term-public bash config after ./setup.sh"
+  echo "  - zsh config (~/.zshenv, ~/.zshrc) is NOT read by bash; migrate any"
+  echo "    needed exports to local/env.local and aliases to local/bashrc.local"
+  echo "    (see README: Per-Machine Overlay)"
 fi
 
 echo "Bootstrap complete."

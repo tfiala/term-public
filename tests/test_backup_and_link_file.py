@@ -89,6 +89,21 @@ def test_replaces_identical_file_with_symlink(tmp_path):
     assert not (tmp_path / "dest.txt.bak").exists()
 
 
+def test_replaces_dangling_symlink(tmp_path):
+    """A dangling destination symlink must be replaced, not break ln -s."""
+    src = tmp_path / "source.txt"
+    src.write_text("new")
+    dest = tmp_path / "dest.txt"
+    dest.symlink_to(tmp_path / "deleted-target.txt")
+
+    result = run_backup_and_link(str(src), str(dest))
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert dest.is_symlink()
+    assert os.readlink(str(dest)) == str(src)
+
+
 def test_backs_up_directory(tmp_path):
     src = tmp_path / "source_dir"
     src.mkdir()
@@ -179,14 +194,102 @@ def test_setup_backs_up_existing_bashrc(tmp_path):
     assert (home / ".bashrc.bak").read_text() == "export MY_CRITICAL_VAR=hello\n"
 
 
-class TestStaleZshLinkCleanup:
-    """setup.sh removes symlinks left by the zsh era (pre-#15)."""
+def test_setup_repairs_dangling_bashrc_link(tmp_path):
+    """A dangling ~/.bashrc symlink is replaced, not left broken."""
+    repo_root, home = _scaffold_repo(tmp_path)
+    (home / ".bashrc").symlink_to(tmp_path / "gone" / "bashrc")
 
-    def test_removes_stale_zsh_links(self, tmp_path):
+    result = _run_setup(repo_root, home)
+
+    assert result.returncode == 0
+    assert (home / ".bashrc").is_symlink()
+    assert os.readlink(home / ".bashrc") == str(repo_root / "bash" / "bashrc")
+
+
+def test_setup_fails_fast_on_link_error(tmp_path):
+    """setup.sh must exit nonzero when a step fails, not report success."""
+    repo_root, home = _scaffold_repo(tmp_path)
+    # mkdir -p "$HOME/bin" collides with a regular file.
+    (home / "bin").write_text("not a directory\n")
+
+    result = _run_setup(repo_root, home)
+
+    assert result.returncode != 0
+    assert "Linked config into place." not in result.stdout
+
+
+def _use_real_bash_config(repo_root):
+    """Copy the real bash config into the scaffold for behavior tests."""
+    real = Path(SETUP_SH).resolve().parent
+    (repo_root / "bash" / "bashrc").write_text((real / "bash" / "bashrc").read_text())
+    (repo_root / "bash" / "bash_profile").write_text(
+        (real / "bash" / "bash_profile").read_text())
+
+
+class TestPriorConfigStaysEffective:
+    """Backed-up bash config must keep working, not just exist as bytes."""
+
+    def test_prior_bashrc_export_survives(self, tmp_path):
         repo_root, home = _scaffold_repo(tmp_path)
+        _use_real_bash_config(repo_root)
+        (home / ".bashrc").write_text("export MY_CRITICAL_VAR=hello\n")
 
-        # Simulate links from an old checkout (targets no longer exist).
+        assert _run_setup(repo_root, home).returncode == 0
+
+        r = subprocess.run(
+            ["bash", "--norc", "-c",
+             'source "$HOME/.bashrc"; echo "VAR=$MY_CRITICAL_VAR"'],
+            capture_output=True, text=True,
+            env={**os.environ, "HOME": str(home)},
+        )
+        assert r.returncode == 0
+        assert "VAR=hello" in r.stdout
+
+    def test_prior_bash_profile_export_survives(self, tmp_path):
+        repo_root, home = _scaffold_repo(tmp_path)
+        _use_real_bash_config(repo_root)
+        (home / ".bash_profile").write_text("export MY_LOGIN_VAR=world\n")
+
+        assert _run_setup(repo_root, home).returncode == 0
+
+        r = subprocess.run(
+            ["bash", "--norc", "-c",
+             'source "$HOME/.bash_profile"; echo "VAR=$MY_LOGIN_VAR"'],
+            capture_output=True, text=True,
+            env={**os.environ, "HOME": str(home)},
+        )
+        assert r.returncode == 0
+        assert "VAR=world" in r.stdout
+
+    def test_migration_notice_for_zsh_config(self, tmp_path):
+        """Leftover zsh config gets explicit migration guidance."""
+        repo_root, home = _scaffold_repo(tmp_path)
+        (home / ".zshrc").write_text("export FROM_ZSH=1\n")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0
+        assert "zsh-era config remains" in result.stdout
+        assert "env.local" in result.stdout
+
+
+def _make_old_term_public_checkout(path):
+    """Create a fake zsh-era term-public checkout with its provenance marker."""
+    (path / "zsh").mkdir(parents=True)
+    (path / "scripts").mkdir()
+    (path / "zsh" / "zshrc").write_text("# old term-public zshrc\n")
+    (path / "zsh" / "zshenv").write_text("# old term-public zshenv\n")
+    (path / "p10k.zsh").write_text("# old term-public p10k\n")
+    (path / "scripts" / "hive.py").write_text("#!/usr/bin/env python3\n")
+
+
+class TestStaleZshLinkCleanup:
+    """setup.sh removes zsh-era links only with proven term-public provenance."""
+
+    def test_removes_links_to_verified_checkout(self, tmp_path):
+        repo_root, home = _scaffold_repo(tmp_path)
         old_checkout = tmp_path / "old-checkout"
+        _make_old_term_public_checkout(old_checkout)
         (home / ".zshrc").symlink_to(old_checkout / "zsh" / "zshrc")
         (home / ".zshenv").symlink_to(old_checkout / "zsh" / "zshenv")
         (home / ".p10k.zsh").symlink_to(old_checkout / "p10k.zsh")
@@ -201,8 +304,8 @@ class TestStaleZshLinkCleanup:
     def test_restores_pre_term_public_backup(self, tmp_path):
         """The .bak made when the zsh link was first created comes back."""
         repo_root, home = _scaffold_repo(tmp_path)
-
         old_checkout = tmp_path / "old-checkout"
+        _make_old_term_public_checkout(old_checkout)
         (home / ".zshrc").symlink_to(old_checkout / "zsh" / "zshrc")
         (home / ".zshrc.bak").write_text("# my original zshrc\n")
 
@@ -211,6 +314,32 @@ class TestStaleZshLinkCleanup:
         assert result.returncode == 0
         assert not (home / ".zshrc").is_symlink()
         assert (home / ".zshrc").read_text() == "# my original zshrc\n"
+
+    def test_keeps_foreign_link_with_warning(self, tmp_path):
+        """A live link into a non-term-public dotfiles repo is never removed."""
+        repo_root, home = _scaffold_repo(tmp_path)
+        foreign = tmp_path / "unrelated-dotfiles"
+        (foreign / "zsh").mkdir(parents=True)
+        (foreign / "zsh" / "zshrc").write_text("# someone else's zshrc\n")
+        (home / ".zshrc").symlink_to(foreign / "zsh" / "zshrc")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0
+        assert (home / ".zshrc").is_symlink()
+        assert (home / ".zshrc").read_text() == "# someone else's zshrc\n"
+        assert "could not be verified" in result.stderr
+
+    def test_keeps_dangling_link_with_warning(self, tmp_path):
+        """A dangling link (deleted checkout) has no provable provenance."""
+        repo_root, home = _scaffold_repo(tmp_path)
+        (home / ".zshrc").symlink_to(tmp_path / "deleted-checkout" / "zsh" / "zshrc")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0
+        assert os.path.lexists(home / ".zshrc")
+        assert "could not be verified" in result.stderr
 
     def test_leaves_foreign_zshrc_alone(self, tmp_path):
         """A user-managed .zshrc (not a term-public link) is untouched."""

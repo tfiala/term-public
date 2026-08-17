@@ -48,6 +48,16 @@ if [[ -f "${TERM_PUBLIC_LOCAL_DIR}/env.local" ]]; then
   source "${TERM_PUBLIC_LOCAL_DIR}/env.local"
 fi
 
+# Source the user's prior .bashrc if setup.sh backed it up (mirrors the
+# old zshenv.bak pattern), so pre-existing config stays effective, not
+# just archived.  Runs before the prompt setup below so term-public
+# chrome wins where the two conflict.  The guard prevents re-entry when
+# the backup itself sources ~/.bashrc.
+if [[ -z "${_TERM_PUBLIC_BASHRC_BAK:-}" && -f "$HOME/.bashrc.bak" ]]; then
+  _TERM_PUBLIC_BASHRC_BAK=1
+  source "$HOME/.bashrc.bak"
+fi
+
 # Everything below is interactive-only chrome.
 case $- in *i*) ;; *) return ;; esac
 

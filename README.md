@@ -65,9 +65,11 @@ scripts/start-shell-preview.sh --ghostty  # in a fresh Ghostty window
    switch the login shell to Homebrew bash (prompts for your password for
    `/etc/shells` and `chsh`).
 2. Run `./setup.sh` from the repo root to link config files into place.
-   It also unlinks any zsh-era symlinks (`~/.zshrc`, `~/.zshenv`,
-   `~/.p10k.zsh`) left by earlier versions of this repo, restoring `.bak`
-   backups where they exist.
+   It also unlinks zsh-era symlinks (`~/.zshrc`, `~/.zshenv`,
+   `~/.p10k.zsh`) left by earlier versions of this repo — only when the
+   link target is verifiably a term-public checkout — restoring `.bak`
+   backups where they exist, and prints migration guidance for any
+   remaining zsh config (bash does not read it).
 3. Restart Ghostty and open a new shell.
 
 ## Per-Machine Overlay
@@ -95,9 +97,12 @@ theme that stays readable under bright ambient light and glare. Ghostty
 follows the macOS system appearance and restyles all live windows instantly,
 including everything inside tmux sessions.
 
-The Starship palette in `starship/starship.toml` is chosen to stay legible
-on both backgrounds — mid-range 256-color values, no bright yellows or pale
-blues. Keep that constraint when changing prompt colors.
+The Starship palette in `starship/starship.toml` uses only named ANSI
+colors (`green`, `bright-black`, ...), never numeric 256-cube or hex
+values: each Ghostty theme maps ANSI 0-15 against its own background, so
+the prompt adapts to day and night automatically. Keep that constraint
+when changing prompt colors — a fixed 256-cube value that looks fine on
+one background is the washed-out case on the other.
 
 Switch modes with:
 
