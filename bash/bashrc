@@ -78,10 +78,31 @@ case $- in
 esac
 
 # --- History ------------------------------------------------------------------
-shopt -s histappend checkwinsize
+# Parity with the zsh era, where history behavior came from oh-my-zsh's
+# lib/history.zsh:
+#   extended_history                     -> HISTTIMEFORMAT (timestamps
+#                                           persisted in $HISTFILE)
+#   hist_ignore_dups + hist_ignore_space -> HISTCONTROL=ignoreboth
+#   hist_verify                          -> shopt histverify
+#   share_history                        -> per-prompt sync below
+shopt -s histappend histverify checkwinsize
 HISTSIZE=100000
 HISTFILESIZE=200000
 HISTCONTROL=ignoreboth
+HISTTIMEFORMAT='%F %T '
+
+# share_history equivalent: after every command, append it to $HISTFILE
+# and reload the merged file, so concurrent shells (tmux panes) see each
+# other's commands live and a killed pane loses nothing.  Prepended so a
+# PROMPT_COMMAND from .bashrc.bak stays effective; starship init below
+# folds the whole PROMPT_COMMAND into its own precmd, so the sync keeps
+# running once the prompt takes over.
+_term_public_history_sync() {
+  history -a
+  history -c
+  history -r
+}
+PROMPT_COMMAND="_term_public_history_sync${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 
 # --- Completion (Homebrew bash-completion@2) ----------------------------------
 for _tp_bc in \
