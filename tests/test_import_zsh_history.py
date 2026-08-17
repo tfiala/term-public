@@ -4,6 +4,7 @@ history import that accompanies the bash cutover's history parity."""
 import importlib
 import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -91,6 +92,56 @@ class TestImport:
         zsh, bash = self._seed(tmp_path, bash_text="existing")
         assert importer.import_history(zsh, bash) == 0
         assert bash.read_text() == "existing\n#1700000000\necho imported\n"
+
+    def test_backup_and_new_destination_created_private(self, tmp_path):
+        """History can contain secrets: with no pre-existing destination,
+        both new files must be 0600 regardless of umask."""
+        zsh, bash = self._seed(tmp_path, bash_text=None)
+        old_umask = os.umask(0o022)
+        try:
+            assert importer.import_history(zsh, bash) == 0
+        finally:
+            os.umask(old_umask)
+        backup = tmp_path / (".bash_history" + importer.BACKUP_SUFFIX)
+        assert stat.S_IMODE(bash.stat().st_mode) == 0o600
+        assert stat.S_IMODE(backup.stat().st_mode) == 0o600
+
+    def test_existing_destination_mode_untouched_backup_private(self, tmp_path):
+        """An existing destination keeps its mode (never loosened); the
+        backup of it is still created 0600."""
+        zsh, bash = self._seed(tmp_path)
+        bash.chmod(0o600)
+        old_umask = os.umask(0o022)
+        try:
+            assert importer.import_history(zsh, bash) == 0
+        finally:
+            os.umask(old_umask)
+        backup = tmp_path / (".bash_history" + importer.BACKUP_SUFFIX)
+        assert stat.S_IMODE(bash.stat().st_mode) == 0o600
+        assert stat.S_IMODE(backup.stat().st_mode) == 0o600
+
+    def test_concurrent_append_survives_import(self, tmp_path, monkeypatch):
+        """A `history -a` from a live shell that lands between the
+        pre-import snapshot and the final write must not be discarded.
+        The interleave fires deterministically when the importer opens
+        the destination for its append."""
+        zsh, bash = self._seed(tmp_path)
+        real_os_open = os.open
+
+        def interleaving_open(path, flags, *args, **kwargs):
+            if Path(path) == bash and flags & os.O_APPEND:
+                with open(bash, "ab") as f:
+                    f.write(b"concurrent_entry\n")
+            return real_os_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(importer.os, "open", interleaving_open)
+        assert importer.import_history(zsh, bash) == 0
+        content = bash.read_text()
+        assert "concurrent_entry" in content
+        assert "echo imported" in content
+        # The snapshot backup predates the concurrent append by design.
+        backup = tmp_path / (".bash_history" + importer.BACKUP_SUFFIX)
+        assert backup.read_text() == "existing\n"
 
     def test_second_run_refuses(self, tmp_path):
         zsh, bash = self._seed(tmp_path)

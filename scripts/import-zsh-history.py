@@ -23,6 +23,7 @@ while that backup exists — delete it to force a re-import.
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -110,12 +111,23 @@ def import_history(zsh_path: Path, bash_path: Path) -> int:
         return 1
 
     existing = bash_path.read_bytes() if bash_path.is_file() else b""
-    backup.write_bytes(existing)
+    # History can contain private commands, so the backup is created 0600
+    # regardless of umask; O_EXCL also makes the done-marker check above
+    # race-safe.
+    fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(existing)
 
     converted = render_bash_history(entries).encode("utf-8")
     if existing and not existing.endswith(b"\n"):
-        existing += b"\n"
-    bash_path.write_bytes(existing + converted)
+        converted = b"\n" + converted
+    # Append via O_APPEND, never read-modify-replace: a `history -a` from
+    # a live shell between the snapshot above and this write must survive.
+    # The 0600 mode applies only if the file is being created; an existing
+    # destination keeps its current mode.
+    fd = os.open(bash_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(converted)
 
     print(f"Imported {len(entries)} entries from {zsh_path} into {bash_path}")
     print(f"Backup of the previous bash history: {backup}")
