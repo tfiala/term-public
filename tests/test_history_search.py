@@ -34,15 +34,43 @@ INSTALLED_FZF_KEYBINDINGS = next(
     (p for p in FZF_KEYBINDING_PATHS if Path(p).is_file()), None)
 
 
-def _interactive(home, snippet):
-    return subprocess.run(
-        ["bash", "--rcfile", str(BASHRC), "-i", "-c", snippet],
-        capture_output=True,
-        text=True,
+def _pty_session(home, keystrokes, timeout=15):
+    """Type keystrokes into an interactive shell under a real pty and
+    return everything it printed.  A pty is load-bearing, not cosmetic:
+    without a controlling terminal Linux bash makes `bind` a no-op
+    ("line editing not enabled"), so the bashrc's keybindings only exist
+    in shells a tty-less test would never see."""
+    import pty
+
+    master, slave = pty.openpty()
+    proc = subprocess.Popen(
+        ["bash", "--rcfile", str(BASHRC), "-i"],
+        stdin=slave, stdout=slave, stderr=slave,
         env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
              "HOME": str(home), "TERM": "xterm-256color"},
-        timeout=15,
+        start_new_session=True,
     )
+    os.close(slave)
+    os.write(master, keystrokes.encode())
+    out = bytearray()
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([master], [], [], 0.2)
+            if ready:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:  # child exited, pty torn down
+                    break
+                if not chunk:
+                    break
+                out += chunk
+            elif proc.poll() is not None:
+                break
+    finally:
+        os.close(master)
+        proc.wait(timeout=5)
+    return out.decode(errors="replace")
 
 
 class TestPrefixSearch:
@@ -60,11 +88,11 @@ class TestPrefixSearch:
 
     @pytest.mark.parametrize("keymap", ["vi-insert", "vi-command"])
     def test_arrows_bound_in_keymap(self, tmp_path, keymap):
-        r = _interactive(tmp_path, f"bind -m {keymap} -p")
-        assert r.returncode == 0
+        out = _pty_session(
+            tmp_path, f"bind -m {keymap} -p | grep history-search-\rexit\r")
         for seq, func in self.ARROW_BINDINGS:
-            assert f'"{seq}": {func}' in r.stdout, (
-                f"{seq} not bound to {func} in {keymap}")
+            assert f'"{seq}": {func}' in out, (
+                f"{seq} not bound to {func} in {keymap}:\n{out}")
 
     def test_up_arrow_executes_prefix_match(self, tmp_path):
         """End-to-end under a pty: with `echo` typed, Up must recall the
@@ -76,41 +104,8 @@ class TestPrefixSearch:
         (tmp_path / ".bash_history").write_text(
             "echo tp_ok_$((40+2))\n"
             "true tp_last_entry\n")
-        out = self._pty_session(tmp_path, "echo\x1b[A\rexit\r")
+        out = _pty_session(tmp_path, "echo\x1b[A\rexit\r")
         assert "tp_ok_42" in out, f"prefix search did not recall/execute:\n{out}"
-
-    def _pty_session(self, home, keystrokes, timeout=15):
-        import pty
-
-        master, slave = pty.openpty()
-        proc = subprocess.Popen(
-            ["bash", "--rcfile", str(BASHRC), "-i"],
-            stdin=slave, stdout=slave, stderr=slave,
-            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                 "HOME": str(home), "TERM": "xterm-256color"},
-            start_new_session=True,
-        )
-        os.close(slave)
-        os.write(master, keystrokes.encode())
-        out = bytearray()
-        deadline = time.monotonic() + timeout
-        try:
-            while time.monotonic() < deadline:
-                ready, _, _ = select.select([master], [], [], 0.2)
-                if ready:
-                    try:
-                        chunk = os.read(master, 4096)
-                    except OSError:  # child exited, pty torn down
-                        break
-                    if not chunk:
-                        break
-                    out += chunk
-                elif proc.poll() is not None:
-                    break
-        finally:
-            os.close(master)
-            proc.wait(timeout=5)
-        return out.decode(errors="replace")
 
 
 class TestFzfKeybindings:
@@ -147,14 +142,16 @@ class TestFzfKeybindings:
     def test_widgets_bound_after_sourcing_bashrc(self, tmp_path):
         """With fzf present, an interactive shell ends up with all three
         widgets live in the vi keymaps (bash>=4 binds Ctrl-R/Ctrl-T via
-        bind -x; Alt-C is a macro chaining to the emacs-keymap widget)."""
-        r = _interactive(
+        bind -x; Alt-C is a macro chaining to the emacs-keymap widget).
+        None of the asserted strings appear in the typed commands, so
+        terminal echo cannot satisfy them."""
+        out = _pty_session(
             tmp_path,
-            "bind -m vi-insert -X; bind -m vi-command -X; "
-            "bind -m vi-insert -s; bind -m emacs-standard -s")
-        assert r.returncode == 0
-        for keymap_dump in (r.stdout,):
-            assert "__fzf_history__" in keymap_dump   # Ctrl-R
-            assert "fzf-file-widget" in keymap_dump   # Ctrl-T
-            assert "__fzf_cd__" in keymap_dump        # Alt-C target
-        assert re.search(r'^"\\ec": ', r.stdout, re.M)  # Alt-C in vi-insert
+            "bind -m vi-insert -X\r"
+            "bind -m vi-command -X\r"
+            "bind -m vi-insert -s\r"
+            "bind -m emacs-standard -s\rexit\r")
+        assert "__fzf_history__" in out   # Ctrl-R
+        assert "fzf-file-widget" in out   # Ctrl-T
+        assert "__fzf_cd__" in out        # Alt-C target widget
+        assert '"\\ec": ' in out          # Alt-C bound in a vi keymap
