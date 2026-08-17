@@ -30,8 +30,7 @@ backup_and_link_file() {
       ln -s "$1" "$2"
     else
       # An identical regular file must still become a symlink, or it
-      # silently freezes while the repo moves on (a copied ~/bin/hive sat
-      # stale from May while scripts/hive.py advanced). No backup needed —
+      # silently freezes while the repo moves on. No backup needed —
       # the content is identical.
       rm -f "$2"
       ln -s "$1" "$2"
@@ -39,6 +38,52 @@ backup_and_link_file() {
   else
     ln -s "$1" "$2"
   fi
+}
+
+# backup_and_copy_file
+# $1 - source path
+# $2 - destination path
+# Executables installed into ~/bin are copies, never symlinks: other
+# tooling also installs them by copying (infra/home-dc
+# scripts/copy-scripts.py fetches hive from this repo's main), and a
+# symlink lets that write travel through into this checkout's scripts/,
+# overwriting the canonical source (seen 2026-08-16, when a copy of main
+# clobbered an in-review branch). The cost is that a copy goes stale
+# until the next setup.sh run — accepted for ~/bin; dotfiles stay
+# symlinked via backup_and_link_file above.
+backup_and_copy_file() {
+  mkdir -p "$(dirname "$2")"
+
+  if [[ -L "$2" ]]; then
+    if [[ -e "$2" ]] && ! [[ "$2" -ef "$1" ]]; then
+      # Live link to something else — preserve it; the link itself
+      # moves, so the backup keeps pointing at the user's real file.
+      rm -rf "$2.bak"
+      mv "$2" "$2.bak"
+    else
+      # A link resolving to our own source (the legacy install shape,
+      # in any spelling) preserves nothing worth backing up, and a
+      # dangling link preserves nothing at all. Remove either.
+      unlink "$2"
+    fi
+  elif [[ -e "$2" ]]; then
+    if [[ "$1" -ef "$2" ]]; then
+      # A hard link to the source is another write-through alias — and
+      # backing it up would keep the shared inode alive under a new
+      # name. Remove it and copy fresh; the content is our own.
+      rm -f "$2"
+    elif [[ ! -d "$2" ]] && cmp -s "$1" "$2"; then
+      # Same content already installed — still normalize the executable
+      # bit, which a bare copy may have lost.
+      chmod u+x "$2"
+      return 0
+    else
+      rm -rf "$2.bak"
+      mv "$2" "$2.bak"
+    fi
+  fi
+  cp "$1" "$2"
+  chmod u+x "$2"
 }
 
 # _repo_identity
@@ -111,9 +156,9 @@ backup_and_link_file "$ROOT_DIR/bash/bash_profile" "$HOME/.bash_profile"
 backup_and_link_file "$ROOT_DIR/bash/bashrc" "$HOME/.bashrc"
 backup_and_link_file "$ROOT_DIR/bash/inputrc" "$HOME/.inputrc"
 backup_and_link_file "$ROOT_DIR/starship/starship.toml" "$CONFIG_HOME/starship.toml"
-backup_and_link_file "$ROOT_DIR/scripts/hive.py" "$HOME/bin/hive"
-backup_and_link_file "$ROOT_DIR/scripts/hive-ci-popup.py" "$HOME/bin/hive-ci-popup"
-backup_and_link_file "$ROOT_DIR/scripts/term-theme" "$HOME/bin/term-theme"
+backup_and_copy_file "$ROOT_DIR/scripts/hive.py" "$HOME/bin/hive"
+backup_and_copy_file "$ROOT_DIR/scripts/hive-ci-popup.py" "$HOME/bin/hive-ci-popup"
+backup_and_copy_file "$ROOT_DIR/scripts/term-theme" "$HOME/bin/term-theme"
 backup_and_link_file "$ROOT_DIR/tmux/tmux.conf" "$HOME/.tmux/tmux.conf"
 backup_and_link_file "$ROOT_DIR/tmux/tmux.conf" "$HOME/.tmux.conf"
 

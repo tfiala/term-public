@@ -73,8 +73,8 @@ def test_backs_up_changed_file(tmp_path):
 
 
 def test_replaces_identical_file_with_symlink(tmp_path):
-    # Leaving an identical copy in place lets it silently go stale as the
-    # repo moves on (bit ~/bin/hive); it must become a symlink. No backup
+    # Leaving an identical copy in place lets a linked dotfile silently go
+    # stale as the repo moves on; it must become a symlink. No backup
     # is taken since no content would be lost.
     src = tmp_path / "source.txt"
     src.write_text("same")
@@ -159,6 +159,200 @@ def test_backs_up_directory(tmp_path):
 _SCAFFOLD_ORIGIN = "git@github.com:example/term-public.git"
 
 
+# --- backup_and_copy_file unit tests ------------------------------------------
+
+
+def _extract_copy_function() -> str:
+    with open(SETUP_SH) as f:
+        text = f.read()
+    match = re.search(
+        r"^(backup_and_copy_file\(\) \{.*?^})", text, re.MULTILINE | re.DOTALL)
+    assert match, "Could not find backup_and_copy_file in setup.sh"
+    return match.group(1)
+
+
+_COPY_FUNCTION_DEF = _extract_copy_function()
+
+
+def run_backup_and_copy(source: str, dest: str,
+                        umask: int | None = None) -> subprocess.CompletedProcess:
+    script = _COPY_FUNCTION_DEF + '\nbackup_and_copy_file "$1" "$2"'
+    if umask is not None:
+        script = f'umask {umask:03o}\n' + script
+    return subprocess.run(
+        ["bash", "--norc", "-c", script, "bash", source, dest],
+        capture_output=True,
+        text=True,
+    )
+
+
+def _assert_installed_copy(src: Path, dest: Path):
+    assert dest.is_file() and not dest.is_symlink()
+    assert os.access(dest, os.X_OK)
+    assert dest.read_bytes() == src.read_bytes()
+
+
+def test_copy_creates_regular_file_for_new_destination(tmp_path):
+    src = tmp_path / "source.txt"
+    src.write_text("content")
+    dest = tmp_path / "bin" / "tool"
+
+    result = run_backup_and_copy(str(src), str(dest))
+
+    assert result.returncode == 0
+    _assert_installed_copy(src, dest)
+    # The decisive property: writing the copy must not reach the source.
+    dest.write_text("clobbered")
+    assert src.read_text() == "content"
+
+
+def test_copy_fresh_file_executable_under_restrictive_umask(tmp_path):
+    """A caller umask that masks bare +x must not prevent user execute.
+
+    The destination parent already exists so this isolates file-mode
+    normalization from mkdir's separate umask behavior.
+    """
+    src = tmp_path / "source.txt"
+    src.write_text("content")
+    dest = tmp_path / "tool"
+
+    result = run_backup_and_copy(str(src), str(dest), umask=0o111)
+
+    assert result.returncode == 0
+    _assert_installed_copy(src, dest)
+
+
+def test_copy_identical_noop_normalizes_executable_bit(tmp_path):
+    """An identical destination is left in place (same inode) but must
+    still come out executable under a restrictive umask — a bare copy may
+    have lost the bit."""
+    src = tmp_path / "source.txt"
+    src.write_text("same")
+    dest = tmp_path / "dest.txt"
+    dest.write_text("same")
+    dest.chmod(0o644)
+    ino_before = os.stat(dest).st_ino
+
+    result = run_backup_and_copy(str(src), str(dest), umask=0o111)
+
+    assert result.returncode == 0
+    assert os.stat(dest).st_ino == ino_before
+    assert os.access(dest, os.X_OK)
+    assert not (tmp_path / "dest.txt.bak").exists()
+
+
+def test_copy_replaces_hard_link_alias_to_source(tmp_path):
+    """A hard link to the source passes cmp but is still a write-through
+    alias: it must be replaced by an independent inode, with no hard-link
+    backup keeping the shared inode alive."""
+    src = tmp_path / "source.txt"
+    src.write_text("content")
+    dest = tmp_path / "dest.txt"
+    os.link(src, dest)
+    assert os.stat(dest).st_ino == os.stat(src).st_ino
+
+    result = run_backup_and_copy(str(src), str(dest))
+
+    assert result.returncode == 0
+    _assert_installed_copy(src, dest)
+    assert os.stat(dest).st_ino != os.stat(src).st_ino
+    assert not (tmp_path / "dest.txt.bak").exists()
+    dest.write_text("clobbered")
+    assert src.read_text() == "content"
+
+
+def test_copy_backs_up_changed_file(tmp_path):
+    src = tmp_path / "source.txt"
+    src.write_text("new content")
+    dest = tmp_path / "dest.txt"
+    dest.write_text("old content")
+
+    result = run_backup_and_copy(str(src), str(dest))
+
+    assert result.returncode == 0
+    _assert_installed_copy(src, dest)
+    backup = tmp_path / "dest.txt.bak"
+    assert backup.read_text() == "old content"
+
+
+def test_copy_migrates_symlink_to_source(tmp_path):
+    """The legacy install shape — a symlink to our own source — becomes
+    a copy without .bak churn."""
+    src = tmp_path / "source.txt"
+    src.write_text("content")
+    dest = tmp_path / "dest.txt"
+    dest.symlink_to(src)
+
+    result = run_backup_and_copy(str(src), str(dest))
+
+    assert result.returncode == 0
+    _assert_installed_copy(src, dest)
+    assert not (tmp_path / "dest.txt.bak").exists()
+
+
+def test_copy_migrates_relative_symlink_to_source(tmp_path):
+    """A relative link resolving to the source is still our own install
+    shape — identity is by resolution (-ef), not readlink text."""
+    src = tmp_path / "source.txt"
+    src.write_text("content")
+    dest = tmp_path / "dest.txt"
+    os.symlink("source.txt", dest)
+
+    result = run_backup_and_copy(str(src), str(dest))
+
+    assert result.returncode == 0
+    _assert_installed_copy(src, dest)
+    assert not (tmp_path / "dest.txt.bak").exists()
+
+
+def test_copy_replaces_dangling_symlink(tmp_path):
+    src = tmp_path / "source.txt"
+    src.write_text("content")
+    dest = tmp_path / "dest.txt"
+    dest.symlink_to(tmp_path / "nonexistent")
+
+    result = run_backup_and_copy(str(src), str(dest))
+
+    assert result.returncode == 0
+    _assert_installed_copy(src, dest)
+    assert not (tmp_path / "dest.txt.bak").exists()
+
+
+def test_copy_preserves_live_foreign_symlink_as_bak(tmp_path):
+    """A destination symlink into another location is preserved: the link
+    itself becomes the .bak, still pointing at the foreign file."""
+    foreign = tmp_path / "foreign.txt"
+    foreign.write_text("foreign content")
+    src = tmp_path / "source.txt"
+    src.write_text("content")
+    dest = tmp_path / "dest.txt"
+    dest.symlink_to(foreign)
+
+    result = run_backup_and_copy(str(src), str(dest))
+
+    assert result.returncode == 0
+    _assert_installed_copy(src, dest)
+    backup = tmp_path / "dest.txt.bak"
+    assert backup.is_symlink()
+    assert backup.read_text() == "foreign content"
+
+
+def test_copy_backs_up_directory(tmp_path):
+    src = tmp_path / "source.txt"
+    src.write_text("content")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "inner.txt").write_text("inner")
+
+    result = run_backup_and_copy(str(src), str(dest))
+
+    assert result.returncode == 0
+    _assert_installed_copy(src, dest)
+    backup = tmp_path / "dest.bak"
+    assert backup.is_dir()
+    assert (backup / "inner.txt").read_text() == "inner"
+
+
 def _git_init_with_origin(path, url):
     """Make path a git repo whose origin is url (no commits needed)."""
     subprocess.run(["git", "init", "-q", str(path)], check=True)
@@ -192,6 +386,7 @@ def _scaffold_repo(tmp_path):
     (repo_root / "tmux" / "tmux.conf").write_text("# tmux\n")
     (repo_root / "scripts" / "hive.py").write_text("#!/usr/bin/env python3\n")
     (repo_root / "scripts" / "hive-ci-popup.py").write_text("#!/usr/bin/env python3\n")
+    (repo_root / "scripts" / "term-theme").write_text("#!/usr/bin/env bash\n")
 
     return repo_root, home
 
@@ -229,7 +424,47 @@ def test_setup_creates_local_overlay_skeleton(tmp_path):
     assert (home / ".bashrc").is_symlink()
     assert (home / ".inputrc").is_symlink()
     assert (home / ".config" / "starship.toml").is_symlink()
-    assert (home / "bin" / "hive").is_symlink()
+    assert (home / "bin" / "hive").is_file()
+    assert not (home / "bin" / "hive").is_symlink()
+
+
+def test_setup_installs_bin_scripts_as_copies(tmp_path):
+    """~/bin executables are copies, not symlinks — an external installer
+    (infra/home-dc copy-scripts.py) overwriting ~/bin must not write
+    through into the repo's canonical scripts/ (2026-08-16 incident)."""
+    repo_root, home = _scaffold_repo(tmp_path)
+
+    result = _run_setup(repo_root, home)
+
+    assert result.returncode == 0
+    for name, src in [("hive", "hive.py"),
+                      ("hive-ci-popup", "hive-ci-popup.py"),
+                      ("term-theme", "term-theme")]:
+        dest = home / "bin" / name
+        assert dest.is_file() and not dest.is_symlink()
+        assert os.access(dest, os.X_OK)
+        assert dest.read_bytes() == (repo_root / "scripts" / src).read_bytes()
+        # The decisive property: writing the installed copy must not
+        # reach the repo source.
+        dest.write_text("clobbered by external installer\n")
+        assert (repo_root / "scripts" / src).read_text() \
+            != "clobbered by external installer\n"
+
+
+def test_setup_migrates_bin_symlink_to_copy(tmp_path):
+    """A legacy symlinked ~/bin/hive from an earlier setup.sh becomes a
+    copy, without .bak churn."""
+    repo_root, home = _scaffold_repo(tmp_path)
+    bin_dir = home / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "hive").symlink_to(repo_root / "scripts" / "hive.py")
+
+    result = _run_setup(repo_root, home)
+
+    assert result.returncode == 0
+    dest = bin_dir / "hive"
+    assert dest.is_file() and not dest.is_symlink()
+    assert not (bin_dir / "hive.bak").exists()
 
 
 def test_setup_backs_up_existing_bashrc(tmp_path):
