@@ -54,6 +54,68 @@ report() {
   esac
 }
 
+# Record the mode for consumers that cannot query the macOS appearance at
+# the right moment (the p10k palette watcher re-reads this at each prompt).
+persist_mode() {
+  local dir=${XDG_CACHE_HOME:-$HOME/.cache}/term-theme
+  mkdir -p "$dir" 2>/dev/null && printf '%s\n' "$1" >"$dir/mode" || true
+}
+
+# Claude Code reads its theme from ~/.claude/settings.json (the /config
+# preferences, theme included, moved there in 2.1.119 — an edit to the
+# legacy ~/.claude.json no longer reaches current versions), so flip the
+# setting there for future sessions; running sessions repaint after a
+# restart or an in-app /theme. When settings.json has no theme yet, the
+# variant choice is seeded from the legacy file so a pre-migration
+# daltonized/ansi preference carries over. Leaves auto/custom themes alone
+# (the supported `auto` theme already follows the terminal appearance by
+# itself). Best-effort: silently a no-op without a ~/.claude dir or
+# python3, and never touches a file it cannot parse.
+sync_claude_theme() {
+  local mode=$1 dir=$HOME/.claude
+  [[ -d $dir ]] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$dir/settings.json" "$HOME/.claude.json" "$mode" <<'EOF' 2>/dev/null || true
+import json
+import os
+import sys
+
+path, legacy, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg = {}
+if os.path.exists(path):
+    with open(path) as f:
+        cfg = json.load(f)
+current = cfg.get('theme')
+if current is None:
+    try:
+        with open(legacy) as f:
+            current = json.load(f).get('theme')
+    except (OSError, ValueError):
+        pass
+if current is None:
+    current = 'dark'
+if current.startswith(('auto', 'custom:')):
+    sys.exit(0)  # already self-adapting, or a deliberate custom theme
+suffix = next(
+    (s for s in ('-daltonized', '-ansi') if current.endswith(s)), '')
+new = ('light' if mode == 'day' else 'dark') + suffix
+if new != cfg.get('theme'):
+    cfg['theme'] = new
+    with open(path, 'w') as f:
+        json.dump(cfg, f, indent=2)
+EOF
+}
+
+# Live hive tmux sessions carry mode-specific status-bar palettes baked in
+# at session creation; ask hive to re-apply them for the new mode. No-op
+# without tmux, a running server, or hive.
+restyle_hive_tmux() {
+  command -v hive >/dev/null 2>&1 || return 0
+  command -v tmux >/dev/null 2>&1 || return 0
+  tmux ls >/dev/null 2>&1 || return 0
+  hive tmux restyle >/dev/null 2>&1 || true
+}
+
 main() {
   if ! command -v osascript >/dev/null 2>&1; then
     echo "term-theme: requires macOS (osascript not found)" >&2
@@ -76,7 +138,15 @@ main() {
       exit 2
       ;;
   esac
-  report "$state"
+
+  local mode
+  mode=$(report "$state")
+  persist_mode "$mode"
+  if [[ $action != status ]]; then
+    sync_claude_theme "$mode"
+    restyle_hive_tmux
+  fi
+  printf '%s\n' "$mode"
 }
 
 main "$@"

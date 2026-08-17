@@ -14,6 +14,13 @@ backup_and_link_file() {
       rm -rf "$2.bak"
       mv "$2" "$2.bak"
       ln -s "$1" "$2"
+    else
+      # An identical regular file must still become a symlink, or it
+      # silently freezes while the repo moves on (a copied ~/bin/hive sat
+      # stale from May while scripts/hive.py advanced). No backup needed —
+      # the content is identical.
+      rm -f "$2"
+      ln -s "$1" "$2"
     fi
   else
     ln -s "$1" "$2"

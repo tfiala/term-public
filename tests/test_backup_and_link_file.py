@@ -72,7 +72,10 @@ def test_backs_up_changed_file(tmp_path):
     assert dest.is_symlink()
 
 
-def test_leaves_same_file_unchanged(tmp_path):
+def test_replaces_identical_file_with_symlink(tmp_path):
+    # Leaving an identical copy in place lets it silently go stale as the
+    # repo moves on (bit ~/bin/hive); it must become a symlink. No backup
+    # is taken since no content would be lost.
     src = tmp_path / "source.txt"
     src.write_text("same")
     dest = tmp_path / "dest.txt"
@@ -81,8 +84,9 @@ def test_leaves_same_file_unchanged(tmp_path):
     result = run_backup_and_link(str(src), str(dest))
 
     assert result.returncode == 0
-    assert not dest.is_symlink()
+    assert dest.is_symlink()
     assert dest.read_text() == "same"
+    assert not (tmp_path / "dest.txt.bak").exists()
 
 
 def test_backs_up_directory(tmp_path):

@@ -30,21 +30,12 @@
 
   typeset -g POWERLEVEL9K_MODE=nerdfont-complete
   typeset -g POWERLEVEL9K_PROMPT_ADD_NEWLINE=true
-  typeset -g POWERLEVEL9K_MULTILINE_FIRST_PROMPT_PREFIX='%240F╭─'
-  typeset -g POWERLEVEL9K_MULTILINE_NEWLINE_PROMPT_PREFIX='%240F├─'
-  typeset -g POWERLEVEL9K_MULTILINE_LAST_PROMPT_PREFIX='%240F╰─'
-  typeset -g POWERLEVEL9K_BACKGROUND=236
 
-  typeset -g POWERLEVEL9K_DIR_FOREGROUND=31
   typeset -g POWERLEVEL9K_SHORTEN_STRATEGY=truncate_to_unique
   typeset -g POWERLEVEL9K_TIME_FORMAT='%D{%H:%M}'
-  typeset -g POWERLEVEL9K_TIME_FOREGROUND=109
 
   typeset -g POWERLEVEL9K_STATUS_OK=false
   typeset -g POWERLEVEL9K_COMMAND_EXECUTION_TIME_THRESHOLD=1
-  typeset -g POWERLEVEL9K_VCS_CLEAN_FOREGROUND=76
-  typeset -g POWERLEVEL9K_VCS_UNTRACKED_FOREGROUND=220
-  typeset -g POWERLEVEL9K_VCS_MODIFIED_FOREGROUND=214
   typeset -g POWERLEVEL9K_VCS_BRANCH_ICON=$'\uF126 '
   typeset -g POWERLEVEL9K_VCS_UNTRACKED_ICON='?'
   typeset -g POWERLEVEL9K_VCS_DISABLE_GITSTATUS_FORMATTING=true
@@ -52,11 +43,126 @@
   typeset -g POWERLEVEL9K_VCS_LOADING_CONTENT_EXPANSION='${$((my_git_formatter(0)))+${my_git_format}}'
   typeset -g POWERLEVEL9K_VCS_{STAGED,UNSTAGED,UNTRACKED,CONFLICTED,COMMITS_AHEAD,COMMITS_BEHIND}_MAX_NUM=-1
 
-  typeset -g POWERLEVEL9K_PROMPT_CHAR_OK_VIINS_FOREGROUND=76
-  typeset -g POWERLEVEL9K_PROMPT_CHAR_ERROR_VIINS_FOREGROUND=196
   typeset -g POWERLEVEL9K_PROMPT_CHAR_OK_VIINS_CONTENT_EXPANSION='❯'
   typeset -g POWERLEVEL9K_PROMPT_CHAR_ERROR_VIINS_CONTENT_EXPANSION='❯'
 }
+
+# --- day / night palette ------------------------------------------------------
+# Ghostty's appearance-pair theme only remaps the 16 ANSI colors; the 256-color
+# cube these segments use is fixed, so the prompt must pick mode-appropriate
+# colors itself. The mode comes from the macOS appearance at startup;
+# `term-theme` records flips in $XDG_CACHE_HOME/term-theme/mode and a precmd
+# hook applies them at the next prompt (p10k hot reload picks up the changed
+# variables — do not set POWERLEVEL9K_DISABLE_HOT_RELOAD here).
+
+_term_public_p10k_state_file() {
+  print -r -- "${XDG_CACHE_HOME:-$HOME/.cache}/term-theme/mode"
+}
+
+_term_public_p10k_apply_palette() {
+  local mode=$1 frame
+  typeset -g _term_public_p10k_mode=$mode
+  if [[ $mode == day ]]; then
+    frame=245
+    typeset -g POWERLEVEL9K_BACKGROUND=254
+    typeset -g POWERLEVEL9K_DIR_FOREGROUND=24
+    typeset -g POWERLEVEL9K_TIME_FOREGROUND=66
+    typeset -g POWERLEVEL9K_VCS_CLEAN_FOREGROUND=28
+    typeset -g POWERLEVEL9K_VCS_UNTRACKED_FOREGROUND=94
+    typeset -g POWERLEVEL9K_VCS_MODIFIED_FOREGROUND=130
+    typeset -g POWERLEVEL9K_PROMPT_CHAR_OK_VIINS_FOREGROUND=28
+    typeset -g POWERLEVEL9K_PROMPT_CHAR_ERROR_VIINS_FOREGROUND=160
+    typeset -g _term_public_git_meta='%242F'
+    typeset -g _term_public_git_clean='%28F'
+    typeset -g _term_public_git_modified='%130F'
+    typeset -g _term_public_git_untracked='%25F'
+    typeset -g _term_public_git_conflicted='%160F'
+    typeset -g _term_public_git_loading='%246F'
+    typeset -g _term_public_hive_fg=25
+  else
+    frame=240
+    typeset -g POWERLEVEL9K_BACKGROUND=236
+    typeset -g POWERLEVEL9K_DIR_FOREGROUND=31
+    typeset -g POWERLEVEL9K_TIME_FOREGROUND=109
+    typeset -g POWERLEVEL9K_VCS_CLEAN_FOREGROUND=76
+    typeset -g POWERLEVEL9K_VCS_UNTRACKED_FOREGROUND=220
+    typeset -g POWERLEVEL9K_VCS_MODIFIED_FOREGROUND=214
+    typeset -g POWERLEVEL9K_PROMPT_CHAR_OK_VIINS_FOREGROUND=76
+    typeset -g POWERLEVEL9K_PROMPT_CHAR_ERROR_VIINS_FOREGROUND=196
+    typeset -g _term_public_git_meta='%246F'
+    typeset -g _term_public_git_clean='%76F'
+    typeset -g _term_public_git_modified='%178F'
+    typeset -g _term_public_git_untracked='%39F'
+    typeset -g _term_public_git_conflicted='%196F'
+    typeset -g _term_public_git_loading='%244F'
+    typeset -g _term_public_hive_fg=75
+  fi
+  typeset -g POWERLEVEL9K_MULTILINE_FIRST_PROMPT_PREFIX="%${frame}F╭─"
+  typeset -g POWERLEVEL9K_MULTILINE_NEWLINE_PROMPT_PREFIX="%${frame}F├─"
+  typeset -g POWERLEVEL9K_MULTILINE_LAST_PROMPT_PREFIX="%${frame}F╰─"
+}
+
+_term_public_p10k_detect_mode() {
+  if (( $+commands[defaults] )); then
+    if defaults read -g AppleInterfaceStyle >/dev/null 2>&1; then
+      print -r -- night
+    else
+      print -r -- day
+    fi
+    return
+  fi
+  local f mode
+  f=$(_term_public_p10k_state_file)
+  if [[ -r $f ]]; then
+    mode=$(<$f)
+    if [[ $mode == (day|night) ]]; then
+      print -r -- $mode
+      return
+    fi
+  fi
+  print -r -- night
+}
+
+# Only state-file writes after startup count, so a stale file never
+# overrides the appearance detected at startup. The startup snapshot is the
+# file's own (mtime, content) pair rather than the clock: mtime has only
+# second granularity, so a clock watermark would silently swallow a flip
+# written in the same second the shell started — the snapshot cannot,
+# because such a write still changes the mtime or the content.
+zmodload -F zsh/stat b:zstat 2>/dev/null
+typeset -g _term_public_p10k_mode_mtime=0
+typeset -g _term_public_p10k_mode_seen=
+() {
+  (( $+builtins[zstat] )) || return 0
+  local f
+  local -a st
+  f=$(_term_public_p10k_state_file)
+  if [[ -r $f ]] && zstat -A st +mtime -- $f 2>/dev/null; then
+    typeset -g _term_public_p10k_mode_mtime=$st[1]
+    typeset -g _term_public_p10k_mode_seen=$(<$f)
+  fi
+}
+
+_term_public_p10k_watch_mode() {
+  (( $+builtins[zstat] )) || return 0
+  local f mode
+  local -a st
+  f=$(_term_public_p10k_state_file)
+  { [[ -r $f ]] && zstat -A st +mtime -- $f 2>/dev/null } || return 0
+  mode=$(<$f)
+  if (( st[1] == _term_public_p10k_mode_mtime )) &&
+     [[ $mode == "$_term_public_p10k_mode_seen" ]]; then
+    return 0
+  fi
+  typeset -g _term_public_p10k_mode_mtime=$st[1]
+  typeset -g _term_public_p10k_mode_seen=$mode
+  [[ $mode == (day|night) && $mode != $_term_public_p10k_mode ]] || return 0
+  _term_public_p10k_apply_palette $mode
+}
+
+_term_public_p10k_apply_palette "$(_term_public_p10k_detect_mode)"
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd _term_public_p10k_watch_mode
 
 function my_git_formatter() {
   emulate -L zsh
@@ -67,17 +173,17 @@ function my_git_formatter() {
   fi
 
   if (( $1 )); then
-    local meta='%246F'
-    local clean='%76F'
-    local modified='%178F'
-    local untracked='%39F'
-    local conflicted='%196F'
+    local meta=$_term_public_git_meta
+    local clean=$_term_public_git_clean
+    local modified=$_term_public_git_modified
+    local untracked=$_term_public_git_untracked
+    local conflicted=$_term_public_git_conflicted
   else
-    local meta='%244F'
-    local clean='%244F'
-    local modified='%244F'
-    local untracked='%244F'
-    local conflicted='%244F'
+    local meta=$_term_public_git_loading
+    local clean=$_term_public_git_loading
+    local modified=$_term_public_git_loading
+    local untracked=$_term_public_git_loading
+    local conflicted=$_term_public_git_loading
   fi
 
   local res
@@ -125,7 +231,7 @@ functions -M my_git_formatter 2>/dev/null
 
 function prompt_hive_badge() {
   [[ -n "$HIVE_NAME" ]] || return
-  p10k segment -f "${HIVE_COLOR_256:-75}" -t "[${HIVE_NAME}-${HIVE_NUMBER}]"
+  p10k segment -f "${HIVE_COLOR_256:-${_term_public_hive_fg:-75}}" -t "[${HIVE_NAME}-${HIVE_NUMBER}]"
 }
 
 function instant_prompt_hive_badge() {
@@ -138,7 +244,7 @@ function prompt_hive_pr() {
   local pr=""
   [[ -f "$cache" ]] && pr=$(<"$cache")
   [[ -n "$pr" ]] || return
-  p10k segment -f 75 -t "#${pr}"
+  p10k segment -f "${_term_public_hive_fg:-75}" -t "#${pr}"
 }
 
 function instant_prompt_hive_pr() {

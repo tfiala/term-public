@@ -1979,32 +1979,86 @@ _TMUX_DIR = Path('/tmp/hive-tmux')
 # `rgb`/`c256` drive the `--list` output and the HIVE_COLOR_* env vars; the
 # hex fields (`primary`, `background`, `foreground`, `inactive_bg`) drive the
 # generated tmux status bar. Hex values are normative in ADR-0045.
+# The flat fields are the night (dark-background) variants; each `day`
+# sub-dict overrides them for light backgrounds (_palette_for_mode).
 _SHELL_PALETTE = [
     {'name': 'blue', 'rgb': '97;150;255', 'c256': '75',
      'primary': '#6196ff', 'background': '#1a2744',
-     'foreground': '#82aaff', 'inactive_bg': '#2c3e6b'},
+     'foreground': '#82aaff', 'inactive_bg': '#2c3e6b',
+     'day': {'rgb': '47;95;208', 'c256': '26',
+             'primary': '#2f5fd0', 'background': '#dce6fa',
+             'foreground': '#1c3f8f', 'inactive_bg': '#b9cdf2'}},
     {'name': 'teal', 'rgb': '45;212;168', 'c256': '43',
      'primary': '#2dd4a8', 'background': '#1a3a3a',
-     'foreground': '#56d6c2', 'inactive_bg': '#2c5e5e'},
+     'foreground': '#56d6c2', 'inactive_bg': '#2c5e5e',
+     'day': {'rgb': '15;158;126', 'c256': '30',
+             'primary': '#0f9e7e', 'background': '#d7f2ec',
+             'foreground': '#0b5f4c', 'inactive_bg': '#aee0d6'}},
     {'name': 'green', 'rgb': '102;187;106', 'c256': '114',
      'primary': '#66bb6a', 'background': '#1a3320',
-     'foreground': '#81c784', 'inactive_bg': '#2c5e3e'},
+     'foreground': '#81c784', 'inactive_bg': '#2c5e3e',
+     'day': {'rgb': '63;153;68', 'c256': '28',
+             'primary': '#3f9944', 'background': '#ddf0de',
+             'foreground': '#256b29', 'inactive_bg': '#b8dfba'}},
     {'name': 'purple', 'rgb': '179;157;219', 'c256': '141',
      'primary': '#b39ddb', 'background': '#2a1a44',
-     'foreground': '#ce93d8', 'inactive_bg': '#4a3a6e'},
+     'foreground': '#ce93d8', 'inactive_bg': '#4a3a6e',
+     'day': {'rgb': '126;87;194', 'c256': '97',
+             'primary': '#7e57c2', 'background': '#eae2f8',
+             'foreground': '#4d2d8c', 'inactive_bg': '#d2c3ef'}},
     {'name': 'amber', 'rgb': '255;202;40', 'c256': '220',
      'primary': '#ffca28', 'background': '#3a2e1a',
-     'foreground': '#ffd54f', 'inactive_bg': '#5e4e2e'},
+     'foreground': '#ffd54f', 'inactive_bg': '#5e4e2e',
+     'day': {'rgb': '184;134;11', 'c256': '136',
+             'primary': '#b8860b', 'background': '#f9efd2',
+             'foreground': '#7a5c00', 'inactive_bg': '#eeddad'}},
     {'name': 'rose', 'rgb': '239;83;80', 'c256': '203',
      'primary': '#ef5350', 'background': '#3a1a1a',
-     'foreground': '#ef9a9a', 'inactive_bg': '#5e2e2e'},
+     'foreground': '#ef9a9a', 'inactive_bg': '#5e2e2e',
+     'day': {'rgb': '211;47;47', 'c256': '160',
+             'primary': '#d32f2f', 'background': '#fbe0e0',
+             'foreground': '#8f1f1f', 'inactive_bg': '#f3bcbc'}},
     {'name': 'cyan', 'rgb': '38;198;218', 'c256': '44',
      'primary': '#26c6da', 'background': '#1a3344',
-     'foreground': '#80deea', 'inactive_bg': '#2c4e5e'},
+     'foreground': '#80deea', 'inactive_bg': '#2c4e5e',
+     'day': {'rgb': '9;151;173', 'c256': '31',
+             'primary': '#0997ad', 'background': '#d9f1f5',
+             'foreground': '#086274', 'inactive_bg': '#ace0e8'}},
     {'name': 'orange', 'rgb': '255;167;38', 'c256': '214',
      'primary': '#ffa726', 'background': '#3a2a1a',
-     'foreground': '#ffcc80', 'inactive_bg': '#5e4a2e'},
+     'foreground': '#ffcc80', 'inactive_bg': '#5e4a2e',
+     'day': {'rgb': '217;122;0', 'c256': '166',
+             'primary': '#d97a00', 'background': '#fbe9d4',
+             'foreground': '#8a4d00', 'inactive_bg': '#f2d3ab'}},
 ]
+
+
+def _appearance_mode() -> str:
+    """'day' or 'night' from the macOS appearance.
+
+    Falls back to the term-theme state file on non-macOS hosts, and to
+    night (the original, pre-day-mode look) when neither source answers.
+    """
+    try:
+        r = subprocess.run(['defaults', 'read', '-g', 'AppleInterfaceStyle'],
+                           capture_output=True, text=True)
+        return 'night' if r.returncode == 0 else 'day'
+    except OSError:
+        pass
+    state = Path(os.environ.get('XDG_CACHE_HOME',
+                                str(Path.home() / '.cache')))
+    try:
+        mode = (state / 'term-theme' / 'mode').read_text().strip()
+    except OSError:
+        return 'night'
+    return mode if mode in ('day', 'night') else 'night'
+
+
+def _palette_for_mode(color: dict, mode: str) -> dict:
+    """Resolve a palette entry to the given appearance mode."""
+    if mode != 'day':
+        return color
+    return {**color, **color['day']}
 
 
 def _hive_color(hive: Path) -> dict:
@@ -2119,6 +2173,29 @@ def _resolve_tmux_hive(hive_arg: str | None) -> Path | None:
 # --- tmux config generation ---------------------------------------------------
 
 
+def _style_option_pairs(color: dict) -> list[tuple[str, str, str]]:
+    """(comment, option, value) triples for the palette-derived session
+    styling — shared by the generated config and `hive tmux restyle` so
+    the two can never drift. An empty comment continues the prior group.
+    """
+    return [
+        ('Status bar (session-scoped)', 'status-style',
+         f'bg={color["background"]},fg={color["foreground"]}'),
+        ('Active window tab', 'window-status-current-format',
+         f'#[bg={color["primary"]},fg={color["background"]},bold]'
+         ' #I:#W #[default]'),
+        ('Inactive window tab', 'window-status-format',
+         f'#[bg={color["inactive_bg"]},fg={color["foreground"]}]'
+         ' #I:#W #[default]'),
+        ('Pane borders', 'pane-border-style',
+         f'fg={color["inactive_bg"]}'),
+        ('', 'pane-active-border-style', f'fg={color["primary"]}'),
+        ('Status left (session name badge)', 'status-left',
+         f'#[bg={color["primary"]},fg={color["background"]},bold]'
+         ' #{session_name} #[default] '),
+    ]
+
+
 def _generate_tmux_config(hive: Path, color: dict) -> str:
     """Generate the per-hive tmux config sourced at session creation.
 
@@ -2142,22 +2219,12 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
         f'set-environment HIVE_COLOR "{color["name"]}"',
         f'set-environment HIVE_COLOR_RGB "{color["rgb"]}"',
         f'set-environment HIVE_COLOR_256 "{color["c256"]}"',
-        '',
-        '# Status bar (session-scoped)',
-        f'set status-style "bg={color["background"]},fg={color["foreground"]}"',
-        '',
-        '# Active window tab',
-        f'set window-status-current-format "#[bg={color["primary"]},fg={color["background"]},bold] #I:#W #[default]"',
-        '',
-        '# Inactive window tab',
-        f'set window-status-format "#[bg={color["inactive_bg"]},fg={color["foreground"]}] #I:#W #[default]"',
-        '',
-        '# Pane borders',
-        f'set pane-border-style "fg={color["inactive_bg"]}"',
-        f'set pane-active-border-style "fg={color["primary"]}"',
-        '',
-        '# Status left (session name badge)',
-        f'set status-left "#[bg={color["primary"]},fg={color["background"]},bold] #{{session_name}} #[default] "',
+    ]
+    for comment, opt, val in _style_option_pairs(color):
+        if comment:
+            lines += ['', f'# {comment}']
+        lines.append(f'set {opt} "{val}"')
+    lines += [
         'set status-left-length 20',
         '',
         '# Status right (folder | branch [sync] | time)',
@@ -2600,6 +2667,10 @@ def cmd_tmux(args: argparse.Namespace) -> None:
         print(f'{CROSS()} tmux is not installed', file=sys.stderr)
         sys.exit(1)
 
+    if action == 'restyle':
+        _tmux_restyle()
+        return
+
     if getattr(args, 'list_hives', False):
         _tmux_list()
         return
@@ -2614,7 +2685,7 @@ def cmd_tmux(args: argparse.Namespace) -> None:
                   f'or --list to see configured hives.', file=sys.stderr)
         sys.exit(1)
 
-    _tmux_start(hive, _hive_color(hive),
+    _tmux_start(hive, _palette_for_mode(_hive_color(hive), _appearance_mode()),
                 new_window=getattr(args, 'new_window', False))
 
 
@@ -2627,8 +2698,9 @@ def _tmux_list() -> None:
         return
     print('Configured hives:')
     print()
+    mode = _appearance_mode()
     for hive in apiary:
-        color = _hive_color(hive)
+        color = _palette_for_mode(_hive_color(hive), mode)
         name = _short_name(hive)
         if C.enabled:
             badge = f'\033[38;2;{color["rgb"]}m{name:16}\033[0m'
@@ -2675,6 +2747,42 @@ def _used_workspaces(session: str, workspaces: list[Path]) -> set[Path]:
                 used.add(ws)
                 break
     return used
+
+
+def _tmux_restyle() -> None:
+    """Re-apply mode-appropriate styling to every live hive tmux session.
+
+    Invoked by `term-theme` after flipping the macOS appearance, so status
+    bars, window tabs and pane borders follow the day/night switch without
+    recreating sessions. The generated /tmp/hive-tmux/<name>.conf is
+    rewritten too — the backtick+r reload binding sources it, so without
+    the rewrite a reload would revert to the palette from session
+    creation. New panes also see the mode's HIVE_COLOR_* env; shells that
+    already exist keep the values they started with.
+    """
+    mode = _appearance_mode()
+    r = subprocess.run(['tmux', 'list-sessions', '-F', '#{session_name}'],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return
+    rewritten: set[str] = set()
+    for session in r.stdout.splitlines():
+        env = subprocess.run(
+            ['tmux', 'show-environment', '-t', session, 'HIVE_ROOT'],
+            capture_output=True, text=True)
+        if env.returncode != 0 or '=' not in env.stdout:
+            continue
+        hive = Path(env.stdout.strip().split('=', 1)[1])
+        color = _palette_for_mode(_hive_color(hive), mode)
+        if _short_name(hive) not in rewritten:
+            _write_tmux_config(hive, color)
+            rewritten.add(_short_name(hive))
+        for _, opt, val in _style_option_pairs(color):
+            subprocess.run(['tmux', 'set', '-t', session, opt, val])
+        subprocess.run(['tmux', 'set-environment', '-t', session,
+                        'HIVE_COLOR_RGB', color['rgb']])
+        subprocess.run(['tmux', 'set-environment', '-t', session,
+                        'HIVE_COLOR_256', color['c256']])
 
 
 def _tmux_start(hive: Path, color: dict, new_window: bool) -> None:
@@ -2768,12 +2876,16 @@ def _tmux_git_sync(pane_path: str) -> None:
     if len(parts) != 2 or not all(p.isdigit() for p in parts):
         return
     behind, ahead = int(parts[0]), int(parts[1])
+    if _appearance_mode() == 'day':
+        diverged_c, behind_c, ahead_c = '#b45309', '#c2334d', '#3f6212'
+    else:
+        diverged_c, behind_c, ahead_c = '#ff9e64', '#ff7a93', '#a9dc76'
     if ahead and behind:
-        sys.stdout.write(f' #[fg=#ff9e64]↑{ahead}↓{behind}#[default]')
+        sys.stdout.write(f' #[fg={diverged_c}]↑{ahead}↓{behind}#[default]')
     elif behind:
-        sys.stdout.write(f' #[fg=#ff7a93]↓{behind}#[default]')
+        sys.stdout.write(f' #[fg={behind_c}]↓{behind}#[default]')
     elif ahead:
-        sys.stdout.write(f' #[fg=#a9dc76]↑{ahead}#[default]')
+        sys.stdout.write(f' #[fg={ahead_c}]↑{ahead}#[default]')
 
     # Background fetch if the per-repo marker is older than 2 minutes.
     _TMUX_DIR.mkdir(parents=True, exist_ok=True)
@@ -2971,6 +3083,9 @@ def main():
     tmux_runs = tmux_sub.add_parser('runs')
     tmux_runs.add_argument('--hive-root', dest='hive_root',
                            help='Hive root path (default: detect from cwd)')
+    tmux_sub.add_parser(
+        'restyle',
+        help='Re-apply day/night styling to live hive sessions')
 
     args = parser.parse_args()
 

@@ -75,6 +75,36 @@ bright room that is usually what you want. For automatic switching at
 sunset/sunrise, set System Settings → Appearance → Auto. The first run may
 prompt for automation access to System Events.
 
+Ghostty restyles everything it draws instantly, but programs that pick their
+own colors need help — the appearance-pair theme only remaps the 16 ANSI
+colors, not the 256-color cube or truecolor values most TUIs use. `term-theme`
+records the mode in `~/.cache/term-theme/mode` and nudges each consumer:
+
+- **zsh prompt (p10k)** — `p10k.zsh` carries day/night palettes; new shells
+  detect the appearance at startup, and running shells pick up a flip at
+  their next prompt via the mode file.
+- **hive tmux** — `scripts/hive.py` carries per-hive day palettes; sessions
+  are styled for the current mode at creation, and `term-theme` restyles
+  live sessions via `hive tmux restyle`. Existing shells keep the
+  `HIVE_COLOR_*` env they started with until a new pane/window.
+- **Claude Code** — stores its theme in `~/.claude/settings.json` (the
+  `/config` preferences moved there in 2.1.119); `term-theme` flips it
+  between `light`/`dark`, preserving a daltonized/ansi variant and leaving
+  `auto`/custom themes alone — the supported `auto` theme already follows
+  the terminal appearance by itself, so on `auto` there is nothing to
+  sync. Restart running sessions (or use `/theme`) to repaint.
+- **codex** — detects the background itself at startup; restart it after a
+  flip.
+- **neovim** — follows the appearance at startup via the nvim config
+  (`vim.o.background` resolved from the macOS appearance, tokyonight picks
+  its day/night style from it). Restart nvim after a flip.
+
+Flips made outside `term-theme` (System Settings, scheduled Auto) restyle
+Ghostty but skip these hooks. Afterwards, run `term-theme day` or
+`term-theme night` to match — setting the mode it is already in is
+idempotent and runs all the hooks. `term-theme status` only refreshes the
+mode file (enough for the zsh prompt, not for hive/Claude).
+
 ## Hive tmux
 
 Examples:
