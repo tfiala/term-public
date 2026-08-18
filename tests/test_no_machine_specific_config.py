@@ -29,9 +29,16 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# A literal home directory: /Users/tfiala, but not the parameterized
-# /Users/$USER or /Users/${USER} that macOS `dscl` lookups legitimately
-# use (scripts/term-public-troubleshoot.sh, setup/bootstrap-macos.sh).
+# A literal home directory -- /Users/ followed by a real account name --
+# but not the parameterized /Users/$USER or /Users/${USER} that macOS
+# `dscl` lookups legitimately use (scripts/term-public-troubleshoot.sh,
+# setup/bootstrap-macos.sh).
+#
+# This file is itself tracked and therefore scanned, so write example
+# paths with a bracketed placeholder (/Users/<name>): `<` is outside the
+# name character class, which keeps documentation from tripping the
+# guard.  Spelling a real account name here fails CI -- as it did on the
+# first push of this file.
 HARDCODED_HOME_RE = re.compile(r"/Users/(?!\$)[A-Za-z0-9._-]+")
 
 # Marker comments installers leave behind when they edit a shell profile.
@@ -77,6 +84,16 @@ class TestNoMachineSpecificContent:
         """Fail closed: an empty file list would make every other
         assertion here vacuous."""
         assert len(tracked_files()) > 10
+
+    def test_this_file_is_tracked(self):
+        """The sweeps only see tracked files, so while this file is
+        merely staged-but-not-committed -- or not added at all -- it
+        exempts itself and passes vacuously.  That is not theoretical:
+        the first local run of this guard skipped its own example paths
+        for exactly this reason and CI caught what pytest had not."""
+        assert Path(__file__).resolve() in {p.resolve() for p in tracked_files()}, (
+            "this test file is untracked; `git add` it before trusting a "
+            "local pass")
 
     def test_config_files_are_covered(self):
         """The marker sweep is scoped by prefix; prove that scope still
