@@ -45,12 +45,44 @@ neither "all non-zero" nor a narrowed subset such as 127.
 History hygiene is handled by two deliberate controls instead:
 
 1. **Targeted removal after the fact.** A `histrm <pattern>` helper removes
-   matching entries from `~/.bash_history`, backing the file up first and
-   treating the timestamped format as `#epoch` / command *pairs* so a removal
-   cannot orphan a timestamp or split a multi-line entry. It must append-merge
-   rather than snapshot-replace, since live shells write to the same file
-   concurrently — the same defect the #24 review caught in
-   `scripts/import-zsh-history.py`.
+   matching entries from `~/.bash_history`. This ADR fixes its required
+   postconditions and leaves the algorithm to the implementation:
+
+   - **Backup.** A copy of the pre-removal file exists before the destination
+     is modified, created `0600` regardless of umask, since history can
+     contain private commands.
+   - **Selectivity.** Every non-matching entry survives byte-identically,
+     including its `#epoch` line where it has one — and its *absence* where it
+     does not. The file is not guaranteed to be all timestamped pairs:
+     `scripts/import-zsh-history.py` deliberately emits an entry with no
+     `#epoch` line when the source entry carried no timestamp, so plain
+     (pre-extended, or foreign) history is present untimestamped and must be
+     preserved as-is.
+   - **Structural integrity.** The result contains no `#epoch` line whose
+     command was removed, and no orphaned continuation line from a multi-line
+     entry.
+   - **No silent loss.** Entries appended by a live shell between the read and
+     the replacement are either carried into the result or the run aborts
+     non-zero leaving the destination unchanged. Dropping them silently is a
+     defect, not a tolerable race.
+   - **Atomic publication.** No reader ever observes a partially written
+     file.
+   - **No-op safety.** A pattern that matches nothing leaves the destination
+     byte-identical.
+
+   The "no silent loss" postcondition is the load-bearing one, and it is why
+   the concurrency fix from #24 does not transfer. `import-zsh-history.py` is
+   *additive*, so `O_APPEND` is sufficient there: a concurrent `history -a`
+   interleaves harmlessly. Removal is *subtractive* — appending a filtered
+   copy would leave the original bytes in place, so the file must be rewritten,
+   which reintroduces exactly the lost-update window `O_APPEND` avoided.
+   Because bash's `history -a` takes no lock, a removal cannot close that
+   window from its own side; it can only detect the change and retry or refuse,
+   or require that no other shell is writing. Whichever the implementation
+   picks, it must state the residual window rather than claim there is none —
+   a shell holding the old descriptor across an atomic replace can still write
+   to the replaced inode.
+
 2. **Pre-hoc opt-out.** `HISTCONTROL=ignoreboth` (already set in `bash/bashrc`)
    means a leading space keeps a command out of history entirely. That is the
    supported way to try a flag you believe is a guess.
@@ -110,9 +142,14 @@ action.
   accepted trade: the repo prefers a manual, precise cleanup over an automatic,
   imprecise one.
 - `histrm` becomes a piece of software with real correctness obligations —
-  timestamp/command pairing, multi-line entries, concurrent appends from live
-  shells, and a backup before mutation. It should be built and tested to the
-  standard `scripts/import-zsh-history.py` was, not written as a one-line `sed`.
+  mixed timestamped and untimestamped entries, multi-line entries, concurrent
+  appends from live shells, and a backup before mutation. It should be built
+  and tested to the standard `scripts/import-zsh-history.py` was, not written
+  as a one-line `sed`.
+- Removal is strictly harder than the import was, and the ADR does not pretend
+  otherwise: the importer could sidestep concurrency with `O_APPEND`, while a
+  rewrite cannot. Whoever implements `histrm` inherits a real design decision
+  (detect-and-retry versus required quiescence) rather than a settled recipe.
 - Removal is destructive to a file that has no other copy. The backup-first
   requirement is load-bearing, not decoration.
 - The `PROMPT_COMMAND` chain stays as #24 left it. Nothing new runs per prompt,
@@ -144,7 +181,14 @@ resource, RBAC, NetworkPolicy, registry image, or secret is involved.
   `STARSHIP_PROMPT_COMMAND=_term_public_history_sync`), establishing that
   exit-status culling was technically available and is being declined on merit.
 - `scripts/import-zsh-history.py` and the #24 review — the prior art for the
-  concurrency and file-format hazards `histrm` inherits.
+  concurrency and file-format hazards `histrm` inherits. Two specifics the
+  removal contract above depends on: `render_bash_history` emits a `#epoch`
+  line only `if timestamp is not None`, so an untimestamped entry is written
+  bare (the file is a *mix*, not uniform pairs); and the destination write is
+  `O_APPEND` with the comment "Append via `O_APPEND`, never read-modify-replace:
+  a `history -a` from a live shell between the snapshot above and this write
+  must survive" — an option available to an additive import and not to a
+  subtractive removal.
 
 ## Revisit Triggers
 

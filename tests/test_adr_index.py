@@ -30,10 +30,28 @@ ALLOWED_STATUSES = {
 }
 BINDING_KINDS = {"decision", "proposal", "umbrella"}
 
-# adr-lint's REQUIRED_SECTIONS, for the kinds this repo uses so far.
+# adr-lint's REQUIRED_SECTIONS, mirrored for every kind in
+# ALLOWED_KINDS.  Mapping only the kinds this repo happens to use would
+# fail open: an ADR declaring any unmapped kind would skip section
+# validation entirely and still pass here while adr-lint rejected it.
 REQUIRED_SECTIONS = {
     "decision": ["Context", "Decision", "Rationale", "Consequences",
                  "Evidence", "Revisit Triggers", "Alternatives Considered"],
+    "proposal": ["Context", "Proposed Decision", "Rationale", "Consequences",
+                 "Evidence", "Open Questions", "Alternatives Considered",
+                 "Revisit Triggers"],
+    "umbrella": ["Context", "Decision", "Scope", "Rollout", "Dependencies",
+                 "Evidence", "Revisit Triggers", "Alternatives Considered"],
+    "informational": ["Context", "Summary", "Evidence", "Non-Binding Notes"],
+    "assessment": ["Context", "Findings", "Recommendations", "Evidence",
+                   "Follow-Up"],
+    "incident_report": ["Timeline", "Impact", "Root Causes",
+                        "Corrective Actions", "Evidence", "Follow-Up"],
+    "record": ["Context", "Decision", "Outcome", "Evidence"],
+    "evidence": ["Context", "Evidence", "Outcome"],
+    "legacy-conversion": ["Context"],
+    "analysis": ["Context", "Findings", "Recommendation", "Evidence",
+                 "Follow-Up"],
 }
 INFRA_IMPACT_REQUIRED_FROM = "2026-05-04"
 
@@ -41,7 +59,14 @@ TITLE_RE = re.compile(r"^# ADR-(\d{4}): (.+)$")
 FIELD_RE = re.compile(r"^\*\*(?P<key>[A-Za-z-]+):\*\* (?P<value>.+)$")
 INDEX_ROW_RE = re.compile(
     r"^\| \[(?P<num>\d{4})\]\((?P<path>[^)]+)\) \| (?P<title>.+?) \| "
-    r"(?P<status>.+?) \| (?P<revisit>.+?) \|$")
+    r"(?P<status>.+?) \|$")
+
+# Every column is compared against the ADR file, so the header is pinned:
+# a new column would be unverified data that can drift silently.  That is
+# why Revisit is not a column — its text is long, the ADR's own
+# `**Revisit:**` field is authoritative, and adr-lint's --check-index
+# does not compare it either.
+INDEX_HEADER = "| ADR | Title | Status |"
 
 
 def adr_files():
@@ -114,11 +139,23 @@ class TestAdrMetadata:
             assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", fields["Date"]), (
                 f"{path.name}: Date must be YYYY-MM-DD")
 
+    def test_every_allowed_kind_has_a_section_schema(self):
+        """The two maps are one contract; a kind in the vocabulary with
+        no schema would silently exempt itself from section checks."""
+        assert set(REQUIRED_SECTIONS) == ALLOWED_KINDS, (
+            "REQUIRED_SECTIONS and ALLOWED_KINDS disagree: "
+            f"unmapped kinds {ALLOWED_KINDS - set(REQUIRED_SECTIONS)}, "
+            f"unknown kinds {set(REQUIRED_SECTIONS) - ALLOWED_KINDS}")
+
     def test_required_sections_present(self):
         for path in adr_files():
             adr = parse_adr(path)
             kind = adr["fields"].get("Kind")
-            for section in REQUIRED_SECTIONS.get(kind, []):
+            # Fail closed: an unmapped kind is a gap in this test's own
+            # schema, never a reason to skip validation.
+            assert kind in REQUIRED_SECTIONS, (
+                f"{path.name}: no section schema for kind {kind!r}")
+            for section in REQUIRED_SECTIONS[kind]:
                 assert section in adr["sections"], (
                     f"{path.name}: missing required section '## {section}' "
                     f"for kind {kind}")
@@ -162,6 +199,15 @@ class TestIndexAgreesWithFiles:
         for name, row in index_rows().items():
             assert name.startswith(row["num"] + "-"), (
                 f"index row {row['num']} links to {name}")
+
+    def test_header_pins_the_checked_columns(self):
+        """No unchecked column: every column in the header is one this
+        module compares against the ADR file.  Adding a column (Revisit,
+        Date, Owner) fails here until it is either checked or dropped."""
+        lines = INDEX.read_text().splitlines()
+        assert INDEX_HEADER in lines, (
+            f"index header must be exactly {INDEX_HEADER!r} — a new column "
+            "would be unverified and free to drift")
 
     def test_titles_and_statuses_match(self):
         rows = index_rows()

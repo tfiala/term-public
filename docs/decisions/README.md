@@ -11,7 +11,7 @@ which comes from `infra/acc` and is installed to `~/bin` by that repo's
 ```markdown
 # ADR-NNNN: Title
 
-**Kind:** decision | proposal | umbrella | informational | assessment | analysis | record
+**Kind:** decision | proposal | umbrella | informational | assessment | incident_report | record | evidence | legacy-conversion | analysis
 **Status:** proposed | accepted | implemented | validated | rejected | superseded | deprecated | deferred
 **Date:** YYYY-MM-DD
 **Revisit:** Conditions that should trigger re-evaluation
@@ -61,6 +61,12 @@ Zero errors and zero warnings is the bar.
 
 ## Current Decisions
 
-| ADR | Title | Status | Revisit |
-|-----|-------|--------|---------|
-| [0001](0001-shell-history-hygiene.md) | Shell History Hygiene — Deliberate Removal, Not Exit-Status Culling | accepted | A pre-execution validity signal becomes available; targeted removal proves too manual in practice; bash or the line editor gains a native forget-this-entry primitive; or the interactive shell moves off bash |
+| ADR | Title | Status |
+|-----|-------|--------|
+| [0001](0001-shell-history-hygiene.md) | Shell History Hygiene — Deliberate Removal, Not Exit-Status Culling | accepted |
+
+The index carries only what `tests/test_adr_index.py` compares against the ADR
+files. Revisit conditions are deliberately *not* a column: the text is long,
+each ADR's own `**Revisit:**` field is authoritative, and neither this repo's
+tests nor `adr-lint --check-index` compare an index copy — so a column would be
+unverified data free to drift.
