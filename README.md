@@ -30,6 +30,7 @@ It avoids:
 - `setup.sh` symlink installer
 - `setup/bootstrap-macos.sh` package/bootstrap helper
 - `local/` untracked per-machine overlay created by `setup.sh`
+- `docs/decisions/` architecture decision records ([index](docs/decisions/README.md))
 
 ## Shell: bash + Starship
 
