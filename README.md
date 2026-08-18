@@ -126,6 +126,26 @@ checkout's location; copy or reconcile its overlay manually before deleting it.
 
 This is the place for things like Node path tweaks, k3s helper scripts, or workstation-only tooling that should not be committed back to the public repo.
 
+### Installers that edit your shell profile
+
+`~/.bash_profile` and `~/.bashrc` are symlinks into this repo, so an installer
+that "adds itself to your PATH" writes into the **tracked** file rather than a
+private dotfile. Docker Desktop did this on 2026-08-18, prepending an
+`export PATH="$PATH:/Users/<user>/.docker/bin"` block to `bash/bash_profile`.
+Conda, nvm, rustup, pyenv, the Google Cloud SDK, and JetBrains Toolbox all
+behave the same way.
+
+When it happens, move the line into `local/env.local` (use `$HOME`, not a
+literal home path) and revert the tracked file:
+
+```bash
+git checkout bash/bash_profile   # or bash/bashrc
+```
+
+`tests/test_no_machine_specific_config.py` fails in CI if a hardcoded home
+directory or a known installer marker survives in tracked config, so this
+cannot be committed silently.
+
 ## Day / night mode
 
 `ghostty/config` uses an appearance-pair theme: `palenight` in dark mode and
