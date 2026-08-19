@@ -106,6 +106,124 @@ _repo_identity() {
   printf '%s\n' "$url"
 }
 
+# _remember_linked_checkout
+# $1 - installed symlink that setup.sh is about to replace
+# $2 - repo-relative suffix of that link's target
+# Records a different checkout only when its normalized git origin matches
+# this checkout. Relative links are resolved from the link's directory.
+_remember_linked_checkout() {
+  local link="$1" suffix="$2" target root this_id target_id existing
+  [[ -L "$link" ]] || return 0
+  target="$(readlink "$link")"
+  case "$target" in
+    */"$suffix") ;;
+    *) return 0 ;;
+  esac
+  case "$target" in
+    /*) ;;
+    *) target="$(dirname "$link")/$target" ;;
+  esac
+  root="${target%/"$suffix"}"
+  root="$(cd "$root" 2>/dev/null && pwd -P)" || return 0
+  [[ "$root" != "$ROOT_DIR" ]] || return 0
+  this_id="$(_repo_identity "$ROOT_DIR")"
+  target_id="$(_repo_identity "$root")"
+  [[ -n "$this_id" && "$target_id" == "$this_id" ]] || return 0
+  # The fallback keeps an empty indexed array safe under macOS bash 3.2
+  # with nounset enabled.
+  for existing in "${OLD_CHECKOUT_ROOTS[@]-}"; do
+    [[ -n "$existing" ]] || continue
+    [[ "$existing" != "$root" ]] || return 0
+  done
+  OLD_CHECKOUT_ROOTS[${#OLD_CHECKOUT_ROOTS[@]}]="$root"
+}
+
+# _overlay_source_is_pristine
+# $1 - source checkout, $2 - repo-relative overlay path
+# A source is pristine when it matches that checkout's template. Checkouts
+# from before local/*.template existed fall back to this checkout's template.
+_overlay_source_is_pristine() {
+  local old_root="$1" relative="$2" source_template new_template
+  source_template="$old_root/$relative.template"
+  new_template="$ROOT_DIR/$relative.template"
+  if [[ -f "$source_template" ]]; then
+    cmp -s "$old_root/$relative" "$source_template"
+  elif [[ -f "$new_template" ]]; then
+    cmp -s "$old_root/$relative" "$new_template"
+  else
+    return 1
+  fi
+}
+
+# _overlay_destination_is_pristine
+# $1 - repo-relative overlay path
+# Missing destinations and regular files equal to the current template are
+# safe migration targets. Symlinks are always user-owned destinations.
+_overlay_destination_is_pristine() {
+  local relative="$1" destination template
+  destination="$ROOT_DIR/$relative"
+  template="$ROOT_DIR/$relative.template"
+  if [[ ! -e "$destination" && ! -L "$destination" ]]; then
+    return 0
+  fi
+  [[ ! -L "$destination" && -f "$template" && -f "$destination" ]] \
+    && cmp -s "$destination" "$template"
+}
+
+# _migrate_overlay_file
+# $1 - source checkout, $2 - repo-relative overlay path
+# Copies a customized source only over an absent/pristine destination. A
+# different customized destination is preserved and reported without exposing
+# either file's contents.
+_migrate_overlay_file() {
+  local old_root="$1" relative="$2" source destination
+  source="$old_root/$relative"
+  destination="$ROOT_DIR/$relative"
+  [[ -f "$source" || -L "$source" ]] || return 0
+  _overlay_source_is_pristine "$old_root" "$relative" && return 0
+  if [[ -e "$destination" || -L "$destination" ]] \
+      && cmp -s "$source" "$destination"; then
+    return 0
+  fi
+  if _overlay_destination_is_pristine "$relative"; then
+    mkdir -p "$(dirname "$destination")" || return 1
+    rm -f "$destination" || return 1
+    cp -pP "$source" "$destination" || return 1
+    echo "Migrated machine-local overlay: $relative (from $old_root)"
+  else
+    OVERLAY_CONFLICT_COUNT=$((OVERLAY_CONFLICT_COUNT + 1))
+    echo "WARNING: machine-local overlay differs in both checkouts: $relative" >&2
+    echo "  Preserved $destination" >&2
+    echo "  Review the prior copy at $source and merge it manually." >&2
+  fi
+}
+
+# migrate_checkout_overlay
+# $1 - verified prior checkout root
+# Migrates Ghostty's overlay plus all non-template files under local/.
+migrate_checkout_overlay() {
+  local old_root="$1" source relative manifest
+  _migrate_overlay_file "$old_root" "ghostty/local.config"
+  [[ -d "$old_root/local" ]] || return 0
+  manifest="$(mktemp "${TMPDIR:-/tmp}/term-public-overlay.XXXXXX")"
+  if ! find "$old_root/local" \( -type f -o -type l \) -print0 > "$manifest"; then
+    rm -f "$manifest"
+    echo "ERROR: could not enumerate the prior machine-local overlay at $old_root/local" >&2
+    return 1
+  fi
+  while IFS= read -r -d '' source; do
+    relative="local/${source#"$old_root/local/"}"
+    case "$relative" in
+      *.template) continue ;;
+    esac
+    if ! _migrate_overlay_file "$old_root" "$relative"; then
+      rm -f "$manifest"
+      return 1
+    fi
+  done < "$manifest"
+  rm -f "$manifest"
+}
+
 # remove_stale_link
 # $1 - home dotfile that may be a symlink from the zsh era
 # $2 - repo-relative suffix the old link pointed at
@@ -144,46 +262,80 @@ remove_stale_link() {
   fi
 }
 
-ROOT_DIR="$(pwd)"
+ROOT_DIR="$(pwd -P)"
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 LOCAL_DIR="$ROOT_DIR/local"
+OLD_CHECKOUT_ROOTS=()
+OVERLAY_CONFLICT_COUNT=0
+OVERLAY_CONFLICT_EXIT_STATUS=3
 
 mkdir -p "$HOME/bin"
 mkdir -p "$LOCAL_DIR/bin"
 
-backup_and_link_file "$ROOT_DIR/ghostty" "$CONFIG_HOME/ghostty"
-backup_and_link_file "$ROOT_DIR/bash/bash_profile" "$HOME/.bash_profile"
-backup_and_link_file "$ROOT_DIR/bash/bashrc" "$HOME/.bashrc"
-backup_and_link_file "$ROOT_DIR/bash/inputrc" "$HOME/.inputrc"
-backup_and_link_file "$ROOT_DIR/starship/starship.toml" "$CONFIG_HOME/starship.toml"
+# One definition drives both prior-checkout discovery and link installation,
+# keeping each external path binding exact.
+_REPO_LINK_RELATIVES=(
+  "ghostty"
+  "bash/bash_profile"
+  "bash/bashrc"
+  "bash/inputrc"
+  "starship/starship.toml"
+  "tmux/tmux.conf"
+  "tmux/tmux.conf"
+)
+_REPO_LINK_DESTINATIONS=(
+  "$CONFIG_HOME/ghostty"
+  "$HOME/.bash_profile"
+  "$HOME/.bashrc"
+  "$HOME/.inputrc"
+  "$CONFIG_HOME/starship.toml"
+  "$HOME/.tmux/tmux.conf"
+  "$HOME/.tmux.conf"
+)
+
+_link_index=0
+while (( _link_index < ${#_REPO_LINK_RELATIVES[@]} )); do
+  _remember_linked_checkout \
+    "${_REPO_LINK_DESTINATIONS[$_link_index]}" \
+    "${_REPO_LINK_RELATIVES[$_link_index]}"
+  _link_index=$((_link_index + 1))
+done
+
+for _old_checkout in "${OLD_CHECKOUT_ROOTS[@]-}"; do
+  [[ -n "$_old_checkout" ]] || continue
+  migrate_checkout_overlay "$_old_checkout"
+done
+
+if (( OVERLAY_CONFLICT_COUNT > 0 )); then
+  echo "WARNING: $OVERLAY_CONFLICT_COUNT machine-local overlay conflict(s) require manual review." >&2
+  echo "  Installed links were not changed; rerun setup.sh after reconciling the files above." >&2
+  exit "$OVERLAY_CONFLICT_EXIT_STATUS"
+fi
+
+if [[ ! -f "$LOCAL_DIR/env.local" ]]; then
+  cp "$LOCAL_DIR/env.local.template" "$LOCAL_DIR/env.local"
+fi
+
+if [[ ! -f "$LOCAL_DIR/bashrc.local" ]]; then
+  cp "$LOCAL_DIR/bashrc.local.template" "$LOCAL_DIR/bashrc.local"
+fi
+
+_link_index=0
+while (( _link_index < ${#_REPO_LINK_RELATIVES[@]} )); do
+  backup_and_link_file \
+    "$ROOT_DIR/${_REPO_LINK_RELATIVES[$_link_index]}" \
+    "${_REPO_LINK_DESTINATIONS[$_link_index]}"
+  _link_index=$((_link_index + 1))
+done
+
 backup_and_copy_file "$ROOT_DIR/scripts/hive.py" "$HOME/bin/hive"
 backup_and_copy_file "$ROOT_DIR/scripts/hive-ci-popup.py" "$HOME/bin/hive-ci-popup"
 backup_and_copy_file "$ROOT_DIR/scripts/term-theme" "$HOME/bin/term-theme"
-backup_and_link_file "$ROOT_DIR/tmux/tmux.conf" "$HOME/.tmux/tmux.conf"
-backup_and_link_file "$ROOT_DIR/tmux/tmux.conf" "$HOME/.tmux.conf"
 
 # Clean up links from the zsh era (removed in the bash cutover, #15).
 remove_stale_link "$HOME/.zshenv" "zsh/zshenv"
 remove_stale_link "$HOME/.zshrc" "zsh/zshrc"
 remove_stale_link "$HOME/.p10k.zsh" "p10k.zsh"
-
-if [[ ! -f "$LOCAL_DIR/env.local" ]]; then
-  cat > "$LOCAL_DIR/env.local" <<'EOF'
-# Per-machine environment overrides for term-public.
-# Examples:
-# export PATH="$HOME/.local/node/bin:$PATH"
-# export K3S_DEV_ROOT="$HOME/src/k3s"
-EOF
-fi
-
-if [[ ! -f "$LOCAL_DIR/bashrc.local" ]]; then
-  cat > "$LOCAL_DIR/bashrc.local" <<'EOF'
-# Per-machine bash customizations for term-public.
-# Examples:
-# alias kpods='kubectl get pods -A'
-# source "$HOME/.config/some-tool/init.bash"
-EOF
-fi
 
 # Install Ghostty terminfo into ~/.terminfo so shells and other programs
 # can find xterm-ghostty without TERMINFO being set.

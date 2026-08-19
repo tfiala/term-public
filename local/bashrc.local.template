@@ -1,0 +1,4 @@
+# Per-machine bash customizations for term-public.
+# Examples:
+# alias kpods='kubectl get pods -A'
+# source "$HOME/.config/some-tool/init.bash"
