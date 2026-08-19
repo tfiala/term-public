@@ -378,6 +378,7 @@ def _scaffold_repo(tmp_path):
     (repo_root / "starship").mkdir()
     (repo_root / "scripts").mkdir()
     (repo_root / "tmux").mkdir()
+    (repo_root / "local").mkdir()
     (repo_root / "ghostty" / "config").write_text("ghostty = true\n")
     (repo_root / "bash" / "bash_profile").write_text("# bash_profile\n")
     (repo_root / "bash" / "bashrc").write_text("export TEST_BASHRC=1\n")
@@ -387,11 +388,17 @@ def _scaffold_repo(tmp_path):
     (repo_root / "scripts" / "hive.py").write_text("#!/usr/bin/env python3\n")
     (repo_root / "scripts" / "hive-ci-popup.py").write_text("#!/usr/bin/env python3\n")
     (repo_root / "scripts" / "term-theme").write_text("#!/usr/bin/env bash\n")
+    (repo_root / "local" / "env.local.template").write_text(
+        "# env template\n")
+    (repo_root / "local" / "bashrc.local.template").write_text(
+        "# bashrc template\n")
+    (repo_root / "ghostty" / "local.config.template").write_text(
+        "# ghostty template\n")
 
     return repo_root, home
 
 
-def _run_setup(repo_root, home, extra_env=None):
+def _run_setup(repo_root, home, extra_env=None, bash_executable="bash"):
     """Run setup.sh in a fake repo with the given HOME.
 
     Inherits the real environment (including TERMINFO if set by Ghostty)
@@ -403,7 +410,7 @@ def _run_setup(repo_root, home, extra_env=None):
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
-        ["bash", "setup.sh"],
+        [bash_executable, "setup.sh"],
         cwd=repo_root,
         env=env,
         capture_output=True,
@@ -426,6 +433,139 @@ def test_setup_creates_local_overlay_skeleton(tmp_path):
     assert (home / ".config" / "starship.toml").is_symlink()
     assert (home / "bin" / "hive").is_file()
     assert not (home / "bin" / "hive").is_symlink()
+    assert (repo_root / "local" / "env.local").read_text() == "# env template\n"
+    assert (repo_root / "local" / "bashrc.local").read_text() == \
+        "# bashrc template\n"
+
+
+def test_setup_runs_with_system_bash(tmp_path):
+    """The installer remains compatible with macOS's Bash 3.2."""
+    repo_root, home = _scaffold_repo(tmp_path)
+
+    result = _run_setup(repo_root, home, bash_executable="/bin/bash")
+
+    assert result.returncode == 0, result.stderr
+    assert (home / ".bashrc").is_symlink()
+
+
+def _make_prior_checkout(path, origin="https://github.com/example/term-public.git"):
+    """Create an installed prior checkout with real overlay definitions."""
+    (path / "bash").mkdir(parents=True)
+    (path / "ghostty").mkdir()
+    (path / "local" / "bin").mkdir(parents=True)
+    (path / "bash" / "bashrc").write_text("# prior checkout bashrc\n")
+    (path / "local" / "env.local.template").write_text("# env template\n")
+    (path / "local" / "bashrc.local.template").write_text(
+        "# bashrc template\n")
+    (path / "ghostty" / "local.config.template").write_text(
+        "# ghostty template\n")
+    _git_init_with_origin(path, origin)
+
+
+def _install_prior_checkout_link(home, old_checkout):
+    (home / ".bashrc").symlink_to(old_checkout / "bash" / "bashrc")
+
+
+class TestCheckoutOverlayMigration:
+    """Machine-local files survive switching installed checkout links (#23)."""
+
+    def test_customized_source_replaces_pristine_destination(self, tmp_path):
+        repo_root, home = _scaffold_repo(tmp_path)
+        old_checkout = tmp_path / "old-checkout"
+        _make_prior_checkout(old_checkout)
+        _install_prior_checkout_link(home, old_checkout)
+
+        (old_checkout / "local" / "env.local").write_text(
+            'export PATH="$HOME/.local/bin:$PATH"\n')
+        (old_checkout / "local" / "bashrc.local").write_text("alias k=kubectl\n")
+        helper = old_checkout / "local" / "bin" / "private-helper"
+        helper.write_text("#!/usr/bin/env bash\necho private\n")
+        helper.chmod(0o755)
+        (old_checkout / "ghostty" / "local.config").write_text(
+            "font-family = Machine Font\n")
+        (old_checkout / "local" / "ignored.template").write_text(
+            "not an overlay\n")
+
+        # Existing template copies in B are pristine and safe to replace.
+        (repo_root / "local" / "env.local").write_text("# env template\n")
+        (repo_root / "local" / "bashrc.local").write_text(
+            "# bashrc template\n")
+        (repo_root / "ghostty" / "local.config").write_text(
+            "# ghostty template\n")
+
+        result = _run_setup(repo_root, home, bash_executable="/bin/bash")
+
+        assert result.returncode == 0, result.stderr
+        assert (repo_root / "local" / "env.local").read_text() == \
+            'export PATH="$HOME/.local/bin:$PATH"\n'
+        assert (repo_root / "local" / "bashrc.local").read_text() == \
+            "alias k=kubectl\n"
+        migrated_helper = repo_root / "local" / "bin" / "private-helper"
+        assert migrated_helper.read_text() == "#!/usr/bin/env bash\necho private\n"
+        assert os.access(migrated_helper, os.X_OK)
+        assert (repo_root / "ghostty" / "local.config").read_text() == \
+            "font-family = Machine Font\n"
+        assert not (repo_root / "local" / "ignored.template").exists()
+        assert "Migrated machine-local overlay: local/env.local" in result.stdout
+        assert str(old_checkout) in result.stdout
+
+    def test_customized_destination_is_preserved_and_reported(self, tmp_path):
+        repo_root, home = _scaffold_repo(tmp_path)
+        old_checkout = tmp_path / "old-checkout"
+        _make_prior_checkout(old_checkout)
+        _install_prior_checkout_link(home, old_checkout)
+        (old_checkout / "local" / "env.local").write_text("export FROM_OLD=1\n")
+        destination = repo_root / "local" / "env.local"
+        destination.write_text("export FROM_NEW=1\n")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0
+        assert destination.read_text() == "export FROM_NEW=1\n"
+        assert "machine-local overlay differs" in result.stderr
+        assert "local/env.local" in result.stderr
+        assert str(destination) in result.stderr
+        assert str(old_checkout / "local" / "env.local") in result.stderr
+        assert "1 machine-local overlay conflict(s)" in result.stderr
+        assert "export FROM_OLD=1" not in result.stdout + result.stderr
+        assert "export FROM_NEW=1" not in result.stdout + result.stderr
+
+    def test_pristine_source_is_a_no_op(self, tmp_path):
+        repo_root, home = _scaffold_repo(tmp_path)
+        old_checkout = tmp_path / "old-checkout"
+        _make_prior_checkout(old_checkout)
+        _install_prior_checkout_link(home, old_checkout)
+        (old_checkout / "local" / "env.local").write_text("# env template\n")
+        (old_checkout / "local" / "bashrc.local").write_text(
+            "# bashrc template\n")
+        (old_checkout / "ghostty" / "local.config").write_text(
+            "# ghostty template\n")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0, result.stderr
+        assert (repo_root / "local" / "env.local").read_text() == \
+            "# env template\n"
+        assert (repo_root / "local" / "bashrc.local").read_text() == \
+            "# bashrc template\n"
+        assert not (repo_root / "ghostty" / "local.config").exists()
+        assert "Migrated machine-local overlay" not in result.stdout
+
+    def test_foreign_checkout_overlay_is_not_read_or_copied(self, tmp_path):
+        repo_root, home = _scaffold_repo(tmp_path)
+        old_checkout = tmp_path / "foreign-checkout"
+        _make_prior_checkout(
+            old_checkout, origin="git@github.com:someone/dotfiles.git")
+        _install_prior_checkout_link(home, old_checkout)
+        (old_checkout / "local" / "env.local").write_text("foreign secret\n")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0, result.stderr
+        assert (repo_root / "local" / "env.local").read_text() == \
+            "# env template\n"
+        assert "Migrated machine-local overlay" not in result.stdout
+        assert "foreign secret" not in result.stdout + result.stderr
 
 
 def test_setup_installs_bin_scripts_as_copies(tmp_path):

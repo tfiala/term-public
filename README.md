@@ -89,7 +89,11 @@ scripts/start-shell-preview.sh --ghostty  # in a fresh Ghostty window
    `~/.p10k.zsh`) left by earlier versions of this repo — only when the
    link target is verifiably a term-public checkout — restoring `.bak`
    backups where they exist, and prints migration guidance for any
-   remaining zsh config (bash does not read it).
+   remaining zsh config (bash does not read it). When those installed links
+   point to another checkout of this repository, it first carries customized
+   machine-local overlay files into this checkout. Existing customizations in
+   the new checkout are never overwritten; conflicts are reported with both
+   file paths for manual reconciliation.
 3. Restart Ghostty and open a new shell.
 
 ## Per-Machine Overlay
@@ -106,6 +110,13 @@ Template files in `local/` may be committed as examples using the normal
 
 - `ghostty/local.config.template` is committed
 - `ghostty/local.config` is machine-local and ignored
+
+On a fresh checkout, `setup.sh` copies the committed templates for
+`local/env.local` and `local/bashrc.local` into place. If setup replaces links
+to another verified term-public checkout, customized files under `local/`
+(including private `local/bin/` helpers) and `ghostty/local.config` migrate when
+the destination is absent or still matches its template. Template-only source
+files are ignored.
 
 This is the place for things like Node path tweaks, k3s helper scripts, or workstation-only tooling that should not be committed back to the public repo.
 
