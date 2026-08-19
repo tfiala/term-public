@@ -520,13 +520,17 @@ class TestCheckoutOverlayMigration:
 
         result = _run_setup(repo_root, home)
 
-        assert result.returncode == 0
+        assert result.returncode == 3
         assert destination.read_text() == "export FROM_NEW=1\n"
+        assert (home / ".bashrc").resolve() == old_checkout / "bash" / "bashrc"
+        assert not (repo_root / "local" / "bashrc.local").exists()
         assert "machine-local overlay differs" in result.stderr
         assert "local/env.local" in result.stderr
         assert str(destination) in result.stderr
         assert str(old_checkout / "local" / "env.local") in result.stderr
         assert "1 machine-local overlay conflict(s)" in result.stderr
+        assert "Installed links were not changed" in result.stderr
+        assert "Linked config into place" not in result.stdout
         assert "export FROM_OLD=1" not in result.stdout + result.stderr
         assert "export FROM_NEW=1" not in result.stdout + result.stderr
 

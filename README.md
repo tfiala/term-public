@@ -93,7 +93,9 @@ scripts/start-shell-preview.sh --ghostty  # in a fresh Ghostty window
    point to another checkout of this repository, it first carries customized
    machine-local overlay files into this checkout. Existing customizations in
    the new checkout are never overwritten; conflicts are reported with both
-   file paths for manual reconciliation.
+   file paths for manual reconciliation. A conflict exits with status 3 before
+   any installed links are replaced, so interactive and unattended callers
+   both detect the incomplete switch.
 3. Restart Ghostty and open a new shell.
 
 ## Per-Machine Overlay
@@ -117,6 +119,10 @@ to another verified term-public checkout, customized files under `local/`
 (including private `local/bin/` helpers) and `ghostty/local.config` migrate when
 the destination is absent or still matches its template. Template-only source
 files are ignored.
+
+Migration discovery is intentionally link-based. If an earlier setup run has
+already replaced every link to the prior checkout, `setup.sh` cannot infer that
+checkout's location; copy or reconcile its overlay manually before deleting it.
 
 This is the place for things like Node path tweaks, k3s helper scripts, or workstation-only tooling that should not be committed back to the public repo.
 

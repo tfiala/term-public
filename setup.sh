@@ -267,6 +267,7 @@ CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 LOCAL_DIR="$ROOT_DIR/local"
 OLD_CHECKOUT_ROOTS=()
 OVERLAY_CONFLICT_COUNT=0
+OVERLAY_CONFLICT_EXIT_STATUS=3
 
 mkdir -p "$HOME/bin"
 mkdir -p "$LOCAL_DIR/bin"
@@ -304,6 +305,12 @@ for _old_checkout in "${OLD_CHECKOUT_ROOTS[@]-}"; do
   [[ -n "$_old_checkout" ]] || continue
   migrate_checkout_overlay "$_old_checkout"
 done
+
+if (( OVERLAY_CONFLICT_COUNT > 0 )); then
+  echo "WARNING: $OVERLAY_CONFLICT_COUNT machine-local overlay conflict(s) require manual review." >&2
+  echo "  Installed links were not changed; rerun setup.sh after reconciling the files above." >&2
+  exit "$OVERLAY_CONFLICT_EXIT_STATUS"
+fi
 
 if [[ ! -f "$LOCAL_DIR/env.local" ]]; then
   cp "$LOCAL_DIR/env.local.template" "$LOCAL_DIR/env.local"
@@ -371,6 +378,3 @@ fi
 
 echo "Linked config into place."
 echo "Local machine overlay is available in $LOCAL_DIR"
-if (( OVERLAY_CONFLICT_COUNT > 0 )); then
-  echo "WARNING: $OVERLAY_CONFLICT_COUNT machine-local overlay conflict(s) require manual review." >&2
-fi
