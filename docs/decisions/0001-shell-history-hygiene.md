@@ -51,13 +51,23 @@ History hygiene is handled by two deliberate controls instead:
    - **Backup.** A copy of the pre-removal file exists before the destination
      is modified, created `0600` regardless of umask, since history can
      contain private commands.
+   - **Privacy throughout.** The `0600` boundary covers *every* artifact that
+     holds history content, not just the backup: any temporary or replacement
+     file is created `0600` from the outset rather than chmod-ed afterwards
+     (which leaves a readable window), ownership is preserved, and the final
+     destination mode is no more permissive than the mode it had before,
+     capped at `0600`. An atomic replace that publishes a fresh inode created
+     under the default umask would silently relax `~/.bash_history` from
+     `0600` to `0644` — the operation would satisfy every other postcondition
+     while exposing the private commands this contract exists to protect.
+     Diagnostics are value-safe for the same reason: counts and bounded
+     reasons only, never the matched command text.
    - **Selectivity.** Every non-matching entry survives byte-identically,
      including its `#epoch` line where it has one — and its *absence* where it
      does not. The file is not guaranteed to be all timestamped pairs:
-     `scripts/import-zsh-history.py` deliberately emits an entry with no
-     `#epoch` line when the source entry carried no timestamp, so plain
-     (pre-extended, or foreign) history is present untimestamped and must be
-     preserved as-is.
+     `scripts/import-zsh-history.py` emits an entry with no `#epoch` line when
+     the source entry carried no timestamp, so untimestamped entries **may**
+     be present and must be preserved as-is.
    - **Structural integrity.** The result contains no `#epoch` line whose
      command was removed, and no orphaned continuation line from a multi-line
      entry.
@@ -65,6 +75,18 @@ History hygiene is handled by two deliberate controls instead:
      the replacement are either carried into the result or the run aborts
      non-zero leaving the destination unchanged. Dropping them silently is a
      defect, not a tolerable race.
+   - **No self-reintroduction.** The text just removed must not be back in
+     the history at the next prompt sync. This is not hypothetical: the
+     helper's own command line contains the pattern, and `PROMPT_COMMAND`'s
+     `history -a` appends it after the rewrite has already happened, so an
+     ordinary `histrm <pattern>` ends with the file containing exactly one
+     matching line — its own invocation — leaving the bad spelling on
+     Ctrl-R. The documented usage is therefore a leading-space invocation
+     (` histrm …`), which `HISTCONTROL=ignoreboth` keeps out of history
+     entirely; a shell-function implementation that deletes its own entry
+     satisfies the postcondition equally. The scope is exactly the
+     invocation — bash tracks its write offset, so entries flushed before
+     the rewrite are not re-appended.
    - **Atomic publication.** No reader ever observes a partially written
      file.
    - **No-op safety.** A pattern that matches nothing leaves the destination
@@ -127,10 +149,15 @@ automatic policy would have to guess correctly on every one of the 1,168 to
 clean up two. A pattern the user chooses, run when they notice, cannot guess
 wrong.
 
-**Removal composes with the #24 sync design.** Because every shell reloads the
-merged file at each prompt (`history -c; history -r`), one `histrm` propagates
-to every live tmux pane at its next prompt with no restart and no per-pane
-action.
+**Removal composes with the #24 sync design — in both directions.** Because
+every shell reloads the merged file at each prompt (`history -c; history -r`),
+one `histrm` propagates to every live tmux pane at its next prompt with no
+restart and no per-pane action. The same prompt hook is also what makes the
+no-self-reintroduction postcondition necessary rather than pedantic: `history -a`
+runs on that same next prompt and would otherwise publish the invocation — and
+therefore the pattern text — to every one of those panes. The sync is not a
+free win to be assumed; it propagates whatever the file says, including a
+mistake.
 
 ## Consequences
 
@@ -142,10 +169,17 @@ action.
   accepted trade: the repo prefers a manual, precise cleanup over an automatic,
   imprecise one.
 - `histrm` becomes a piece of software with real correctness obligations —
-  mixed timestamped and untimestamped entries, multi-line entries, concurrent
-  appends from live shells, and a backup before mutation. It should be built
-  and tested to the standard `scripts/import-zsh-history.py` was, not written
-  as a one-line `sed`.
+  possibly-untimestamped entries, multi-line entries, concurrent appends from
+  live shells, file modes on every artifact, and a backup before mutation. It
+  should be built and tested to the standard `scripts/import-zsh-history.py`
+  was, not written as a one-line `sed`. A naive `grep -v` rewrite fails at
+  least three of the postconditions above (orphaned `#epoch` lines, a
+  `0644` replacement inode, and self-reintroduction), which is why they are
+  written down rather than left to taste.
+- The usage is part of the contract, not a tip: `histrm` is invoked with a
+  leading space unless it is implemented to delete its own entry. A helper
+  that is correct internally and invoked normally still leaves the pattern in
+  history, so documentation that omits the space documents a broken workflow.
 - Removal is strictly harder than the import was, and the ADR does not pretend
   otherwise: the importer could sidestep concurrency with `O_APPEND`, while a
   rewrite cannot. Whoever implements `histrm` inherits a real design decision
@@ -171,8 +205,29 @@ resource, RBAC, NetworkPolicy, registry image, or secret is involved.
   invalid `codex --dangerously-skip-approvals-…` spelling versus 136 of the
   valid `--dangerously-bypass-approvals-…` one. (Counts only — history contents
   are not reproduced here.)
+- Format ambiguity, measured 2026-08-19 (counts only): the live
+  `~/.bash_history` had 928 lines and 429 `#epoch` markers. Uniform pairs
+  would be 858, so 70 lines are unaccounted for — but bash's format cannot
+  say whether those are continuation lines of multi-line entries,
+  untimestamped entries, or both, and the file had no untimestamped entry
+  before its first marker. That is precisely why the contract is written for
+  what the format *permits* rather than what one file happens to hold: the
+  distinction is not recoverable by inspection.
+- Self-reintroduction, probed 2026-08-19 in a synthetic interactive bash using
+  this repo's `bash/bashrc`, with a naive `grep -v` removal helper on `PATH`:
+  seeding one matching entry and running `histrm <marker>` normally left the
+  file with exactly one matching line — the recorded `histrm <marker>`
+  invocation. Invoking it with a leading space left zero. A separate run
+  confirmed the scope: an entry flushed before the rewrite was *not*
+  re-appended, so only the invocation is at risk. The same run also showed the
+  naive helper orphaning a `#epoch` line whose command it removed —
+  independent evidence that the structural-integrity postcondition is load-
+  bearing rather than decorative.
+- `~/.bash_history` mode observed `0600` on 2026-08-19, which is the mode the
+  privacy postcondition requires a rewrite to preserve rather than relax.
 - `bash/bashrc` — `HISTCONTROL=ignoreboth` and the `_term_public_history_sync`
-  `PROMPT_COMMAND` (the hook point a cull would have used), added in #24.
+  `PROMPT_COMMAND` (the hook point a cull would have used, and the mechanism
+  that would re-add a `histrm` invocation), added in #24.
 - `bash/bashrc` — the Up/Down `history-search-backward`/`-forward` bindings and
   the fzf keybinding source block, added in #29, which are what make a polluted
   history actively visible.
@@ -184,7 +239,10 @@ resource, RBAC, NetworkPolicy, registry image, or secret is involved.
   concurrency and file-format hazards `histrm` inherits. Two specifics the
   removal contract above depends on: `render_bash_history` emits a `#epoch`
   line only `if timestamp is not None`, so an untimestamped entry is written
-  bare (the file is a *mix*, not uniform pairs); and the destination write is
+  bare and the file **can** be a mix rather than uniform pairs — a capability
+  of the writer, which is what the conservative contract needs; it is not a
+  claim about what any particular file contains today (see the next bullet);
+  and the destination write is
   `O_APPEND` with the comment "Append via `O_APPEND`, never read-modify-replace:
   a `history -a` from a live shell between the snapshot above and this write
   must survive" — an option available to an additive import and not to a
