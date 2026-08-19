@@ -880,7 +880,8 @@ class TestCleanPrBranch:
         cmds = [c.args[0] for c in mock_git.call_args_list]
         assert cmds == [
             ['checkout', 'main'],
-            ['pull', '--rebase', 'origin', 'main'],
+            ['fetch', 'origin', 'main'],
+            ['merge', '--ff-only', 'FETCH_HEAD'],
             ['branch', '-D', 'old-branch'],
         ]
 
@@ -918,11 +919,10 @@ class TestCleanPrBranch:
         assert len(mock_git.call_args_list) == 1
         assert mock_git.call_args_list[0].args[0] == ['checkout', 'main']
 
-    def test_pull_failure_aborts_rebase(self):
+    def test_pull_failure_reported_without_rebase(self):
         dispatch = self._git_dispatch({
             'checkout': self._ok(),
-            'pull': self._fail('conflict'),
-            'rebase': self._ok(),
+            'merge': self._fail('conflict'),
         })
         with patch.object(hive, '_default_branch', return_value='main'):
             with patch.object(hive, '_git_out', return_value=''):
@@ -930,16 +930,65 @@ class TestCleanPrBranch:
                     result = hive._clean_pr_branch(Path('/repo'), 'old-branch')
         assert result['success'] is False
         assert 'pull' in result['error']
-        # Verify rebase --abort was called after pull failure
         cmds = [c.args[0] for c in mock_git.call_args_list]
-        assert ['rebase', '--abort'] in cmds
+        # A sweep never starts or aborts a rebase
+        assert not any(c[0] == 'rebase' for c in cmds)
         # branch -D should NOT have been called
+        assert not any(c[0] == 'branch' for c in cmds)
+
+    def test_fetch_failure_reported_not_classified(self):
+        """A failed fetch reports the fetch error — no ancestry probe, no
+        divergence claim, no integration attempt."""
+        dispatch = self._git_dispatch({
+            'checkout': self._ok(),
+            'fetch': self._fail('could not resolve host'),
+            # If classification ran anyway, this would report divergence.
+            'merge-base': self._fail(),
+        })
+
+        def fake_git_out(args, cwd=None):
+            if args[0] == 'rev-parse':
+                return 'stale123'  # stale refs still resolve
+            return ''
+
+        with patch.object(hive, '_default_branch', return_value='main'):
+            with patch.object(hive, '_git_out', side_effect=fake_git_out):
+                with patch.object(hive, '_git', side_effect=dispatch) as mock_git:
+                    result = hive._clean_pr_branch(Path('/repo'), 'old-branch')
+        assert result['success'] is False
+        assert 'fetch' in result['error']
+        assert 'diverged' not in result['error']
+        cmds = [c.args[0] for c in mock_git.call_args_list]
+        assert not any(c[0] in ('merge', 'merge-base', 'branch') for c in cmds)
+
+    def test_pull_divergence_reported(self):
+        """A diverged default branch is reported, never rewritten."""
+        not_ancestor = subprocess.CompletedProcess([], 1, stdout='', stderr='')
+        dispatch = self._git_dispatch({
+            'checkout': self._ok(),
+            'merge': self._fail('Not possible to fast-forward'),
+            'merge-base': not_ancestor,
+        })
+
+        def fake_git_out(args, cwd=None):
+            if args == ['rev-parse', '--verify', 'FETCH_HEAD']:
+                return 'abc123'
+            return ''
+
+        with patch.object(hive, '_default_branch', return_value='main'):
+            with patch.object(hive, '_git_out', side_effect=fake_git_out):
+                with patch.object(hive, '_git', side_effect=dispatch) as mock_git:
+                    result = hive._clean_pr_branch(Path('/repo'), 'old-branch')
+        assert result['success'] is False
+        assert 'diverged' in result['error']
+        cmds = [c.args[0] for c in mock_git.call_args_list]
+        assert not any(c[0] == 'rebase' for c in cmds)
         assert not any(c[0] == 'branch' for c in cmds)
 
     def test_branch_delete_failure(self):
         dispatch = self._git_dispatch({
             'checkout': self._ok(),
-            'pull': self._ok('Already up to date'),
+            'merge': self._ok('Already up to date'),
             'branch': self._fail(),
         })
         with patch.object(hive, '_default_branch', return_value='main'):
@@ -960,7 +1009,8 @@ class TestCleanPrBranch:
         cmds = [c.args[0] for c in mock_git.call_args_list]
         assert cmds == [
             ['checkout', 'infra-dev'],
-            ['pull', '--rebase', 'origin', 'infra-dev'],
+            ['fetch', 'origin', 'infra-dev'],
+            ['merge', '--ff-only', 'FETCH_HEAD'],
             ['branch', '-D', 'old-branch'],
         ]
 
@@ -2356,7 +2406,7 @@ class TestPullEngine:
         assert result.cached is False
         assert result.up_to_date is True
         assert cache.get_remote_sha(origin_url, 'main') == new_sha
-        mock_git.assert_called_once()
+        assert mock_git.call_count == 2  # fetch + ff-only merge
 
     def test_no_cache_skips_cache_logic(self, tmp_path):
         """When pull_cache is None, no origin URL lookup happens."""
@@ -2416,7 +2466,7 @@ class TestPullEngine:
 
         assert r1.cached is False
         assert cache.get_remote_sha(origin_url, 'main') == head_sha
-        mock_git.assert_called_once()
+        assert mock_git.call_count == 2  # fetch + ff-only merge
 
         with patch.object(hive, '_git_out', side_effect=fake_git_out):
             with patch.object(hive, '_git') as mock_git2:
@@ -2478,7 +2528,7 @@ class TestPullEngine:
 
         assert result.cached is False
         assert result.up_to_date is True
-        mock_git.assert_called_once()
+        assert mock_git.call_count == 2  # fetch + ff-only merge
         assert cache.remote_shas == {}
 
     def test_dirty_repo_with_cache_hit_returns_skipped(self, tmp_path):
@@ -2546,7 +2596,7 @@ class TestPullEngine:
                 r2 = self._pull(repo_feat, cache=cache)
 
         assert r2.cached is False
-        mock_git.assert_called_once()
+        assert mock_git.call_count == 2  # fetch + ff-only merge
         assert cache.get_remote_sha(origin_url, 'feature') == head_sha
 
 
@@ -2575,3 +2625,358 @@ class TestFormatPullSegmentCached:
         )
         seg = hive._format_pull_segment(result)
         assert 'cached' not in seg
+
+
+# --- Fast-forward-only pull guards (issue #26) --------------------------------
+
+
+class TestPullFfOnly:
+    """A pull sweep must never rewrite history: ff-only, divergence reported."""
+
+    @staticmethod
+    def _pull(repo, cache=None, push=False):
+        status = hive.analyze_repo(repo, hive._ORIGIN_REMOTE, remote_cache=cache)
+        return hive.execute_sync(status, remote_cache=cache, push=push)
+
+    @staticmethod
+    def _clean_git_out(extra=None):
+        """git_out fake for a clean repo on main; extra maps arg-tuples to output."""
+        def fake_git_out(args, cwd=None):
+            if args == ['rev-parse', '--abbrev-ref', 'HEAD']:
+                return 'main'
+            if args == ['status', '--porcelain']:
+                return ''
+            if extra and tuple(args) in extra:
+                return extra[tuple(args)]
+            return None
+        return fake_git_out
+
+    @staticmethod
+    def _diverged_git(merge_stderr='Not possible to fast-forward'):
+        """_git fake: fetch succeeds, ff-only merge fails, both ancestry
+        checks answer 'not an ancestor'."""
+        def fake_git(args, cwd=None, timeout=None):
+            if args[0] == 'merge':
+                return subprocess.CompletedProcess(
+                    [], 1, stdout='', stderr=merge_stderr)
+            if args[0] == 'merge-base':
+                return subprocess.CompletedProcess([], 1, stdout='', stderr='')
+            return subprocess.CompletedProcess([], 0, stdout='', stderr='')
+        return fake_git
+
+    def test_pull_is_fetch_then_ff_only_merge(self, tmp_path):
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        ok = subprocess.CompletedProcess(
+            [], 0, stdout='Already up to date.', stderr='')
+        with patch.object(hive, '_git_out', side_effect=self._clean_git_out()):
+            with patch.object(hive, '_git', return_value=ok) as mock_git:
+                result = self._pull(repo)
+        assert result.up_to_date is True
+        cmds = [c.args[0] for c in mock_git.call_args_list]
+        assert cmds == [
+            ['fetch', 'origin', 'main'],
+            ['merge', '--ff-only', 'FETCH_HEAD'],
+        ]
+
+    def test_diverged_branch_skipped_never_rebased(self, tmp_path):
+        """The #26 incident: clean tree + diverged history must not be rewritten."""
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        git_out = self._clean_git_out(
+            {('rev-parse', '--verify', 'FETCH_HEAD'): 'abc123'})
+        with patch.object(hive, '_git_out', side_effect=git_out):
+            with patch.object(hive, '_git',
+                              side_effect=self._diverged_git()) as mock_git:
+                result = self._pull(repo)
+        assert result.action == hive.SyncAction.SKIP_DIVERGED
+        assert result.diverged is True
+        assert result.pull_failed is False
+        cmds = [c.args[0][0] for c in mock_git.call_args_list]
+        assert 'rebase' not in cmds
+
+    def test_diverged_branch_not_pushed(self, tmp_path):
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        git_out = self._clean_git_out(
+            {('rev-parse', '--verify', 'FETCH_HEAD'): 'abc123'})
+        with patch.object(hive, '_git_out', side_effect=git_out):
+            with patch.object(hive, '_git',
+                              side_effect=self._diverged_git()) as mock_git:
+                result = self._pull(repo, push=True)
+        assert result.diverged is True
+        assert result.pushed is False
+        cmds = [c.args[0][0] for c in mock_git.call_args_list]
+        assert 'push' not in cmds
+
+    def test_diverged_branch_does_not_update_cache(self, tmp_path):
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        cache = hive.RemoteCache()
+        git_out = self._clean_git_out({
+            ('rev-parse', '--verify', 'FETCH_HEAD'): 'abc123',
+            ('config', '--get', 'remote.origin.url'): 'ssh://git@host/org/repo',
+            ('rev-parse', 'HEAD'): 'localsha',
+        })
+        with patch.object(hive, '_git_out', side_effect=git_out):
+            with patch.object(hive, '_git', side_effect=self._diverged_git()):
+                result = self._pull(repo, cache=cache)
+        assert result.diverged is True
+        assert cache.remote_shas == {}
+
+    def test_fetch_failure_with_stale_divergent_ref_is_error(self, tmp_path):
+        """A failed fetch must never be classified as divergence, even when a
+        stale remote-tracking ref exists and is mutually non-ancestral with
+        HEAD — the fetch observed nothing, and its error must be preserved."""
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+
+        def fake_git(args, cwd=None, timeout=None):
+            if args[0] == 'fetch':
+                return subprocess.CompletedProcess(
+                    [], 1, stdout='', stderr='could not resolve host')
+            # If classification ran anyway, these would report divergence.
+            if args[0] == 'merge-base':
+                return subprocess.CompletedProcess([], 1, stdout='', stderr='')
+            return subprocess.CompletedProcess([], 0, stdout='', stderr='')
+
+        # Both a stale tracking ref and FETCH_HEAD resolve, as after an
+        # earlier successful fetch.
+        git_out = self._clean_git_out({
+            ('rev-parse', '--verify', 'FETCH_HEAD'): 'stale123',
+            ('rev-parse', '--verify', 'origin/main'): 'stale123',
+        })
+        with patch.object(hive, '_git_out', side_effect=git_out):
+            with patch.object(hive, '_git', side_effect=fake_git) as mock_git:
+                result = self._pull(repo)
+        assert result.pull_failed is True
+        assert result.diverged is False
+        assert result.error_lines == ['could not resolve host']
+        # No ancestry probe may run after a failed fetch
+        cmds = [c.args[0][0] for c in mock_git.call_args_list]
+        assert 'merge-base' not in cmds
+
+    def test_behind_only_failure_is_error_not_diverged(self, tmp_path):
+        """When HEAD is an ancestor of FETCH_HEAD, a failed merge is not divergence."""
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+
+        def fake_git(args, cwd=None, timeout=None):
+            if args[0] == 'merge':
+                return subprocess.CompletedProcess([], 1, stdout='', stderr='boom')
+            if args == ['merge-base', '--is-ancestor', 'HEAD', 'FETCH_HEAD']:
+                return subprocess.CompletedProcess([], 0, stdout='', stderr='')
+            if args[0] == 'merge-base':
+                return subprocess.CompletedProcess([], 1, stdout='', stderr='')
+            return subprocess.CompletedProcess([], 0, stdout='', stderr='')
+
+        git_out = self._clean_git_out(
+            {('rev-parse', '--verify', 'FETCH_HEAD'): 'abc123'})
+        with patch.object(hive, '_git_out', side_effect=git_out):
+            with patch.object(hive, '_git', side_effect=fake_git):
+                result = self._pull(repo)
+        assert result.pull_failed is True
+        assert result.diverged is False
+
+    def test_no_rebase_abort_on_pull_failure(self, tmp_path):
+        """The old rebase --abort cleanup must be gone — it could destroy a
+        bystander agent's in-progress rebase."""
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        fail = subprocess.CompletedProcess([], 1, stdout='', stderr='boom')
+        with patch.object(hive, '_git_out', side_effect=self._clean_git_out()):
+            with patch.object(hive, '_git', return_value=fail) as mock_git:
+                self._pull(repo)
+        assert ['rebase', '--abort'] not in [
+            c.args[0] for c in mock_git.call_args_list]
+
+
+class TestOperationInProgress:
+    @staticmethod
+    def _repo(tmp_path):
+        repo = tmp_path / 'repo'
+        (repo / '.git').mkdir(parents=True)
+        return repo
+
+    @staticmethod
+    def _check(repo):
+        with patch.object(hive, '_git_out', return_value='.git'):
+            return hive._operation_in_progress(repo)
+
+    def test_rebase_merge(self, tmp_path):
+        repo = self._repo(tmp_path)
+        (repo / '.git' / 'rebase-merge').mkdir()
+        assert self._check(repo) == 'rebase'
+
+    def test_rebase_apply(self, tmp_path):
+        repo = self._repo(tmp_path)
+        (repo / '.git' / 'rebase-apply').mkdir()
+        assert self._check(repo) == 'rebase'
+
+    def test_merge_head(self, tmp_path):
+        repo = self._repo(tmp_path)
+        (repo / '.git' / 'MERGE_HEAD').write_text('abc123\n')
+        assert self._check(repo) == 'merge'
+
+    def test_cherry_pick_head(self, tmp_path):
+        repo = self._repo(tmp_path)
+        (repo / '.git' / 'CHERRY_PICK_HEAD').write_text('abc123\n')
+        assert self._check(repo) == 'cherry-pick'
+
+    def test_clean_repo(self, tmp_path):
+        repo = self._repo(tmp_path)
+        assert self._check(repo) is None
+
+    def test_git_dir_lookup_failure(self, tmp_path):
+        with patch.object(hive, '_git_out', return_value=None):
+            assert hive._operation_in_progress(tmp_path) is None
+
+    def test_absolute_git_dir(self, tmp_path):
+        repo = self._repo(tmp_path)
+        (repo / '.git' / 'rebase-merge').mkdir()
+        with patch.object(hive, '_git_out', return_value=str(repo / '.git')):
+            assert hive._operation_in_progress(repo) == 'rebase'
+
+
+class TestHoldReason:
+    def test_hold_set(self, tmp_path):
+        with patch.object(hive, '_git_out', return_value='mid-rewrite, back soon'):
+            assert hive._hold_reason(tmp_path) == 'mid-rewrite, back soon'
+
+    def test_hold_unset(self, tmp_path):
+        with patch.object(hive, '_git_out', return_value=None):
+            assert hive._hold_reason(tmp_path) is None
+
+    def test_hold_set_but_empty(self, tmp_path):
+        with patch.object(hive, '_git_out', return_value=''):
+            assert hive._hold_reason(tmp_path) == '(no reason given)'
+
+
+class TestPullGuards:
+    """Hold markers and in-flight operations stop a sweep before any git mutation."""
+
+    @staticmethod
+    def _analyze(repo, git_out):
+        with patch.object(hive, '_git_out', side_effect=git_out):
+            with patch.object(hive, '_git') as mock_git:
+                status = hive.analyze_repo(repo, hive._ORIGIN_REMOTE)
+                result = hive.execute_sync(status, push=True)
+        return result, mock_git
+
+    @staticmethod
+    def _git_out_fake(hold=None, porcelain=''):
+        def fake(args, cwd=None):
+            if args == ['rev-parse', '--abbrev-ref', 'HEAD']:
+                return 'main'
+            if args == ['config', '--get', 'hive.hold']:
+                return hold
+            if args == ['status', '--porcelain']:
+                return porcelain
+            return None
+        return fake
+
+    def test_held_repo_skipped(self, tmp_path):
+        result, mock_git = self._analyze(
+            tmp_path, self._git_out_fake(hold='rewriting history'))
+        assert result.action == hive.SyncAction.SKIP_HELD
+        assert result.held is True
+        assert result.hold_reason == 'rewriting history'
+        mock_git.assert_not_called()
+
+    def test_hold_wins_over_dirty(self, tmp_path):
+        result, mock_git = self._analyze(
+            tmp_path, self._git_out_fake(hold='claimed', porcelain='M f.py'))
+        assert result.held is True
+        assert result.dirty_count == 0
+        mock_git.assert_not_called()
+
+    def test_in_progress_repo_skipped(self, tmp_path):
+        """Clean tree + mid-rebase — the window the dirty check cannot see."""
+        with patch.object(hive, '_operation_in_progress', return_value='rebase'):
+            result, mock_git = self._analyze(tmp_path, self._git_out_fake())
+        assert result.action == hive.SyncAction.SKIP_IN_PROGRESS
+        assert result.in_progress is True
+        assert result.in_progress_op == 'rebase'
+        mock_git.assert_not_called()
+
+    def test_in_progress_wins_over_dirty(self, tmp_path):
+        with patch.object(hive, '_operation_in_progress', return_value='merge'):
+            result, mock_git = self._analyze(
+                tmp_path, self._git_out_fake(porcelain='UU f.py'))
+        assert result.in_progress is True
+        assert result.dirty_count == 0
+        mock_git.assert_not_called()
+
+
+class TestPullGuardRendering:
+    @staticmethod
+    def _status(action, **kwargs):
+        return hive.RepoStatus(
+            path=Path('/repo'),
+            branch='feature',
+            remote_profile=hive._ORIGIN_REMOTE,
+            action=action,
+            **kwargs,
+        )
+
+    def test_segment_diverged(self):
+        seg = hive._format_pull_segment(
+            self._status(hive.SyncAction.SKIP_DIVERGED))
+        assert 'feature' in seg
+        assert 'diverged' in seg
+        assert 'skipped' in seg
+
+    def test_segment_in_progress(self):
+        seg = hive._format_pull_segment(
+            self._status(hive.SyncAction.SKIP_IN_PROGRESS,
+                         in_progress_op='rebase'))
+        assert 'rebase in progress' in seg
+
+    def test_segment_held(self):
+        seg = hive._format_pull_segment(
+            self._status(hive.SyncAction.SKIP_HELD, hold_reason='claimed'))
+        assert 'held' in seg
+        assert 'claimed' in seg
+
+    def test_notable_states(self):
+        """All guard states must surface in quiet mode, even on the default branch."""
+        for action, extra in [
+            (hive.SyncAction.SKIP_DIVERGED, {}),
+            (hive.SyncAction.SKIP_IN_PROGRESS, {'in_progress_op': 'rebase'}),
+            (hive.SyncAction.SKIP_HELD, {'hold_reason': 'claimed'}),
+        ]:
+            status = self._status(action, **extra)
+            status.branch = 'main'
+            assert hive._is_notable(status, 'main') is True
+
+    def test_clean_default_not_notable(self):
+        status = self._status(hive.SyncAction.NONE, up_to_date=True)
+        status.branch = 'main'
+        assert hive._is_notable(status, 'main') is False
+
+    def _pull_repo_output(self, status, capsys):
+        with patch.object(hive, 'analyze_repo', return_value=status):
+            with patch.object(hive, 'execute_sync', return_value=status):
+                ok = hive._pull_repo(Path('/repo'), push=False)
+        return ok, capsys.readouterr().out
+
+    def test_verbose_diverged(self, capsys):
+        status = self._status(hive.SyncAction.SKIP_DIVERGED)
+        ok, out = self._pull_repo_output(status, capsys)
+        assert ok is False
+        assert 'diverged' in out
+        assert 'feature' in out
+
+    def test_verbose_in_progress(self, capsys):
+        status = self._status(hive.SyncAction.SKIP_IN_PROGRESS,
+                              in_progress_op='cherry-pick')
+        ok, out = self._pull_repo_output(status, capsys)
+        assert ok is False
+        assert 'cherry-pick in progress' in out
+
+    def test_verbose_held(self, capsys):
+        status = self._status(hive.SyncAction.SKIP_HELD,
+                              hold_reason='mid-rewrite')
+        ok, out = self._pull_repo_output(status, capsys)
+        assert ok is False
+        assert 'held: mid-rewrite' in out
