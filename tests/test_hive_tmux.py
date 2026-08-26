@@ -703,9 +703,10 @@ class TestStatusBarTmuxProbe:
         probe_home = tmp_path / 'home'
         probe_tmux_dir = probe_home / '.tmux'
         probe_tmux_dir.mkdir(parents=True)
-        shutil.copy2(
-            _SCRIPTS_DIR.parent / 'tmux' / 'tmux.conf',
-            probe_tmux_dir / 'tmux.conf')
+        # The base config has its own version-aware tests. Keep this probe
+        # focused on parsing the generated layer even when CI's tmux is older
+        # than the machine targeted by tmux/tmux.conf.
+        (probe_tmux_dir / 'tmux.conf').touch()
         probe_env = {**os.environ, 'HOME': str(probe_home)}
         with patch.object(hive, '_TMUX_DIR', tmp_path / 'hive-tmux'):
             config = hive._write_tmux_config(
