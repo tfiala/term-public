@@ -136,15 +136,30 @@ Conda, nvm, rustup, pyenv, the Google Cloud SDK, and JetBrains Toolbox all
 behave the same way.
 
 When it happens, move the line into `local/env.local` (use `$HOME`, not a
-literal home path) and revert the tracked file:
+literal home path), then remove **only** the installer's hunk from the tracked
+file — inspect first, because a whole-file restore would also discard any
+in-flight edits of your own:
 
 ```bash
-git checkout bash/bash_profile   # or bash/bashrc
+git diff bash/bash_profile        # or bash/bashrc — see exactly what changed
+git restore -p bash/bash_profile  # stage-by-hunk: discard only the installer block
 ```
 
-`tests/test_no_machine_specific_config.py` fails in CI if a hardcoded home
-directory or a known installer marker survives in tracked config, so this
-cannot be committed silently.
+Use a whole-file `git restore bash/bash_profile` only after `git diff` has
+shown the installer block is the sole change.
+
+`tests/test_no_machine_specific_config.py` rejects three shapes in tracked
+config: a hardcoded home directory, a known installer marker comment, and the
+`$HOME`-parameterized init blocks version managers write (nvm, pyenv, conda,
+rbenv, SDKMAN, the Google Cloud SDK) — plus a header check that catches an
+unrecognized block prepended to either linked profile. Every installer named
+above has a committed fixture asserting it is caught, so the coverage claim in
+this section is enforced rather than aspirational.
+
+**Boundary:** that test runs in CI, which is after a push. It blocks
+integration, but it cannot stop a literal path from first appearing in a commit
+on a public branch. Preventing that would need a local pre-push hook, which
+this repo does not currently install.
 
 ## Day / night mode
 
