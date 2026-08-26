@@ -213,10 +213,14 @@ hive tmux --new-window
 ```
 
 `hive tmux` starts (or attaches to) a per-hive tmux session — one window per
-workspace, a per-hive color theme, automatic window labels, and backtick-prefix
-keybindings for the common hive operations. The session survives a closed
-terminal or a dropped SSH connection. The `tmux/tmux.conf` base config carries
-the settings that make Claude CLI render correctly inside tmux (notably
+workspace, a per-hive color theme, compact numeric window tabs, and
+backtick-prefix keybindings for the common hive operations. The current tab is
+bracketed independent of color, while run-state glyphs remain beside the window
+number. The selected branch appears once at right and contracts by task-word
+initials as space tightens (`fix/automatic-publication-receipt-ledger` becomes
+`fix/aprl`, then `f/aprl`, then `aprl`). The session survives a closed terminal
+or a dropped SSH connection. The `tmux/tmux.conf` base config carries the
+settings that make Claude CLI render correctly inside tmux (notably
 `allow-passthrough on` plus synchronized output) and pins `default-shell` to
 Homebrew bash.
 
