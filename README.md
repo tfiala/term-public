@@ -170,16 +170,21 @@ This table is the single inventory of covered installers: each row has a
 committed fixture built from the line the tool actually emits, and the tests
 assert this table and the fixture set match exactly in both directions.
 
+Some installers interpolate your home directory **literally** at install time
+(shown as `/Users/<user>` below) and some write `$HOME`. That difference decides
+whether the hardcoded-home detector fires, so it is part of each fixture's
+contract rather than a formatting detail.
+
 | Installer | Emitted shape | Detected as |
 |---|---|---|
-| `docker desktop` | marker comment + `export PATH="$PATH:$HOME/.docker/bin"` | installer marker |
-| `conda` | `# >>> conda initialize >>>` block | installer marker, third-party init |
+| `docker desktop` | marker comment + `export PATH="$PATH:/Users/<user>/.docker/bin"` | installer marker, hardcoded home |
+| `conda` | `# >>> conda initialize >>>` block naming `/Users/<user>/miniconda3` | installer marker, third-party init, hardcoded home |
 | `rustup` | `. "$HOME/.cargo/env"` | third-party init |
 | `nvm` | `export NVM_DIR="$HOME/.nvm"` + `nvm.sh` source | third-party init |
 | `pyenv` | `export PYENV_ROOT="$HOME/.pyenv"` + `pyenv init` | third-party init |
 | `rbenv` | `export RBENV_ROOT="$HOME/.rbenv"` + `rbenv init` | third-party init |
 | `sdkman` | `export SDKMAN_DIR="$HOME/.sdkman"` + `sdkman-init.sh` | third-party init |
-| `google cloud sdk` | `path.bash.inc` source + marker comment | installer marker, third-party init |
+| `google cloud sdk` | marker comment + `/Users/<user>/google-cloud-sdk/path.bash.inc` source | installer marker, third-party init, hardcoded home |
 | `jetbrains toolbox` | `# added by JetBrains Toolbox` + PATH | installer marker |
 
 **Boundary:** that test runs in CI, which is after a push. It blocks
