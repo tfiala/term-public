@@ -700,17 +700,24 @@ class TestTmuxStartNewWindow:
 class TestStatusBarTmuxProbe:
     def test_generated_config_parses(self, fake_hive, tmp_path):
         socket = f'hive-config-{os.getpid()}-{time.time_ns()}'
+        probe_home = tmp_path / 'home'
+        probe_tmux_dir = probe_home / '.tmux'
+        probe_tmux_dir.mkdir(parents=True)
+        shutil.copy2(
+            _SCRIPTS_DIR.parent / 'tmux' / 'tmux.conf',
+            probe_tmux_dir / 'tmux.conf')
+        probe_env = {**os.environ, 'HOME': str(probe_home)}
         with patch.object(hive, '_TMUX_DIR', tmp_path / 'hive-tmux'):
             config = hive._write_tmux_config(
                 fake_hive, hive._SHELL_PALETTE[0])
         try:
             subprocess.run(
                 ['tmux', '-L', socket, 'new-session', '-d', '-s', 'probe'],
-                check=True, capture_output=True, text=True)
+                check=True, capture_output=True, text=True, env=probe_env)
             sourced = subprocess.run(
                 ['tmux', '-L', socket, 'source-file', '-t', 'probe',
                  str(config)],
-                capture_output=True, text=True)
+                capture_output=True, text=True, env=probe_env)
             assert sourced.returncode == 0, sourced.stderr
         finally:
             subprocess.run(['tmux', '-L', socket, 'kill-server'],
