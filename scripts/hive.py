@@ -2358,7 +2358,7 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
         '',
         '# Status right (compact branch [sync] | time). The helper budgets',
         '# its fixed-width branch field around the session and numeric tabs.',
-        'set status-right-length 32',
+        'set status-right-length 40',
         'set status-right " #(hive tmux status-context '
         '\\"#{pane_current_path}\\" \\"#{client_width}\\" '
         '\\"#{session_name}\\" \\"#{session_windows}\\")'
@@ -2369,6 +2369,7 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
         'set allow-rename off',
         '',
         '# Window label update hooks (session-scoped)',
+        'set-hook after-new-window   "run-shell -b \'hive tmux label-window \\"#{pane_current_path}\\" \\"#{window_id}\\"\'"',
         'set-hook after-select-window "run-shell -b \'hive tmux label-window \\"#{pane_current_path}\\" \\"#{window_id}\\"\'"',
         'set-hook after-select-pane   "run-shell -b \'hive tmux label-window \\"#{pane_current_path}\\" \\"#{window_id}\\"\'"',
         '',
@@ -2377,13 +2378,13 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
         '# the default behavior for non-hive sessions.',
         '',
         '# backtick + r: reload config (hive config or base tmux.conf)',
-        'bind r run-shell \''
+        'bind r run-shell -b \''
         'if [ -n "$HIVE_NAME" ]; then'
         '  CONF="/tmp/hive-tmux/$HIVE_NAME.conf";'
         '  [ -f "$CONF" ] && tmux source-file "$CONF" &&'
-        '    hive tmux refresh-labels "#{session_id}" &&'
+        '    hive tmux refresh-labels "#{session_name}" &&'
         '    tmux display-message "Reloaded: $CONF"'
-        '    || tmux display-message "Config not found";'
+        '    || tmux display-message "Reload failed: $CONF";'
         'else'
         '  tmux source-file "$HOME/.tmux/tmux.conf" && tmux display-message "Reloaded!";'
         'fi\'',
@@ -2438,8 +2439,9 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
         '# backtick + R: force-refresh all window labels (hive only)',
         'bind R run-shell -b \''
         'if [ -n "$HIVE_ROOT" ]; then'
-        '  hive tmux refresh-labels "#{session_id}" &&'
-        '    tmux display-message "Labels refreshed";'
+        '  hive tmux refresh-labels "#{session_name}" &&'
+        '    tmux display-message "Labels refreshed" ||'
+        '    tmux display-message "Label refresh failed";'
         'else'
         '  tmux display-message "Not in a hive session";'
         'fi\'',
@@ -2526,10 +2528,13 @@ def _branch_field_width(client_width: str, session_name: str,
     except (TypeError, ValueError):
         return 4
 
-    # Session badge + three columns per numeric tab + the leading space and
-    # `` | HH:MM PT `` at right. Two final columns leave slack for tmux's list
-    # arrows/spacing.
-    available = width - (len(session_name) + 3) - (windows * 3) - 13 - 2
+    # Session badge + numeric tabs (including one run glyph each) + the leading
+    # space and clock at right. Sequential windows above 9 need one more index
+    # column. Reserve the largest ordinary sync indicator (9 visible columns)
+    # and two columns of slack for tmux's list arrows/spacing.
+    tab_width = (windows * 4) + max(0, windows - 9)
+    available = (
+        width - (len(session_name) + 3) - tab_width - 13 - 9 - 2)
     for field_width in (10, 6, 4):
         if available >= field_width:
             return field_width
@@ -2858,21 +2863,22 @@ def _set_tmux_window_status(window_id: str, run_suffix: str) -> None:
             capture_output=True)
 
 
-def _tmux_refresh_labels(session: str) -> None:
-    """Refresh every window label and compact tab in one tmux session."""
+def _tmux_refresh_labels(session: str) -> bool:
+    """Refresh every window in one session; return false if it cannot be read."""
     if not session:
-        return
+        return False
     r = subprocess.run(
         ['tmux', 'list-windows', '-t', session,
          '-F', '#{window_id}\t#{pane_current_path}'],
         capture_output=True, text=True)
     if r.returncode != 0:
-        return
+        return False
     for line in r.stdout.splitlines():
         if '\t' not in line:
             continue
         window_id, pane_path = line.split('\t', 1)
         _tmux_label_window(pane_path, window_id)
+    return True
 
 
 # --- tmux subcommand ----------------------------------------------------------
@@ -2887,7 +2893,8 @@ def cmd_tmux(args: argparse.Namespace) -> None:
         _tmux_label_window(args.pane_path, args.window_id)
         return
     if action == 'refresh-labels':
-        _tmux_refresh_labels(args.session)
+        if not _tmux_refresh_labels(args.session):
+            sys.exit(1)
         return
     if action == 'status-context':
         _tmux_status_context(args.pane_path, args.client_width,

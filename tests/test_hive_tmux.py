@@ -131,6 +131,7 @@ class TestGenerateTmuxConfig:
         assert 'hive tmux label-window' in conf
         assert 'hive tmux refresh-labels' in conf
         assert 'hive tmux status-context' in conf
+        assert 'set-hook after-new-window' in conf
         assert 'hive tmux popup' in conf
         assert 'hive tmux runs' in conf
         assert 'hive tmux --hive' in conf
@@ -138,8 +139,14 @@ class TestGenerateTmuxConfig:
 
     def test_status_right_is_bounded(self, fake_hive):
         conf = hive._generate_tmux_config(fake_hive, hive._SHELL_PALETTE[0])
-        assert 'set status-right-length 32' in conf
+        assert 'set status-right-length 40' in conf
         assert 'rev-parse --abbrev-ref HEAD' not in conf
+
+    def test_refresh_bindings_use_shell_safe_session_name(self, fake_hive):
+        conf = hive._generate_tmux_config(fake_hive, hive._SHELL_PALETTE[0])
+        assert '#{session_id}' not in conf
+        assert conf.count('refresh-labels "#{session_name}"') == 2
+        assert 'bind r run-shell -b' in conf
 
 
 class TestWriteTmuxConfig:
@@ -239,9 +246,13 @@ class TestBranchFieldWidth:
         assert hive._branch_field_width('107', 'workingal-1', '9') == 10
 
     def test_narrow_client_steps_down(self):
-        assert hive._branch_field_width('62', 'workingal-1', '9') == 6
-        assert hive._branch_field_width('60', 'workingal-1', '9') == 4
-        assert hive._branch_field_width('59', 'workingal-1', '9') == 0
+        assert hive._branch_field_width('80', 'workingal-1', '9') == 6
+        assert hive._branch_field_width('78', 'workingal-1', '9') == 4
+        assert hive._branch_field_width('77', 'workingal-1', '9') == 0
+
+    def test_reserves_run_glyphs_two_digit_tabs_and_sync(self):
+        assert hive._branch_field_width('84', 'workingal-1', '10') == 4
+        assert hive._branch_field_width('82', 'workingal-1', '10') == 0
 
     def test_invalid_dimensions_fail_to_small_field(self):
         assert hive._branch_field_width('unknown', 'workingal-1', '9') == 4
@@ -264,7 +275,7 @@ class TestTmuxStatusContext:
 
     def test_prints_nothing_when_tabs_consume_width(self, capsys):
         with patch.object(hive, '_git_out') as git_out:
-            hive._tmux_status_context('/repo', '59', 'workingal-1', '9')
+            hive._tmux_status_context('/repo', '77', 'workingal-1', '9')
         assert capsys.readouterr().out == ''
         git_out.assert_not_called()
 
@@ -449,12 +460,21 @@ class TestRefreshLabels:
                    '@2\t/tmp/hive with spaces/widget-2\n')
         with patch.object(hive.subprocess, 'run', return_value=listed), \
              patch.object(hive, '_tmux_label_window') as label:
-            hive._tmux_refresh_labels('$1')
+            refreshed = hive._tmux_refresh_labels('$1')
 
+        assert refreshed is True
         label.assert_has_calls([
             call('/tmp/hive/widget-1', '@1'),
             call('/tmp/hive with spaces/widget-2', '@2'),
         ])
+
+    def test_failed_list_is_reported(self):
+        listed = MagicMock(returncode=1, stdout='', stderr='no session')
+        with patch.object(hive.subprocess, 'run', return_value=listed), \
+             patch.object(hive, '_tmux_label_window') as label:
+            refreshed = hive._tmux_refresh_labels('missing')
+        assert refreshed is False
+        label.assert_not_called()
 
 
 # --- git-sync indicator ------------------------------------------------------
@@ -531,9 +551,17 @@ class TestCmdTmuxDispatch:
 
     def test_refresh_labels_action_routes(self):
         args = self._args(tmux_action='refresh-labels', session='$1')
-        with patch.object(hive, '_tmux_refresh_labels') as fn:
+        with patch.object(hive, '_tmux_refresh_labels', return_value=True) as fn:
             hive.cmd_tmux(args)
         fn.assert_called_once_with('$1')
+
+    def test_refresh_labels_action_propagates_failure(self):
+        args = self._args(tmux_action='refresh-labels', session='missing')
+        with patch.object(
+                hive, '_tmux_refresh_labels', return_value=False), \
+             pytest.raises(SystemExit) as exc:
+            hive.cmd_tmux(args)
+        assert exc.value.code == 1
 
     def test_status_context_action_routes(self):
         args = self._args(tmux_action='status-context', pane_path='/x',
@@ -723,6 +751,58 @@ class TestStatusBarTmuxProbe:
         finally:
             subprocess.run(['tmux', '-L', socket, 'kill-server'],
                            capture_output=True)
+
+    def test_new_window_hook_applies_compact_format(
+            self, fake_hive, tmp_path):
+        socket = f'hive-new-window-{os.getpid()}-{time.time_ns()}'
+        probe_home = tmp_path / 'home'
+        probe_tmux_dir = probe_home / '.tmux'
+        probe_tmux_dir.mkdir(parents=True)
+        (probe_tmux_dir / 'tmux.conf').touch()
+        probe_bin = tmp_path / 'bin'
+        probe_bin.mkdir()
+        (probe_bin / 'hive').symlink_to(_SCRIPTS_DIR / 'hive.py')
+        probe_env = {
+            **os.environ,
+            'HOME': str(probe_home),
+            'PATH': f'{probe_bin}{os.pathsep}{os.environ["PATH"]}',
+        }
+        with patch.object(hive, '_TMUX_DIR', tmp_path / 'hive-tmux'):
+            config = hive._write_tmux_config(
+                fake_hive, hive._SHELL_PALETTE[0])
+        try:
+            subprocess.run(
+                ['tmux', '-L', socket, 'new-session', '-d', '-s', 'probe'],
+                check=True, capture_output=True, text=True, env=probe_env)
+            subprocess.run(
+                ['tmux', '-L', socket, 'source-file', '-t', 'probe',
+                 str(config)],
+                check=True, capture_output=True, text=True, env=probe_env)
+            window_id = subprocess.run(
+                ['tmux', '-L', socket, 'new-window', '-P', '-F',
+                 '#{window_id}', '-t', 'probe', '-c',
+                 str(fake_hive / 'widget-1')],
+                check=True, capture_output=True, text=True,
+                env=probe_env).stdout.strip()
+
+            deadline = time.time() + 2
+            observed = None
+            while time.time() < deadline:
+                observed = subprocess.run(
+                    ['tmux', '-L', socket, 'show-window-options',
+                     '-t', window_id, '-v', 'window-status-format'],
+                    capture_output=True, text=True, env=probe_env)
+                if (observed.returncode == 0 and
+                        observed.stdout.rstrip('\n') ==
+                        hive._WINDOW_STATUS_FORMAT):
+                    break
+                time.sleep(0.02)
+            assert observed is not None
+            assert observed.returncode == 0, observed.stderr
+            assert observed.stdout.rstrip('\n') == hive._WINDOW_STATUS_FORMAT
+        finally:
+            subprocess.run(['tmux', '-L', socket, 'kill-server'],
+                           capture_output=True, env=probe_env)
 
     def test_compact_formats_are_set_on_every_window(self):
         socket = f'hive-status-{os.getpid()}-{time.time_ns()}'
