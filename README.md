@@ -132,29 +132,55 @@ This is the place for things like Node path tweaks, k3s helper scripts, or works
 that "adds itself to your PATH" writes into the **tracked** file rather than a
 private dotfile. Docker Desktop did this on 2026-08-18, prepending an
 `export PATH="$PATH:/Users/<user>/.docker/bin"` block to `bash/bash_profile`.
-Conda, nvm, rustup, pyenv, the Google Cloud SDK, and JetBrains Toolbox all
-behave the same way.
 
-When it happens, move the line into `local/env.local` (use `$HOME`, not a
-literal home path), then remove **only** the installer's hunk from the tracked
-file — inspect first, because a whole-file restore would also discard any
-in-flight edits of your own:
+When it happens, move the block into the right overlay file — matching the
+per-machine overlay contract above, and always with `$HOME` rather than a
+literal home path:
+
+- a plain **PATH or environment export** goes in `local/env.local`
+- an installer's **shell-init or function block** (nvm, pyenv, conda, rbenv,
+  SDKMAN) goes in `local/bashrc.local`, since it defines shell functions and
+  completions rather than environment
+
+Then remove **only** the installer's hunk from the tracked file. Inspect
+first — a whole-file restore would also discard any in-flight edits of your
+own:
 
 ```bash
 git diff bash/bash_profile        # or bash/bashrc — see exactly what changed
-git restore -p bash/bash_profile  # stage-by-hunk: discard only the installer block
+git restore -p bash/bash_profile  # interactive: discard just the installer hunk
 ```
 
-Use a whole-file `git restore bash/bash_profile` only after `git diff` has
-shown the installer block is the sole change.
+`git restore -p` walks the file's hunks and asks about each one. If the
+installer's lines share a hunk with an edit you want to keep, use `s` to split
+it or `e` to edit the hunk before accepting. A whole-file
+`git restore bash/bash_profile` is safe only once `git diff` has shown the
+installer block is the sole change.
 
-`tests/test_no_machine_specific_config.py` rejects three shapes in tracked
-config: a hardcoded home directory, a known installer marker comment, and the
-`$HOME`-parameterized init blocks version managers write (nvm, pyenv, conda,
-rbenv, SDKMAN, the Google Cloud SDK) — plus a header check that catches an
-unrecognized block prepended to either linked profile. Every installer named
-above has a committed fixture asserting it is caught, so the coverage claim in
-this section is enforced rather than aspirational.
+#### What the guard covers
+
+`tests/test_no_machine_specific_config.py` rejects four shapes in tracked
+config: a hardcoded home directory, a known installer marker comment, a
+`$HOME`-parameterized version-manager init block, and any unrecognized block
+prepended to a linked file (caught because it displaces the file's own first
+line). The set of linked files is derived from `setup.sh`'s own link table
+rather than restated, so adding a linked file forces the guard to advance.
+
+This table is the single inventory of covered installers: each row has a
+committed fixture built from the line the tool actually emits, and the tests
+assert this table and the fixture set match exactly in both directions.
+
+| Installer | Emitted shape | Detected as |
+|---|---|---|
+| `docker desktop` | marker comment + `export PATH="$PATH:$HOME/.docker/bin"` | installer marker |
+| `conda` | `# >>> conda initialize >>>` block | installer marker, third-party init |
+| `rustup` | `. "$HOME/.cargo/env"` | third-party init |
+| `nvm` | `export NVM_DIR="$HOME/.nvm"` + `nvm.sh` source | third-party init |
+| `pyenv` | `export PYENV_ROOT="$HOME/.pyenv"` + `pyenv init` | third-party init |
+| `rbenv` | `export RBENV_ROOT="$HOME/.rbenv"` + `rbenv init` | third-party init |
+| `sdkman` | `export SDKMAN_DIR="$HOME/.sdkman"` + `sdkman-init.sh` | third-party init |
+| `google cloud sdk` | `path.bash.inc` source + marker comment | installer marker, third-party init |
+| `jetbrains toolbox` | `# added by JetBrains Toolbox` + PATH | installer marker |
 
 **Boundary:** that test runs in CI, which is after a push. It blocks
 integration, but it cannot stop a literal path from first appearing in a commit
