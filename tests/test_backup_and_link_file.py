@@ -453,6 +453,7 @@ def _make_prior_checkout(path, origin="https://github.com/example/term-public.gi
     (path / "bash").mkdir(parents=True)
     (path / "ghostty").mkdir()
     (path / "local" / "bin").mkdir(parents=True)
+    (path / "bash" / "bash_profile").write_text("# prior checkout bash_profile\n")
     (path / "bash" / "bashrc").write_text("# prior checkout bashrc\n")
     (path / "local" / "env.local.template").write_text("# env template\n")
     (path / "local" / "bashrc.local.template").write_text(
@@ -464,6 +465,79 @@ def _make_prior_checkout(path, origin="https://github.com/example/term-public.gi
 
 def _install_prior_checkout_link(home, old_checkout):
     (home / ".bashrc").symlink_to(old_checkout / "bash" / "bashrc")
+
+
+class TestPriorCheckoutLinkReplacement:
+    """Reinstalling from a same-origin checkout preserves real backups (#22)."""
+
+    @staticmethod
+    def _install_bash_links(home, checkout):
+        (home / ".bash_profile").symlink_to(checkout / "bash" / "bash_profile")
+        (home / ".bashrc").symlink_to(checkout / "bash" / "bashrc")
+
+    def test_preserves_user_backups_across_checkout_reruns(self, tmp_path):
+        checkout_b_parent = tmp_path / "checkout-b"
+        checkout_b_parent.mkdir()
+        checkout_b, home = _scaffold_repo(checkout_b_parent)
+        checkout_a = tmp_path / "checkout-a"
+        _make_prior_checkout(checkout_a)
+        self._install_bash_links(home, checkout_a)
+        (home / ".bash_profile.bak").write_text("export ORIGINAL_PROFILE=1\n")
+        (home / ".bashrc.bak").write_text("export ORIGINAL_RC=1\n")
+
+        first = _run_setup(checkout_b, home, bash_executable="/bin/bash")
+
+        assert first.returncode == 0, first.stderr
+        assert (home / ".bash_profile").resolve() == \
+            checkout_b / "bash" / "bash_profile"
+        assert (home / ".bashrc").resolve() == checkout_b / "bash" / "bashrc"
+        assert (home / ".bash_profile.bak").read_text() == \
+            "export ORIGINAL_PROFILE=1\n"
+        assert (home / ".bashrc.bak").read_text() == "export ORIGINAL_RC=1\n"
+
+        checkout_c_parent = tmp_path / "checkout-c"
+        checkout_c_parent.mkdir()
+        checkout_c, _ = _scaffold_repo(checkout_c_parent)
+
+        second = _run_setup(checkout_c, home, bash_executable="/bin/bash")
+
+        assert second.returncode == 0, second.stderr
+        assert (home / ".bash_profile").resolve() == \
+            checkout_c / "bash" / "bash_profile"
+        assert (home / ".bashrc").resolve() == checkout_c / "bash" / "bashrc"
+        assert (home / ".bash_profile.bak").read_text() == \
+            "export ORIGINAL_PROFILE=1\n"
+        assert (home / ".bashrc.bak").read_text() == "export ORIGINAL_RC=1\n"
+
+    def test_same_origin_rerun_does_not_create_backups(self, tmp_path):
+        repo_root, home = _scaffold_repo(tmp_path)
+        old_checkout = tmp_path / "old-checkout"
+        _make_prior_checkout(old_checkout)
+        self._install_bash_links(home, old_checkout)
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0, result.stderr
+        assert (home / ".bash_profile").resolve() == \
+            repo_root / "bash" / "bash_profile"
+        assert (home / ".bashrc").resolve() == repo_root / "bash" / "bashrc"
+        assert not os.path.lexists(home / ".bash_profile.bak")
+        assert not os.path.lexists(home / ".bashrc.bak")
+
+    def test_wrong_same_origin_target_is_preserved_as_backup(self, tmp_path):
+        """Origin equality alone cannot bless the wrong config binding."""
+        repo_root, home = _scaffold_repo(tmp_path)
+        old_checkout = tmp_path / "old-checkout"
+        _make_prior_checkout(old_checkout)
+        (home / ".bashrc").symlink_to(old_checkout / "bash" / "bash_profile")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0, result.stderr
+        assert (home / ".bashrc").resolve() == repo_root / "bash" / "bashrc"
+        assert (home / ".bashrc.bak").is_symlink()
+        assert (home / ".bashrc.bak").resolve() == \
+            old_checkout / "bash" / "bash_profile"
 
 
 class TestCheckoutOverlayMigration:
