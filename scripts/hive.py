@@ -2316,12 +2316,6 @@ def _style_option_pairs(color: dict) -> list[tuple[str, str, str]]:
     return [
         ('Status bar (session-scoped)', 'status-style',
          f'bg={color["background"]},fg={color["foreground"]}'),
-        ('Active window tab', 'window-status-current-format',
-         f'#[bg={color["primary"]},fg={color["background"]},bold]'
-         ' #I:#W #[default]'),
-        ('Inactive window tab', 'window-status-format',
-         f'#[bg={color["inactive_bg"]},fg={color["foreground"]}]'
-         ' #I:#W #[default]'),
         ('Pane borders', 'pane-border-style',
          f'fg={color["inactive_bg"]}'),
         ('', 'pane-active-border-style', f'fg={color["primary"]}'),
@@ -2362,30 +2356,35 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
     lines += [
         'set status-left-length 20',
         '',
-        '# Status right (folder | branch [sync] | time)',
-        'set status-right-length 70',
-        'set status-right " #(basename \\"#{pane_current_path}\\") | '
-        '#(git -C \\"#{pane_current_path}\\" rev-parse --abbrev-ref HEAD 2>/dev/null || echo \\"no-git\\")'
-        '#(hive tmux git-sync \\"#{pane_current_path}\\") | %H:%M PT "',
+        '# Status right (compact branch [sync] | time). The helper budgets',
+        '# its fixed-width branch field around the session and numeric tabs.',
+        'set status-right-length 40',
+        'set status-right " #(hive tmux status-context '
+        '\\"#{pane_current_path}\\" \\"#{client_width}\\" '
+        '\\"#{session_name}\\" \\"#{session_windows}\\")'
+        '%H:%M PT "',
         '',
         '# Window naming',
         'set automatic-rename off',
         'set allow-rename off',
         '',
         '# Window label update hooks (session-scoped)',
-        'set-hook after-select-window "run-shell -b \'hive tmux label-window #{pane_current_path} #{window_id}\'"',
-        'set-hook after-select-pane   "run-shell -b \'hive tmux label-window #{pane_current_path} #{window_id}\'"',
+        'set-hook after-new-window   "run-shell -b \'hive tmux label-window \\"#{pane_current_path}\\" \\"#{window_id}\\"\'"',
+        'set-hook after-select-window "run-shell -b \'hive tmux label-window \\"#{pane_current_path}\\" \\"#{window_id}\\"\'"',
+        'set-hook after-select-pane   "run-shell -b \'hive tmux label-window \\"#{pane_current_path}\\" \\"#{window_id}\\"\'"',
         '',
         '# Keybindings — tmux keybindings are global (not session-scoped), so',
         '# every hive-specific binding guards on $HIVE_ROOT and falls back to',
         '# the default behavior for non-hive sessions.',
         '',
         '# backtick + r: reload config (hive config or base tmux.conf)',
-        'bind r run-shell \''
+        'bind r run-shell -b \''
         'if [ -n "$HIVE_NAME" ]; then'
         '  CONF="/tmp/hive-tmux/$HIVE_NAME.conf";'
-        '  [ -f "$CONF" ] && tmux source-file "$CONF" && tmux display-message "Reloaded: $CONF"'
-        '    || tmux display-message "Config not found";'
+        '  [ -f "$CONF" ] && tmux source-file "$CONF" &&'
+        '    hive tmux refresh-labels "#{session_name}" &&'
+        '    tmux display-message "Reloaded: $CONF"'
+        '    || tmux display-message "Reload failed: $CONF";'
         'else'
         '  tmux source-file "$HOME/.tmux/tmux.conf" && tmux display-message "Reloaded!";'
         'fi\'',
@@ -2440,11 +2439,9 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
         '# backtick + R: force-refresh all window labels (hive only)',
         'bind R run-shell -b \''
         'if [ -n "$HIVE_ROOT" ]; then'
-        '  for win_info in $(tmux list-windows -F "#{window_id}:#{pane_current_path}"); do'
-        '    wid="${win_info%%:*}"; wpath="${win_info#*:}";'
-        '    hive tmux label-window "$wpath" "$wid";'
-        '  done;'
-        '  tmux display-message "Labels refreshed";'
+        '  hive tmux refresh-labels "#{session_name}" &&'
+        '    tmux display-message "Labels refreshed" ||'
+        '    tmux display-message "Label refresh failed";'
         'else'
         '  tmux display-message "Not in a hive session";'
         'fi\'',
@@ -2465,6 +2462,11 @@ def _write_tmux_config(hive: Path, color: dict) -> Path:
 _LABEL_CACHE_TTL = 300  # seconds — window hooks fire often; don't hammer fj
 _DEFAULT_BRANCHES = {'main', 'master', 'develop', 'dev',
                      'flow-dev', 'flow-prod', 'infra-dev', 'infra-prod'}
+_WINDOW_STATUS_FORMAT = (
+    ' #I#{?@hive_run_suffix,#{@hive_run_suffix},} ')
+_WINDOW_STATUS_CURRENT_FORMAT = (
+    '#[reverse,bold][#I]#[default]'
+    '#{?@hive_run_suffix,#{@hive_run_suffix},}')
 
 
 def _label_cache_key(workspace: Path) -> str:
@@ -2480,11 +2482,80 @@ def _label_cache_key(workspace: Path) -> str:
 
 
 def _shorten_branch(branch: str) -> str:
-    """Shorten a branch name for a window label (strip prefix, truncate)."""
+    """Shorten a branch name stored in tmux's internal window name."""
     short = branch.split('/', 1)[1] if '/' in branch else branch
     if len(short) > 16:
         short = short[:14] + '..'
     return short
+
+
+def _compact_branch(branch: str, max_length: int) -> str:
+    """Elide a branch while retaining its kind and task initials when possible.
+
+    ``fix/automatic-publication-receipt-ledger`` becomes ``fix/aprl`` at
+    ordinary widths, ``f/aprl`` when tighter, and ``aprl`` at the narrowest
+    useful width. Short branch names pass through unchanged.
+    """
+    if max_length <= 0:
+        return ''
+    if len(branch) <= max_length:
+        return branch
+
+    parts = [part for part in branch.split('/') if part]
+    leaf = parts[-1] if parts else branch
+    prefix = parts[-2] if len(parts) > 1 else ''
+    words = [word for word in re.split(r'[-_.]+', leaf) if word]
+    initialism = ''.join(word[0] for word in words) if len(words) > 1 else ''
+    compact_leaf = initialism or leaf
+
+    candidates = []
+    if prefix:
+        candidates.extend((f'{prefix}/{compact_leaf}',
+                           f'{prefix[0]}/{compact_leaf}'))
+    candidates.extend((compact_leaf, leaf))
+    for candidate in candidates:
+        if candidate and len(candidate) <= max_length:
+            return candidate
+    return compact_leaf[:max_length]
+
+
+def _branch_field_width(client_width: str, session_name: str,
+                        window_count: str) -> int:
+    """Choose a fixed branch field width that leaves numeric tabs visible."""
+    try:
+        width = max(0, int(client_width))
+        windows = max(0, int(window_count))
+    except (TypeError, ValueError):
+        return 4
+
+    # Session badge + numeric tabs (including one run glyph each) + the leading
+    # space and clock at right. Sequential windows above 9 need one more index
+    # column. Reserve the largest ordinary sync indicator (9 visible columns)
+    # and two columns of slack for tmux's list arrows/spacing.
+    tab_width = (windows * 4) + max(0, windows - 9)
+    available = (
+        width - (len(session_name) + 3) - tab_width - 13 - 9 - 2)
+    for field_width in (10, 6, 4):
+        if available >= field_width:
+            return field_width
+    return 0
+
+
+def _tmux_status_context(pane_path: str, client_width: str,
+                         session_name: str, window_count: str) -> None:
+    """Print compact branch/sync context and its separator for status-right."""
+    field_width = _branch_field_width(
+        client_width, session_name, window_count)
+    if field_width == 0 or not pane_path:
+        return
+    toplevel = _git_out(['rev-parse', '--show-toplevel'], cwd=pane_path)
+    branch = None
+    if toplevel:
+        branch = _git_out(['rev-parse', '--abbrev-ref', 'HEAD'], cwd=toplevel)
+    label = _compact_branch(branch or 'no-git', field_width)
+    sys.stdout.write(label.ljust(field_width))
+    _tmux_git_sync(pane_path)
+    sys.stdout.write(' | ')
 
 
 def _compute_window_label(workspace: Path) -> dict:
@@ -2727,6 +2798,7 @@ def _tmux_label_window(pane_path: str, window_id: str) -> None:
     toplevel = _git_out(['rev-parse', '--show-toplevel'], cwd=pane)
     if not toplevel:
         # Not a git repo — fall back to the directory basename.
+        _set_tmux_window_status(window_id, '')
         subprocess.run(['tmux', 'rename-window', '-t', window_id, pane.name],
                        capture_output=True)
         return
@@ -2758,6 +2830,7 @@ def _tmux_label_window(pane_path: str, window_id: str) -> None:
 
     suffix = _run_state_label_suffix(workspace)
     label = f'{data["label"]} {suffix}' if suffix else data['label']
+    _set_tmux_window_status(window_id, suffix)
     subprocess.run(['tmux', 'rename-window', '-t', window_id, label],
                    capture_output=True)
 
@@ -2772,6 +2845,42 @@ def _tmux_label_window(pane_path: str, window_id: str) -> None:
             pass
 
 
+def _set_tmux_window_status(window_id: str, run_suffix: str) -> None:
+    """Apply compact tab formats to one concrete tmux window.
+
+    These are window options in tmux, not session options. Applying them to
+    each window avoids the old behavior where only the window current during
+    a config reload received the hive-specific format.
+    """
+    options = (
+        ('window-status-format', _WINDOW_STATUS_FORMAT),
+        ('window-status-current-format', _WINDOW_STATUS_CURRENT_FORMAT),
+        ('@hive_run_suffix', run_suffix),
+    )
+    for option, value in options:
+        subprocess.run(
+            ['tmux', 'set-window-option', '-t', window_id, option, value],
+            capture_output=True)
+
+
+def _tmux_refresh_labels(session: str) -> bool:
+    """Refresh every window in one session; return false if it cannot be read."""
+    if not session:
+        return False
+    r = subprocess.run(
+        ['tmux', 'list-windows', '-t', session,
+         '-F', '#{window_id}\t#{pane_current_path}'],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        return False
+    for line in r.stdout.splitlines():
+        if '\t' not in line:
+            continue
+        window_id, pane_path = line.split('\t', 1)
+        _tmux_label_window(pane_path, window_id)
+    return True
+
+
 # --- tmux subcommand ----------------------------------------------------------
 
 
@@ -2782,6 +2891,14 @@ def cmd_tmux(args: argparse.Namespace) -> None:
     # Hidden helper actions, invoked by the generated tmux config.
     if action == 'label-window':
         _tmux_label_window(args.pane_path, args.window_id)
+        return
+    if action == 'refresh-labels':
+        if not _tmux_refresh_labels(args.session):
+            sys.exit(1)
+        return
+    if action == 'status-context':
+        _tmux_status_context(args.pane_path, args.client_width,
+                             args.session_name, args.window_count)
         return
     if action == 'git-sync':
         _tmux_git_sync(args.pane_path)
@@ -2967,18 +3084,7 @@ def _tmux_start(hive: Path, color: dict, new_window: bool) -> None:
 
     subprocess.run(['tmux', 'source-file', '-t', session_name, str(config_path)])
 
-    # Label every window.
-    r = subprocess.run(
-        ['tmux', 'list-windows', '-t', session_name,
-         '-F', '#{window_id}:#{pane_current_path}'],
-        capture_output=True, text=True,
-    )
-    if r.returncode == 0:
-        for line in r.stdout.splitlines():
-            if ':' not in line:
-                continue
-            wid, wpath = line.split(':', 1)
-            _tmux_label_window(wpath, wid)
+    _tmux_refresh_labels(session_name)
 
     subprocess.run(['tmux', 'select-window', '-t', f'{session_name}:1'],
                    capture_output=True)
@@ -3210,6 +3316,13 @@ def main():
     tmux_label = tmux_sub.add_parser('label-window')
     tmux_label.add_argument('pane_path')
     tmux_label.add_argument('window_id')
+    tmux_refresh = tmux_sub.add_parser('refresh-labels')
+    tmux_refresh.add_argument('session')
+    tmux_context = tmux_sub.add_parser('status-context')
+    tmux_context.add_argument('pane_path')
+    tmux_context.add_argument('client_width')
+    tmux_context.add_argument('session_name')
+    tmux_context.add_argument('window_count')
     tmux_gitsync = tmux_sub.add_parser('git-sync')
     tmux_gitsync.add_argument('pane_path')
     tmux_popup = tmux_sub.add_parser('popup')
