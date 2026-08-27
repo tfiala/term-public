@@ -19,10 +19,10 @@ backup_and_link_file() {
   if [[ -L "$2" ]]; then
     if [[ "$(readlink "$2")" == "$1" ]]; then
       return 0
-    elif [[ -e "$2" && "$2" -ef "$1" ]]; then
-      # The link reaches this exact source through a different spelling
-      # (for example, a symlinked checkout alias). Normalize it without
-      # rotating away the genuine pre-term-public backup.
+    elif [[ "$2" -ef "$1" ]]; then
+      # The link resolves to this exact source inode through another path
+      # (for example, a checkout alias or a hard-linked target). Normalize it
+      # without rotating away the genuine pre-term-public backup.
       unlink "$2"
       ln -s "$1" "$2"
       return 0
