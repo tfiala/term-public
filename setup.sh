@@ -19,6 +19,13 @@ backup_and_link_file() {
   if [[ -L "$2" ]]; then
     if [[ "$(readlink "$2")" == "$1" ]]; then
       return 0
+    elif [[ -e "$2" && "$2" -ef "$1" ]]; then
+      # The link reaches this exact source through a different spelling
+      # (for example, a symlinked checkout alias). Normalize it without
+      # rotating away the genuine pre-term-public backup.
+      unlink "$2"
+      ln -s "$1" "$2"
+      return 0
     elif [[ -n "${3-}" ]]; then
       prior_checkout_root="$(_same_repo_checkout_root "$2" "$3")"
       if [[ -n "$prior_checkout_root" ]]; then

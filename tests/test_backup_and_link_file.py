@@ -23,6 +23,11 @@ _FUNCTION_DEF = _extract_function()
 
 
 def run_backup_and_link(source: str, dest: str) -> subprocess.CompletedProcess:
+    """Exercise only the function's standalone two-argument contract.
+
+    The repo-provenance branch depends on setup.sh's helpers and ROOT_DIR, so
+    its tests must use the full-script _run_setup harness below.
+    """
     script = _FUNCTION_DEF + '\nbackup_and_link_file "$1" "$2"'
     return subprocess.run(
         ["bash", "--norc", "-c", script, "bash", source, dest],
@@ -524,12 +529,34 @@ class TestPriorCheckoutLinkReplacement:
         assert not os.path.lexists(home / ".bash_profile.bak")
         assert not os.path.lexists(home / ".bashrc.bak")
 
-    def test_wrong_same_origin_target_is_preserved_as_backup(self, tmp_path):
-        """Origin equality alone cannot bless the wrong config binding."""
+    def test_foreign_origin_link_still_becomes_backup(self, tmp_path):
+        """Provenance, not link shape, is what waives the backup."""
         repo_root, home = _scaffold_repo(tmp_path)
-        old_checkout = tmp_path / "old-checkout"
-        _make_prior_checkout(old_checkout)
-        (home / ".bashrc").symlink_to(old_checkout / "bash" / "bash_profile")
+        foreign = tmp_path / "foreign-dotfiles"
+        _make_prior_checkout(
+            foreign, origin="git@github.com:someone-else/dotfiles.git")
+        (home / ".bashrc").symlink_to(foreign / "bash" / "bashrc")
+        (home / ".bashrc.bak").write_text("export ORIGINAL_RC=1\n")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0, result.stderr
+        assert (home / ".bashrc").resolve() == repo_root / "bash" / "bashrc"
+        assert (home / ".bashrc.bak").is_symlink()
+        assert (home / ".bashrc.bak").resolve() == foreign / "bash" / "bashrc"
+
+    def test_link_from_checkout_without_origin_still_becomes_backup(
+            self, tmp_path):
+        """A checkout with no provable origin is not trusted as our own."""
+        repo_root, home = _scaffold_repo(tmp_path)
+        unproven = tmp_path / "unproven-checkout"
+        _make_prior_checkout(unproven)
+        subprocess.run(
+            ["git", "-C", str(unproven), "remote", "remove", "origin"],
+            check=True,
+        )
+        (home / ".bashrc").symlink_to(unproven / "bash" / "bashrc")
+        (home / ".bashrc.bak").write_text("export ORIGINAL_RC=1\n")
 
         result = _run_setup(repo_root, home)
 
@@ -537,7 +564,37 @@ class TestPriorCheckoutLinkReplacement:
         assert (home / ".bashrc").resolve() == repo_root / "bash" / "bashrc"
         assert (home / ".bashrc.bak").is_symlink()
         assert (home / ".bashrc.bak").resolve() == \
-            old_checkout / "bash" / "bash_profile"
+            unproven / "bash" / "bashrc"
+
+    def test_wrong_same_origin_target_is_preserved_as_backup(self, tmp_path):
+        """Origin equality alone cannot bless the wrong config binding."""
+        repo_root, home = _scaffold_repo(tmp_path)
+        old_checkout = tmp_path / "old-checkout"
+        _make_prior_checkout(old_checkout)
+        (home / ".bashrc").symlink_to(old_checkout / "ghostty")
+        (home / ".bashrc.bak").write_text("export ORIGINAL_RC=1\n")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0, result.stderr
+        assert (home / ".bashrc").resolve() == repo_root / "bash" / "bashrc"
+        assert (home / ".bashrc.bak").is_symlink()
+        assert (home / ".bashrc.bak").resolve() == old_checkout / "ghostty"
+
+    def test_same_checkout_alias_is_normalized_without_backup_churn(
+            self, tmp_path):
+        """An alias spelling of the exact source is our link, not user config."""
+        repo_root, home = _scaffold_repo(tmp_path)
+        repo_alias = tmp_path / "repo-alias"
+        repo_alias.symlink_to(repo_root, target_is_directory=True)
+        (home / ".bashrc").symlink_to(repo_alias / "bash" / "bashrc")
+        (home / ".bashrc.bak").write_text("export ORIGINAL_RC=1\n")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0, result.stderr
+        assert os.readlink(home / ".bashrc") == str(repo_root / "bash" / "bashrc")
+        assert (home / ".bashrc.bak").read_text() == "export ORIGINAL_RC=1\n"
 
 
 class TestCheckoutOverlayMigration:
