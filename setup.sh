@@ -4,18 +4,38 @@ set -euo pipefail
 # backup_and_link_file
 # $1 - source path
 # $2 - destination path
+# $3 - optional repo-relative source path used to prove prior-checkout links
 # Destination symlinks are classified: already-correct links are left
 # alone, dangling links are replaced (ln -s onto one fails and there is
-# nothing to preserve), and live links to anything else are preserved as
-# "$2.bak" — the link itself moves, so the backup keeps pointing into
-# the user's other dotfiles repo and stays sourceable.
+# nothing to preserve), verified links to the same file in another checkout
+# of this repository are replaced without disturbing "$2.bak", and live
+# links to anything else are preserved as "$2.bak" — the link itself moves,
+# so the backup keeps pointing into the user's other dotfiles repo and stays
+# sourceable.
 backup_and_link_file() {
+  local prior_checkout_root=""
   mkdir -p "$(dirname "$2")"
 
   if [[ -L "$2" ]]; then
     if [[ "$(readlink "$2")" == "$1" ]]; then
       return 0
-    elif [[ ! -e "$2" ]]; then
+    elif [[ "$2" -ef "$1" ]]; then
+      # The link resolves to this exact source inode through another path
+      # (for example, a checkout alias or a hard-linked target). Normalize it
+      # without rotating away the genuine pre-term-public backup.
+      unlink "$2"
+      ln -s "$1" "$2"
+      return 0
+    elif [[ -n "${3-}" ]]; then
+      prior_checkout_root="$(_same_repo_checkout_root "$2" "$3")"
+      if [[ -n "$prior_checkout_root" ]]; then
+        unlink "$2"
+        ln -s "$1" "$2"
+        return 0
+      fi
+    fi
+
+    if [[ ! -e "$2" ]]; then
       unlink "$2"
       ln -s "$1" "$2"
     else
@@ -106,29 +126,42 @@ _repo_identity() {
   printf '%s\n' "$url"
 }
 
-# _remember_linked_checkout
-# $1 - installed symlink that setup.sh is about to replace
-# $2 - repo-relative suffix of that link's target
-# Records a different checkout only when its normalized git origin matches
-# this checkout. Relative links are resolved from the link's directory.
-_remember_linked_checkout() {
-  local link="$1" suffix="$2" target root this_id target_id existing
+# _same_repo_checkout_root
+# $1 - installed symlink
+# $2 - exact repo-relative path that the link is expected to target
+# Prints the physical root of a different checkout only when the link targets
+# that exact path and both checkouts have the same normalized git origin.
+# Relative links are resolved from the link's directory.
+_same_repo_checkout_root() {
+  local link="$1" relative="$2" target root this_id target_id
   [[ -L "$link" ]] || return 0
   target="$(readlink "$link")"
   case "$target" in
-    */"$suffix") ;;
+    */"$relative") ;;
     *) return 0 ;;
   esac
   case "$target" in
     /*) ;;
     *) target="$(dirname "$link")/$target" ;;
   esac
-  root="${target%/"$suffix"}"
+  root="${target%/"$relative"}"
   root="$(cd "$root" 2>/dev/null && pwd -P)" || return 0
   [[ "$root" != "$ROOT_DIR" ]] || return 0
   this_id="$(_repo_identity "$ROOT_DIR")"
   target_id="$(_repo_identity "$root")"
   [[ -n "$this_id" && "$target_id" == "$this_id" ]] || return 0
+  printf '%s\n' "$root"
+}
+
+# _remember_linked_checkout
+# $1 - installed symlink that setup.sh is about to replace
+# $2 - repo-relative suffix of that link's target
+# Records a different checkout only when its normalized git origin matches
+# this checkout. Relative links are resolved from the link's directory.
+_remember_linked_checkout() {
+  local root existing
+  root="$(_same_repo_checkout_root "$1" "$2")"
+  [[ -n "$root" ]] || return 0
   # The fallback keeps an empty indexed array safe under macOS bash 3.2
   # with nounset enabled.
   for existing in "${OLD_CHECKOUT_ROOTS[@]-}"; do
@@ -324,7 +357,8 @@ _link_index=0
 while (( _link_index < ${#_REPO_LINK_RELATIVES[@]} )); do
   backup_and_link_file \
     "$ROOT_DIR/${_REPO_LINK_RELATIVES[$_link_index]}" \
-    "${_REPO_LINK_DESTINATIONS[$_link_index]}"
+    "${_REPO_LINK_DESTINATIONS[$_link_index]}" \
+    "${_REPO_LINK_RELATIVES[$_link_index]}"
   _link_index=$((_link_index + 1))
 done
 
