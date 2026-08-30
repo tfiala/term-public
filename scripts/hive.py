@@ -2463,10 +2463,10 @@ _LABEL_CACHE_TTL = 300  # seconds — window hooks fire often; don't hammer fj
 _DEFAULT_BRANCHES = {'main', 'master', 'develop', 'dev',
                      'flow-dev', 'flow-prod', 'infra-dev', 'infra-prod'}
 _WINDOW_STATUS_FORMAT = (
-    ' #I#{?@hive_run_suffix,#{@hive_run_suffix},} ')
+    ' #I#{?@hive_run_suffix, #{@hive_run_suffix},} ')
 _WINDOW_STATUS_CURRENT_FORMAT = (
     '#[reverse,bold][#I]#[default]'
-    '#{?@hive_run_suffix,#{@hive_run_suffix},}')
+    '#{?@hive_run_suffix, #{@hive_run_suffix},}')
 
 
 def _label_cache_key(workspace: Path) -> str:
@@ -2594,6 +2594,9 @@ def _compute_window_label(workspace: Path) -> dict:
 
 _ACC_RUNS_DIR = Path.home() / '.local' / 'state' / 'acc-runs'
 _RUN_HEARTBEAT_TTL = 300  # seconds — heartbeat older than this = interrupted
+# Widen the live-scan mtime prefilter past the TTL: over-including a sidecar
+# costs one JSON read, excluding a live one would drop it from the status bar.
+_LIVE_SCAN_MTIME_MARGIN = 2
 
 
 def _parse_iso_timestamp(ts: str | None) -> float | None:
@@ -2635,72 +2638,140 @@ def _classify_run_state(sidecar: Path) -> str:
     return 'running' if (time.time() - hb) <= _RUN_HEARTBEAT_TTL else 'interrupted'
 
 
-def _workspace_run_state(workspace: Path) -> dict | None:
-    """Most-recent run-dsl run for ``workspace`` (workspaces are reused across
-    invocations — only the most recent one is interesting).
+def _read_run_manifest(sidecar: Path, ws_resolved: Path) -> dict | None:
+    """Read one sidecar's manifest, keeping it only if its work_dir sits at or
+    under ``ws_resolved``. Returns None for anything unreadable or unrelated.
 
-    Returns dict ``{state, program, objective, sidecar, mtime}`` or None when
-    no run exists for this workspace. Compares by manifest mtime so it stays
-    correct as new runs land.
+    The subtree test is what makes .local/<repo> clones visible: an exact
+    work_dir match sees only runs launched at the workspace root, which is a
+    minority of the work in a hive workspace.
+    """
+    manifest = sidecar / 'manifest.json'
+    try:
+        data = json.loads(manifest.read_text())
+        mtime = manifest.stat().st_mtime
+    except (json.JSONDecodeError, OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    wd = data.get('work_dir')
+    if not wd:
+        return None
+    try:
+        wd_resolved = Path(wd).resolve()
+    except OSError:
+        return None
+    if wd_resolved != ws_resolved and ws_resolved not in wd_resolved.parents:
+        return None
+    try:
+        subpath = str(wd_resolved.relative_to(ws_resolved))
+    except ValueError:
+        return None
+    objective = data.get('objective') or ''
+    return {
+        'work_dir': wd_resolved,
+        'subpath': '' if subpath == '.' else subpath,
+        'program': data.get('program', ''),
+        'objective': objective.splitlines()[0] if objective else '',
+        'sidecar': sidecar,
+        'mtime': mtime,
+    }
+
+
+def _workspace_live_runs(workspace: Path) -> list[dict]:
+    """Every run-dsl run currently live at or under ``workspace``.
+
+    Cheap by construction, because this runs on every tmux window relabel: a
+    live run rewrites runtime.json on each heartbeat, so its mtime is never
+    older than its own last_heartbeat_at. A sidecar whose runtime.json mtime
+    is already past the TTL therefore cannot be live, and is skipped on one
+    stat() without opening either JSON file. The margin below only widens the
+    candidate set — last_heartbeat_at stays the authority — so a slow write or
+    a little clock skew costs a wasted read, never a missed run.
     """
     if not _ACC_RUNS_DIR.is_dir():
-        return None
+        return []
     try:
         ws_resolved = workspace.resolve()
     except OSError:
-        return None
-    best: tuple[float, dict] | None = None
-    for sidecar in _ACC_RUNS_DIR.iterdir():
-        if not sidecar.is_dir():
+        return []
+    cutoff = time.time() - (_RUN_HEARTBEAT_TTL * _LIVE_SCAN_MTIME_MARGIN)
+    live = []
+    try:
+        # os.scandir over iterdir: this runs on every window relabel and the
+        # sidecar dir holds every run ever recorded, so the per-entry Path
+        # construction is the bulk of the work. Nothing here needs ordering.
+        with os.scandir(_ACC_RUNS_DIR) as entries:
+            for entry in entries:
+                try:
+                    if os.stat(os.path.join(entry.path, 'runtime.json')
+                               ).st_mtime < cutoff:
+                        continue
+                except OSError:
+                    continue  # no runtime.json — cannot be running
+                sidecar = Path(entry.path)
+                if _classify_run_state(sidecar) != 'running':
+                    continue
+                run = _read_run_manifest(sidecar, ws_resolved)
+                if run is not None:
+                    run['state'] = 'running'
+                    live.append(run)
+    except OSError:
+        return []
+    return live
+
+
+def _subtree_run_states(workspace: Path) -> list[dict]:
+    """Most-recent run-dsl run for every work_dir at or under ``workspace``.
+
+    A hive workspace is not one work_dir: runs routinely happen in its
+    ``.local/<repo>`` clones, and that work belongs to the workspace as much
+    as work at its root does. Grouping by work_dir keeps each clone its own
+    row rather than letting the busiest one speak for the whole subtree.
+
+    Full scan of the sidecar dir — for the on-demand popup only. The window
+    label uses _workspace_live_runs, which prunes first.
+    """
+    if not _ACC_RUNS_DIR.is_dir():
+        return []
+    try:
+        ws_resolved = workspace.resolve()
+    except OSError:
+        return []
+    try:
+        sidecars = sorted(_ACC_RUNS_DIR.iterdir())
+    except OSError:
+        return []
+
+    best: dict[Path, tuple[float, dict]] = {}
+    for sidecar in sidecars:
+        run = _read_run_manifest(sidecar, ws_resolved)
+        if run is None:
             continue
-        manifest = sidecar / 'manifest.json'
-        if not manifest.is_file():
-            continue
-        try:
-            data = json.loads(manifest.read_text())
-        except (json.JSONDecodeError, OSError):
-            continue
-        wd = data.get('work_dir')
-        if not wd:
-            continue
-        try:
-            if Path(wd).resolve() != ws_resolved:
-                continue
-        except OSError:
-            continue
-        try:
-            mtime = manifest.stat().st_mtime
-        except OSError:
-            continue
-        if best is None or mtime > best[0]:
-            objective = data.get('objective') or ''
-            best = (mtime, {
-                'state': _classify_run_state(sidecar),
-                'program': data.get('program', ''),
-                'objective': objective.splitlines()[0] if objective else '',
-                'sidecar': sidecar,
-                'mtime': mtime,
-            })
-    return best[1] if best else None
+        prior = best.get(run['work_dir'])
+        if prior is None or run['mtime'] > prior[0]:
+            run['state'] = _classify_run_state(sidecar)
+            best[run['work_dir']] = (run['mtime'], run)
+    return [run for _, run in sorted(best.values(), key=lambda e: -e[0])]
 
 
 # Plain unicode (no ANSI): tmux rename-window takes plain text.
-_RUN_LABEL_INDICATOR = {
-    'running': '●',
-    'failed': '✗',
-    'interrupted': '…',
-    # 'succeeded' deliberately maps to nothing — recent success isn't noise.
-}
+_RUN_LIVE_INDICATOR = '●'
 
 
 def _run_state_label_suffix(workspace: Path) -> str:
-    """Single-char suffix for the window label reflecting run-dsl state,
-    or '' for none / succeeded. Only attention-worthy states are surfaced
-    so labels stay quiet by default."""
-    state = _workspace_run_state(workspace)
-    if state is None:
+    """Window-label suffix: '●' when exactly one run is live anywhere under
+    ``workspace``, '●N' for N concurrent ones, '' when nothing is running.
+
+    Only *live* state earns a place in the status bar. It is heartbeat-backed,
+    so it self-clears and can never go stale; terminal states are history, and
+    a single character cannot say which of a workspace's clones failed or why.
+    That belongs in the backtick+a popup, which names both.
+    """
+    count = len(_workspace_live_runs(workspace))
+    if count == 0:
         return ''
-    return _RUN_LABEL_INDICATOR.get(state['state'], '')
+    return _RUN_LIVE_INDICATOR if count == 1 else f'{_RUN_LIVE_INDICATOR}{count}'
 
 
 def _format_run_age(state: dict) -> str:
@@ -2736,18 +2807,21 @@ def _format_run_age(state: dict) -> str:
 
 
 def _tmux_runs(hive: Path) -> None:
-    """Print a per-workspace run-dsl status table — the backtick+a popup.
+    """Print a per-work_dir run-dsl status table — the backtick+a popup.
 
-    Lists only workspaces that have run history; workspaces with no
-    run-dsl record are skipped to keep the popup tight.
+    One row per work_dir, not per workspace: a workspace's ``.local/<repo>``
+    clones each get their own line, named by the subpath, so a failure points
+    at the clone it happened in. Workspaces with no run-dsl record are skipped
+    to keep the popup tight.
+
+    This is where terminal states live. The window label deliberately carries
+    only live runs (see _run_state_label_suffix) — a status-bar character
+    cannot say which clone failed or why, and this table can.
     """
-    workspaces = _discover_workspaces(hive)
     rows = []
-    for ws in workspaces:
-        state = _workspace_run_state(ws)
-        if state is None:
-            continue
-        rows.append((ws, state))
+    for ws in _discover_workspaces(hive):
+        for run in _subtree_run_states(ws):
+            rows.append((ws, run))
 
     # The popup pipes through cat/less; ANSI passes through, so force colour on.
     C.force_enable()
@@ -2764,17 +2838,18 @@ def _tmux_runs(hive: Path) -> None:
         'failed':      ('✗', C.bright_red),
         'interrupted': ('…', C.yellow),
     }
-    name_w = max(len(ws.name) for ws, _ in rows)
-    prog_w = max(len(s['program']) for _, s in rows)
-    prog_w = min(prog_w, 32)
-    for ws, state in rows:
-        char, colour = icons.get(state['state'], ('?', C.dim))
-        state_lbl = state['state']
-        prog = (state['program'] or '')[:prog_w]
-        age = _format_run_age(state)
-        obj = state['objective'][:80] if state['objective'] else ''
-        print(f'  {ws.name:<{name_w}}  {colour(char)} {state_lbl:<11} '
-              f'{prog:<{prog_w}}  {age:>4}  {C.dim(obj)}')
+
+    def where(ws, run):
+        return f'{ws.name}/{run["subpath"]}' if run['subpath'] else ws.name
+
+    name_w = max(len(where(ws, run)) for ws, run in rows)
+    prog_w = min(max(len(run['program']) for _, run in rows), 32)
+    for ws, run in rows:
+        char, colour = icons.get(run['state'], ('?', C.dim))
+        prog = (run['program'] or '')[:prog_w]
+        obj = run['objective'][:80] if run['objective'] else ''
+        print(f'  {where(ws, run):<{name_w}}  {colour(char)} {run["state"]:<11} '
+              f'{prog:<{prog_w}}  {_format_run_age(run):>4}  {C.dim(obj)}')
 
 
 def _tmux_label_window(pane_path: str, window_id: str) -> None:

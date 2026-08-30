@@ -64,6 +64,7 @@ Zero errors and zero warnings is the bar.
 | ADR | Title | Status |
 |-----|-------|--------|
 | [0001](0001-shell-history-hygiene.md) | Shell History Hygiene — Deliberate Removal, Not Exit-Status Culling | accepted |
+| [0002](0002-hive-window-run-indicator.md) | Hive Window Run Indicator — Live Runs Only, Rolled Up Over the Workspace Subtree | accepted |
 
 The index carries only what `tests/test_adr_index.py` compares against the ADR
 files. Revisit conditions are deliberately *not* a column: the text is long,
