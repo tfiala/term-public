@@ -951,44 +951,127 @@ class TestClassifyRunState:
         assert hive._classify_run_state(sc) == 'interrupted'
 
 
-class TestWorkspaceRunState:
-    def test_no_acc_runs_dir_returns_none(self, tmp_path):
+class TestSubtreeRunStates:
+    def test_no_acc_runs_dir_returns_empty(self, tmp_path):
         ws = tmp_path / 'widget-1'
         ws.mkdir()
         with patch.object(hive, '_ACC_RUNS_DIR', tmp_path / 'nonexistent'):
-            assert hive._workspace_run_state(ws) is None
+            assert hive._subtree_run_states(ws) == []
 
-    def test_workspace_with_no_runs_returns_none(self, tmp_path):
+    def test_workspace_with_no_runs_returns_empty(self, tmp_path):
         acc = tmp_path / 'acc-runs'
         acc.mkdir()
         ws = tmp_path / 'widget-1'
         ws.mkdir()
-        # A sidecar for a *different* work_dir.
-        _write_sidecar(acc, 'a', work_dir=tmp_path / 'other')
+        _write_sidecar(acc, 's', work_dir=tmp_path / 'other', status=True)
         with patch.object(hive, '_ACC_RUNS_DIR', acc):
-            assert hive._workspace_run_state(ws) is None
+            assert hive._subtree_run_states(ws) == []
 
-    def test_picks_most_recent_run(self, tmp_path):
+    def test_picks_most_recent_run_per_work_dir(self, tmp_path):
         acc = tmp_path / 'acc-runs'
         acc.mkdir()
         ws = tmp_path / 'widget-1'
         ws.mkdir()
-        older = _write_sidecar(acc, 'old', work_dir=ws, status=False,
-                               objective='Old run')
-        newer = _write_sidecar(acc, 'new', work_dir=ws, status=True,
-                               objective='New run')
-        # Force the newer one's manifest mtime to be later.
-        os.utime(newer / 'manifest.json', (time.time(), time.time()))
-        os.utime(older / 'manifest.json', (time.time() - 100, time.time() - 100))
+        old = _write_sidecar(acc, 'old', work_dir=ws, status=False,
+                             objective='Old run')
+        os.utime(old / 'manifest.json', (1000, 1000))
+        _write_sidecar(acc, 'new', work_dir=ws, status=True,
+                       objective='New run')
         with patch.object(hive, '_ACC_RUNS_DIR', acc):
-            state = hive._workspace_run_state(ws)
-        assert state is not None
-        assert state['state'] == 'succeeded'
-        assert state['objective'] == 'New run'
+            runs = hive._subtree_run_states(ws)
+        assert len(runs) == 1
+        assert runs[0]['state'] == 'succeeded'
+        assert runs[0]['objective'] == 'New run'
+
+    def test_local_clone_gets_its_own_row(self, tmp_path):
+        # The whole point of the subtree walk: work in .local/<repo> is the
+        # workspace's work, but it is a different work_dir and must not be
+        # collapsed into the root's row.
+        acc = tmp_path / 'acc-runs'
+        acc.mkdir()
+        ws = tmp_path / 'widget-1'
+        (ws / '.local' / 'corpus').mkdir(parents=True)
+        _write_sidecar(acc, 'root', work_dir=ws, status=True)
+        _write_sidecar(acc, 'clone', work_dir=ws / '.local' / 'corpus',
+                       status=False)
+        with patch.object(hive, '_ACC_RUNS_DIR', acc):
+            runs = hive._subtree_run_states(ws)
+        by_subpath = {r['subpath']: r['state'] for r in runs}
+        assert by_subpath == {'': 'succeeded', '.local/corpus': 'failed'}
+
+    def test_sibling_workspace_is_not_a_subtree_match(self, tmp_path):
+        # 'widget-10' starts with 'widget-1' as a string but is not under it.
+        acc = tmp_path / 'acc-runs'
+        acc.mkdir()
+        ws = tmp_path / 'widget-1'
+        ws.mkdir()
+        (tmp_path / 'widget-10').mkdir()
+        _write_sidecar(acc, 's', work_dir=tmp_path / 'widget-10', status=False)
+        with patch.object(hive, '_ACC_RUNS_DIR', acc):
+            assert hive._subtree_run_states(ws) == []
+
+
+class TestWorkspaceLiveRuns:
+    def test_counts_live_run_at_workspace_root(self, tmp_path):
+        acc = tmp_path / 'acc-runs'
+        acc.mkdir()
+        ws = tmp_path / 'widget-1'
+        ws.mkdir()
+        _write_sidecar(acc, 's', work_dir=ws, heartbeat_age=10)
+        with patch.object(hive, '_ACC_RUNS_DIR', acc):
+            assert len(hive._workspace_live_runs(ws)) == 1
+
+    def test_counts_live_run_inside_local_clone(self, tmp_path):
+        acc = tmp_path / 'acc-runs'
+        acc.mkdir()
+        ws = tmp_path / 'widget-1'
+        (ws / '.local' / 'corpus').mkdir(parents=True)
+        _write_sidecar(acc, 's', work_dir=ws / '.local' / 'corpus',
+                       heartbeat_age=10)
+        with patch.object(hive, '_ACC_RUNS_DIR', acc):
+            runs = hive._workspace_live_runs(ws)
+        assert [r['subpath'] for r in runs] == ['.local/corpus']
+
+    def test_terminal_states_are_not_live(self, tmp_path):
+        acc = tmp_path / 'acc-runs'
+        acc.mkdir()
+        ws = tmp_path / 'widget-1'
+        ws.mkdir()
+        _write_sidecar(acc, 'ok', work_dir=ws, status=True)
+        _write_sidecar(acc, 'bad', work_dir=ws, status=False)
+        _write_sidecar(acc, 'stale', work_dir=ws,
+                       heartbeat_age=hive._RUN_HEARTBEAT_TTL + 100)
+        with patch.object(hive, '_ACC_RUNS_DIR', acc):
+            assert hive._workspace_live_runs(ws) == []
+
+    def test_stale_runtime_mtime_is_pruned_without_reading(self, tmp_path):
+        # The prefilter is the reason this is cheap enough for every relabel.
+        # A live run rewrites runtime.json each heartbeat, so an old mtime
+        # means not-live even if the JSON inside claims a fresh heartbeat.
+        acc = tmp_path / 'acc-runs'
+        acc.mkdir()
+        ws = tmp_path / 'widget-1'
+        ws.mkdir()
+        sc = _write_sidecar(acc, 's', work_dir=ws, heartbeat_age=1)
+        os.utime(sc / 'runtime.json', (1000, 1000))
+        with patch.object(hive, '_ACC_RUNS_DIR', acc):
+            assert hive._workspace_live_runs(ws) == []
+
+    def test_fresh_mtime_with_stale_heartbeat_still_rejected(self, tmp_path):
+        # The prefilter only widens the candidate set; last_heartbeat_at
+        # remains the authority, so an over-included sidecar is still dropped.
+        acc = tmp_path / 'acc-runs'
+        acc.mkdir()
+        ws = tmp_path / 'widget-1'
+        ws.mkdir()
+        _write_sidecar(acc, 's', work_dir=ws,
+                       heartbeat_age=hive._RUN_HEARTBEAT_TTL + 1)
+        with patch.object(hive, '_ACC_RUNS_DIR', acc):
+            assert hive._workspace_live_runs(ws) == []
 
 
 class TestRunStateLabelSuffix:
-    def test_running_returns_dot(self, tmp_path):
+    def test_single_live_run_returns_bare_dot(self, tmp_path):
         acc = tmp_path / 'acc-runs'
         acc.mkdir()
         ws = tmp_path / 'widget-1'
@@ -997,16 +1080,33 @@ class TestRunStateLabelSuffix:
         with patch.object(hive, '_ACC_RUNS_DIR', acc):
             assert hive._run_state_label_suffix(ws) == '●'
 
-    def test_failed_returns_cross(self, tmp_path):
+    def test_concurrent_live_runs_are_counted(self, tmp_path):
+        acc = tmp_path / 'acc-runs'
+        acc.mkdir()
+        ws = tmp_path / 'widget-1'
+        (ws / '.local' / 'corpus').mkdir(parents=True)
+        (ws / '.local' / 'homepage').mkdir(parents=True)
+        _write_sidecar(acc, 'a', work_dir=ws, heartbeat_age=10)
+        _write_sidecar(acc, 'b', work_dir=ws / '.local' / 'corpus',
+                       heartbeat_age=10)
+        _write_sidecar(acc, 'c', work_dir=ws / '.local' / 'homepage',
+                       heartbeat_age=10)
+        with patch.object(hive, '_ACC_RUNS_DIR', acc):
+            assert hive._run_state_label_suffix(ws) == '●3'
+
+    def test_failed_no_longer_surfaces(self, tmp_path):
+        # Terminal states are history — the popup names the clone and error.
         acc = tmp_path / 'acc-runs'
         acc.mkdir()
         ws = tmp_path / 'widget-1'
         ws.mkdir()
         _write_sidecar(acc, 's', work_dir=ws, status=False)
         with patch.object(hive, '_ACC_RUNS_DIR', acc):
-            assert hive._run_state_label_suffix(ws) == '✗'
+            assert hive._run_state_label_suffix(ws) == ''
 
-    def test_interrupted_returns_ellipsis(self, tmp_path):
+    def test_interrupted_no_longer_surfaces(self, tmp_path):
+        # An interrupted run means "we stopped watching", not "act on this",
+        # and it never expired — the old indicator became permanent decor.
         acc = tmp_path / 'acc-runs'
         acc.mkdir()
         ws = tmp_path / 'widget-1'
@@ -1014,10 +1114,9 @@ class TestRunStateLabelSuffix:
         _write_sidecar(acc, 's', work_dir=ws,
                        heartbeat_age=hive._RUN_HEARTBEAT_TTL + 100)
         with patch.object(hive, '_ACC_RUNS_DIR', acc):
-            assert hive._run_state_label_suffix(ws) == '…'
+            assert hive._run_state_label_suffix(ws) == ''
 
     def test_succeeded_returns_empty(self, tmp_path):
-        # Recent-success is informational only — keep the label clean.
         acc = tmp_path / 'acc-runs'
         acc.mkdir()
         ws = tmp_path / 'widget-1'
@@ -1030,6 +1129,17 @@ class TestRunStateLabelSuffix:
         ws = tmp_path / 'widget-1'
         ws.mkdir()
         with patch.object(hive, '_ACC_RUNS_DIR', tmp_path / 'nonexistent'):
+            assert hive._run_state_label_suffix(ws) == ''
+
+    def test_sibling_workspace_run_does_not_leak(self, tmp_path):
+        acc = tmp_path / 'acc-runs'
+        acc.mkdir()
+        ws = tmp_path / 'widget-1'
+        ws.mkdir()
+        (tmp_path / 'widget-10').mkdir()
+        _write_sidecar(acc, 's', work_dir=tmp_path / 'widget-10',
+                       heartbeat_age=10)
+        with patch.object(hive, '_ACC_RUNS_DIR', acc):
             assert hive._run_state_label_suffix(ws) == ''
 
 
@@ -1071,6 +1181,24 @@ class TestTmuxRunsPopup:
         body = out.split('\n', 2)[-1] if '\n' in out else out
         assert 'widget-1' not in body
         assert 'widget-3' not in body
+
+    def test_local_clone_row_is_named_by_subpath(self, fake_hive, tmp_path,
+                                                 capsys):
+        # Terminal states moved here from the window label, so the row has to
+        # identify which clone failed — 'widget-1' alone would not.
+        acc = tmp_path / 'acc-runs'
+        acc.mkdir()
+        clone = fake_hive / 'widget-1' / '.local' / 'corpus'
+        clone.mkdir(parents=True)
+        _write_sidecar(acc, 'a', work_dir=fake_hive / 'widget-1', status=True)
+        _write_sidecar(acc, 'b', work_dir=clone, status=False,
+                       objective='Corpus run blew up')
+        with patch.object(hive, '_ACC_RUNS_DIR', acc):
+            hive._tmux_runs(fake_hive)
+        out = capsys.readouterr().out
+        assert 'widget-1/.local/corpus' in out
+        assert 'failed' in out and 'Corpus run blew up' in out
+        assert 'succeeded' in out
 
 
 class TestLabelWindowRunSuffix:
