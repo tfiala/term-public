@@ -290,6 +290,12 @@ settings that make Claude CLI render correctly inside tmux (notably
 `allow-passthrough on` plus synchronized output) and pins `default-shell` to
 Homebrew bash.
 
+Window selection keeps the single-key path for the first ten workspaces:
+backtick+`1` through `9` select those window numbers, and backtick+`0` selects
+window 10 in a hive session. For any window number, press backtick+`'`, enter
+the number, and press Enter. Numbered workspaces are assigned to windows in
+numeric suffix order (`wg-2` before `wg-10`).
+
 ## Tests
 
 Run:

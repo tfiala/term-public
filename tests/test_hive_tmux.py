@@ -121,10 +121,18 @@ class TestGenerateTmuxConfig:
 
     def test_keybindings_guard_on_hive_root(self, fake_hive):
         conf = hive._generate_tmux_config(fake_hive, hive._SHELL_PALETTE[0])
-        for key in ('bind c', 'bind b', 'bind g', 'bind G', 'bind C-g',
+        for key in ('bind 0', 'bind c', 'bind b', 'bind g', 'bind G', 'bind C-g',
                     'bind R', 'bind r'):
             assert key in conf
         assert '$HIVE_ROOT' in conf
+
+    def test_zero_selects_window_ten_only_in_hive_sessions(self, fake_hive):
+        conf = hive._generate_tmux_config(fake_hive, hive._SHELL_PALETTE[0])
+        binding = next(line for line in conf.splitlines()
+                       if line.startswith('bind 0 '))
+        assert "'[ -n \"$HIVE_ROOT\" ]'" in binding
+        assert "'select-window -t :=10'" in binding
+        assert "'select-window -t :=0'" in binding
 
     def test_invokes_hive_tmux_subcommands(self, fake_hive):
         conf = hive._generate_tmux_config(fake_hive, hive._SHELL_PALETTE[0])
@@ -184,6 +192,16 @@ class TestSessionHelpers:
     def test_discover_workspaces(self, fake_hive):
         names = [w.name for w in hive._discover_workspaces(fake_hive)]
         assert names == ['widget-1', 'widget-2', 'widget-3']
+
+    def test_discover_workspaces_sorts_numeric_suffixes_naturally(self, fake_hive):
+        for name in ('widget-9', 'widget-10'):
+            workspace = fake_hive / name
+            workspace.mkdir()
+            (workspace / '.git').mkdir()
+        names = [w.name for w in hive._discover_workspaces(fake_hive)]
+        assert names == [
+            'widget-1', 'widget-2', 'widget-3', 'widget-9', 'widget-10',
+        ]
 
 
 class TestResolveTmuxHive:
