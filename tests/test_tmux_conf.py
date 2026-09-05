@@ -172,8 +172,9 @@ def test_all_literal_style_colors_are_truecolor():
 
 def test_arbitrary_window_index_prompt_binding_is_explicit():
     lines = TMUX_CONF.read_text().splitlines()
-    assert (r'''bind \' command-prompt -p "window:" "select-window -t ':%%'"'''
-            in lines)
+    expected = r'''bind \' command-prompt -p "window:" "select-window -t ':%%'"'''
+    bindings = [line for line in lines if line.startswith(r"bind \' ")]
+    assert bindings == [expected]
 
 
 @pytest.mark.parametrize(

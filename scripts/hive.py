@@ -2386,7 +2386,7 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
         '# every hive-specific binding guards on $HIVE_ROOT and falls back to',
         '# the default behavior for non-hive sessions.',
         '',
-        '# backtick + 0: window 10 in hives; preserve tmux window 0 elsewhere',
+        '# backtick + 0: window 10 in hives; use tmux\'s stock :=0 elsewhere',
         'bind 0 if-shell \'[ -n "$HIVE_ROOT" ]\' '
         '\'select-window -t :=10\' \'select-window -t :=0\'',
         '',
