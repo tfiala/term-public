@@ -2213,6 +2213,14 @@ def _workspace_number(name: str) -> str | None:
     return m.group(2) if m else None
 
 
+def _workspace_sort_key(workspace: Path) -> tuple[str, int, str]:
+    """Sort numbered workspaces by numeric suffix, not digit text."""
+    match = _NAME_RE.match(workspace.name)
+    if match is None:
+        return workspace.name, -1, workspace.name
+    return match.group(1), int(match.group(2)), workspace.name
+
+
 # --- tmux session helpers -----------------------------------------------------
 
 
@@ -2281,8 +2289,9 @@ def _windows_in_session(session: str) -> list[str]:
 
 
 def _discover_workspaces(hive: Path) -> list[Path]:
-    """Return the hive's workspace directories (git repos), sorted by name."""
-    return [main for main, _nested in _discover_repos(hive)]
+    """Return git workspaces in natural numeric-suffix order."""
+    workspaces = [main for main, _nested in _discover_repos(hive)]
+    return sorted(workspaces, key=_workspace_sort_key)
 
 
 def _resolve_tmux_hive(hive_arg: str | None) -> Path | None:
@@ -2376,6 +2385,10 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
         '# Keybindings — tmux keybindings are global (not session-scoped), so',
         '# every hive-specific binding guards on $HIVE_ROOT and falls back to',
         '# the default behavior for non-hive sessions.',
+        '',
+        '# backtick + 0: window 10 in hives; use tmux\'s stock :=0 elsewhere',
+        'bind 0 if-shell \'[ -n "$HIVE_ROOT" ]\' '
+        '\'select-window -t :=10\' \'select-window -t :=0\'',
         '',
         '# backtick + r: reload config (hive config or base tmux.conf)',
         'bind r run-shell -b \''
