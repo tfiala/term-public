@@ -172,6 +172,16 @@ class TestGenerateTmuxConfig:
         assert 'turn-refresh "#{session_name}" >/dev/null' in conf
         assert 'turn-refresh "#{session_name}" --bust-cache' in conf
 
+    def test_window_selection_refreshes_turn_state_without_pane_polling(
+            self, fake_hive):
+        conf = hive._generate_tmux_config(fake_hive, hive._SHELL_PALETTE[0])
+        hooks = {line.split(' ', 2)[1]: line for line in conf.splitlines()
+                 if line.startswith('set-hook after-')}
+        assert ('turn-refresh \\"#{session_name}\\" --if-idle'
+                in hooks['after-select-window'])
+        assert 'turn-refresh' not in hooks['after-select-pane']
+        assert 'turn-refresh' not in hooks['after-new-window']
+
     def test_window_formats_compose_run_and_turn_suffixes(self):
         assert '@hive_run_suffix' in hive._WINDOW_STATUS_FORMAT
         assert '@hive_turn_suffix' in hive._WINDOW_STATUS_FORMAT
@@ -1391,6 +1401,39 @@ class TestTurnProducerBoundary:
         assert write.call_count == 2
         set_line.assert_called_once_with('hive-0', '1⇄2 #7 ▶2')
 
+    def test_if_idle_refresh_skips_when_selection_refresh_is_running(self):
+        with patch.object(hive, '_acquire_turn_refresh_lock',
+                          return_value=None), \
+             patch.object(hive, '_build_turn_session') as build:
+            assert hive._tmux_turn_refresh('hive-0', if_idle=True)
+        build.assert_not_called()
+
+    def test_selection_lock_is_per_session_and_nonblocking(self, tmp_path):
+        state_dir = tmp_path / 'turn'
+        with patch.object(hive, '_TURN_STATE_DIR', state_dir):
+            first = hive._acquire_turn_refresh_lock('hive-0')
+            duplicate = hive._acquire_turn_refresh_lock('hive-0')
+            other = hive._acquire_turn_refresh_lock('hive-1')
+        try:
+            assert first is not None
+            assert duplicate is None
+            assert other is not None
+        finally:
+            if first is not None:
+                os.close(first)
+            if other is not None:
+                os.close(other)
+        assert all(path.stat().st_mode & 0o777 == 0o600
+                   for path in state_dir.glob('refresh-*.lock'))
+
+    def test_if_idle_refresh_releases_its_session_lock(self):
+        with patch.object(hive, '_acquire_turn_refresh_lock',
+                          return_value=23), \
+             patch.object(hive, '_build_turn_session', return_value=None), \
+             patch.object(hive.os, 'close') as close:
+            assert not hive._tmux_turn_refresh('hive-0', if_idle=True)
+        close.assert_called_once_with(23)
+
     def test_unchanged_pair_line_does_not_mutate_tmux(self):
         shown = subprocess.CompletedProcess(
             [], 0, stdout='1⇄2 #7 ▶2\n', stderr='')
@@ -1549,10 +1592,19 @@ class TestCmdTmuxDispatch:
 
     def test_turn_refresh_action_routes_with_cache_bust(self):
         args = self._args(tmux_action='turn-refresh', session='infra-0',
-                          bust_cache=True)
+                          bust_cache=True, if_idle=False)
         with patch.object(hive, '_tmux_turn_refresh', return_value=True) as fn:
             hive.cmd_tmux(args)
-        fn.assert_called_once_with('infra-0', bust_cache=True)
+        fn.assert_called_once_with(
+            'infra-0', bust_cache=True, if_idle=False)
+
+    def test_turn_refresh_action_routes_selection_single_flight(self):
+        args = self._args(tmux_action='turn-refresh', session='infra-0',
+                          bust_cache=False, if_idle=True)
+        with patch.object(hive, '_tmux_turn_refresh', return_value=True) as fn:
+            hive.cmd_tmux(args)
+        fn.assert_called_once_with(
+            'infra-0', bust_cache=False, if_idle=True)
 
     def test_pairs_action_routes(self):
         args = self._args(tmux_action='pairs', session='infra-0')
@@ -1659,6 +1711,13 @@ class TestTmuxPopup:
         run.assert_called_once_with(
             ['tmux', 'display-message', '-c', '/dev/ttys000', '-t', '%7',
              'hive tmux popup: no command'], capture_output=True)
+
+    def test_legacy_no_target_call_omits_empty_target_flags(self):
+        with patch.object(hive.subprocess, 'run') as run:
+            hive._tmux_popup(None, [])
+        run.assert_called_once_with(
+            ['tmux', 'display-message', 'hive tmux popup: no command'],
+            capture_output=True)
 
 
 # --- Pane environment seeding ------------------------------------------------
@@ -1804,6 +1863,11 @@ class TestStatusBarTmuxProbe:
                  str(config)],
                 capture_output=True, text=True, env=probe_env)
             assert sourced.returncode == 0, sourced.stderr
+            hook = subprocess.run(
+                ['tmux', '-L', socket, 'show-hooks', '-t', 'probe',
+                 'after-select-window'],
+                check=True, capture_output=True, text=True, env=probe_env)
+            assert 'turn-refresh \\"#{session_name}\\" --if-idle' in hook.stdout
         finally:
             subprocess.run(['tmux', '-L', socket, 'kill-server'],
                            capture_output=True)

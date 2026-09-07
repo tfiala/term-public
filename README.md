@@ -427,10 +427,11 @@ that provenance is absent, and `hive tmux role clear` to remove the override.
 Backtick+`p` opens the pair detail popup. Backtick+`R` clears mutable PR
 observations and refreshes immediately while preserving immutable merged
 receipts. Turn state is evaluated when a session starts or reloads, when a role
-is changed, and by those two bindings; it is deliberately not launched from
-`status-right`, because tmux may restart a completed `#(…)` command far more
-often than `status-interval`. Press backtick+`R` after PR activity when the
-popup is not already being opened.
+is changed, when a window is selected, and by those two bindings. Selection
+refreshes are user-paced and single-flight; turn evaluation is deliberately not
+launched from `status-right`, because tmux may restart a completed `#(…)`
+command far more often than `status-interval`. Press backtick+`R` after PR
+activity when the popup is not already being opened.
 
 Window selection keeps the single-key path for the first ten workspaces:
 backtick+`1` through `9` select those window numbers, and backtick+`0` selects
