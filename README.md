@@ -31,7 +31,7 @@ It avoids:
 - `tmux/` base tmux config (carries the Claude-CLI-safe settings)
 - `neovim/configs.bash` Neovim config sources, app names, and aliases
 - `scripts/hive.py` hive/apiary/tmux entrypoint
-- `setup.sh` symlink installer
+- `setup.sh` config linker and Neovim config installer
 - `setup/bootstrap-macos.sh` package/bootstrap helper (macOS)
 - `setup/bootstrap-linux.sh` package/bootstrap helper (RHEL 9 family, Ubuntu)
 - `ghostty/xterm-ghostty.terminfo` vendored terminfo source, compiled by

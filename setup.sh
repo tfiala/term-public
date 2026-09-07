@@ -106,15 +106,12 @@ backup_and_copy_file() {
   chmod u+x "$2"
 }
 
-# install_nvim_config
+# preflight_nvim_config_destination
 # $1 - NVIM_APPNAME / directory name under XDG_CONFIG_HOME
-# $2 - public git clone URL
-# $3 - branch containing the personalized configuration
-# Existing config directories are user-owned working trees and are never
-# updated or replaced. A shallow clone is sufficient: each config repository
-# manages its own plugins and lockfile after Neovim starts.
-install_nvim_config() {
-  local appname="$1" source_url="$2" branch="$3" destination
+# Rejects a conflicting non-directory before setup changes any installed
+# config. Existing directories are user-owned working trees and are valid.
+preflight_nvim_config_destination() {
+  local appname="$1" destination
   destination="$CONFIG_HOME/$appname"
 
   if [[ -d "$destination" ]]; then
@@ -124,13 +121,35 @@ install_nvim_config() {
     echo "ERROR: Neovim config destination is not a directory: $destination" >&2
     return 1
   fi
+}
+
+# install_nvim_config
+# $1 - NVIM_APPNAME / directory name under XDG_CONFIG_HOME
+# $2 - public git clone URL
+# $3 - branch containing the personalized configuration
+# Runs only after the primary local config has been linked. Network or git
+# failures warn and degrade to a missing flavor alias; they do not leave a
+# fresh machine without its shell config. Existing directories are never
+# updated or replaced. A shallow clone is sufficient because each config
+# repository manages its own plugins and lockfile after Neovim starts.
+install_nvim_config() {
+  local appname="$1" source_url="$2" branch="$3" destination
+  destination="$CONFIG_HOME/$appname"
+
+  if [[ -d "$destination" ]]; then
+    return 0
+  fi
   if ! command -v git >/dev/null 2>&1; then
-    echo "ERROR: git is required to install Neovim config: $appname" >&2
-    return 1
+    echo "WARNING: git is unavailable; skipped Neovim config: $appname" >&2
+    return 0
   fi
 
   mkdir -p "$CONFIG_HOME"
-  git clone --depth 1 --branch "$branch" -- "$source_url" "$destination"
+  if ! git clone --depth 1 --branch "$branch" -- "$source_url" "$destination"; then
+    echo "WARNING: could not install Neovim config: $appname" >&2
+    echo "  Rerun setup.sh when the repository is reachable." >&2
+    return 0
+  fi
   echo "Installed Neovim config: $appname"
 }
 
@@ -379,10 +398,8 @@ source "$ROOT_DIR/neovim/configs.bash"
 for _nvim_spec in "${TERM_PUBLIC_NVIM_CONFIG_SPECS[@]}"; do
   IFS='|' read -r _nvim_alias _nvim_appname _nvim_url _nvim_branch \
     <<< "$_nvim_spec"
-  install_nvim_config "$_nvim_appname" "$_nvim_url" "$_nvim_branch"
+  preflight_nvim_config_destination "$_nvim_appname"
 done
-unset TERM_PUBLIC_NVIM_CONFIG_SPECS
-unset _nvim_spec _nvim_alias _nvim_appname _nvim_url _nvim_branch
 
 if [[ ! -f "$LOCAL_DIR/env.local" ]]; then
   cp "$LOCAL_DIR/env.local.template" "$LOCAL_DIR/env.local"
@@ -404,6 +421,16 @@ done
 backup_and_copy_file "$ROOT_DIR/scripts/hive.py" "$HOME/bin/hive"
 backup_and_copy_file "$ROOT_DIR/scripts/hive-ci-popup.py" "$HOME/bin/hive-ci-popup"
 backup_and_copy_file "$ROOT_DIR/scripts/term-theme" "$HOME/bin/term-theme"
+
+# These network-dependent additions are deliberately after the primary local
+# install. Failure leaves a usable shell and can be repaired by rerunning setup.
+for _nvim_spec in "${TERM_PUBLIC_NVIM_CONFIG_SPECS[@]}"; do
+  IFS='|' read -r _nvim_alias _nvim_appname _nvim_url _nvim_branch \
+    <<< "$_nvim_spec"
+  install_nvim_config "$_nvim_appname" "$_nvim_url" "$_nvim_branch"
+done
+unset TERM_PUBLIC_NVIM_CONFIG_SPECS
+unset _nvim_spec _nvim_alias _nvim_appname _nvim_url _nvim_branch
 
 # Clean up links from the zsh era (removed in the bash cutover, #15).
 remove_stale_link "$HOME/.zshenv" "zsh/zshenv"
