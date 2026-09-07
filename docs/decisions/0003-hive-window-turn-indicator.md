@@ -88,10 +88,16 @@ Measured on the two attached hive sessions on 2026-09-06, 14 panes:
   (`⠧ home-dc-6`). Six of the fourteen panes carried a Claude summary; two of
   the Codex panes were mid-spin. Only Codex supplies a working spinner in the
   title, so the title is a summary source, not a liveness source.
-- `pane_current_command` separates the two CLIs from each other and from a
-  plain shell: Claude Code's process is named by its version (`2.1.263`),
-  Codex's is `node`, and a bare window is `bash`. It identifies the
-  program; it does not say whether the program is emitting output.
+- `pane_current_command` separates the two live CLIs from a plain shell in
+  the measured panes, but it is only a basename: Claude Code presents its
+  version (`2.1.263`), Codex presents `node`, and a bare window presents
+  `bash`. `node` is not an agent identity. The process inventory on the pane
+  TTY carries the structural distinction: the live Codex pane has a Node
+  entry script whose resolved path ends in
+  `/node_modules/@openai/codex/bin/codex.js` and a descendant native `codex`
+  binary under the same package; the live Claude pane has a `claude` process.
+  An ordinary Node server has neither agent signature. The inventory
+  identifies the program but still does not say whether it is emitting output.
 - Once both checkouts track the same PR branch, `git branch --show-current`
   and the upstream are identical in both windows, and the PR record is the
   same object for both. None of these carry push or checkout provenance.
@@ -140,11 +146,26 @@ any cached state.
 
 A window is **eligible** only if all three hold: its pane's current path is
 inside a git checkout with an origin; its branch is not that remote's
-default branch as read by `_default_branch`; and its pane runs an agent —
-`pane_current_command` is a Claude Code version string or `node`. A window
-put back on `main`, or a window that is just a shell, is ineligible and
-takes no part in any group, gets no glyph, and appears in the popup only
-under "not participating".
+default branch as read by `_default_branch`; and the process inventory for
+its `pane_tty` contains a verified agent signature. The producer reads that
+inventory with `ps`, restricted to the session's pane TTYs and rooted at each
+`pane_pid`, and walks the parent/child relationships rather than trusting the
+foreground basename:
+
+- Claude Code is a descendant process whose command basename is `claude`.
+- Codex is either a Node process whose entry-script path resolves to a path
+  ending in `/node_modules/@openai/codex/bin/codex.js`, or its descendant
+  native `codex` binary under that same package. A bare `node` basename never
+  qualifies.
+
+Only the resulting boolean and agent kind survive the check; command lines
+are never printed, logged, or cached. A failed or unparseable process snapshot
+also fails closed and clears any prior eligibility output. A window put back
+on `main`, a window that is just a shell, and a window running an ordinary
+Node workload are ineligible: they take no part in any group, get no glyph,
+and appear in the popup only under "not participating". Unknown agent
+installations fail closed to ineligible until their structural signature has
+a fixture.
 
 A **group** is the set of eligible windows in one hive with equal pair keys.
 The baton table below applies to a group according to its **shape**, and
@@ -157,35 +178,51 @@ only one shape is a pair:
 | malformed | two windows with a duplicate role or any unknown role; or three or more windows | rows 1–2 apply per window; every other row resolves to **unknown**, and the popup names the shape ("implementer + implementer", "3 windows on <key>", "roles unknown") |
 
 The "third window joining" case named in **Context** is therefore not a
-pair; it is a malformed group, shown as such, until the operator declares
-roles or puts a window back.
+pair; it is a malformed group, shown as such, until a window is put back.
+Declarations can repair duplicate or unknown roles, but cannot repair a
+three-window cardinality.
 
-### PR resolution and closed receipts
+### PR resolution and terminal state
 
-A PR is an **attribute** of a group, not a precondition for it. It is
-resolved per pair key, in this order:
+A PR is an **attribute** of a group, not a precondition for it. Open PR state
+is group-wide even when one checkout has not pulled the latest head. Without
+an open PR, terminal matching is defined only when every member has the same
+local HEAD; different local HEADs resolve to **unknown** ("mixed local
+HEADs") rather than pretending the group has one revision.
 
-1. the open PR on that remote whose head ref is the branch;
-2. otherwise a **closed receipt** for `(pair key, HEAD)` held in the private
-   cache (below);
-3. otherwise, among the most recently updated closed or merged PRs with that
-   head ref — one page, at most 30, a **count** bound with no age
-   component — the one whose head SHA equals the checkout's current HEAD;
-   when found, a receipt is written;
-4. otherwise none.
+Resolution proceeds in this order:
 
-A receipt records the PR number, its state, and the head SHA it was observed
-at. It is authoritative for that `(pair key, HEAD)` regardless of age and
-regardless of later lookup failures, and it is invalidated by exactly two
-events: the pair key changes, or HEAD changes. The `↩` state therefore
-persists on an untouched checkout for as long as it stays untouched, and
-disappears the moment the branch advances past the closed PR's head. There
-is no time bound anywhere in this resolution; nothing changes state because
-a calendar moved.
+1. When all members share one HEAD, an immutable **merged receipt** for
+   `(pair key, HEAD)` may answer merged without a network lookup. A merged PR
+   cannot reopen.
+2. Otherwise a mutable lookup entry younger than 60 s may answer open,
+   closed, none, or a structural unknown. The entry is bound to the pair key
+   and the set of local HEADs it was evaluated against.
+3. Otherwise query the remote for at most two open PRs whose head ref is the
+   branch. Exactly one is the group's open PR; two results means two or more
+   and is unknown ("multiple open PRs"). If none exists and the group has one
+   shared local HEAD, inspect one count-bounded page (at most 30) of the most
+   recently updated closed or
+   merged PRs with that head ref and match that HEAD to the PR head SHA. A
+   merged match writes an immutable receipt; a closed-unmerged match is only
+   a mutable 60 s cache entry. With no match, a short page proves none; a full
+   page is unknown ("terminal history truncated") because an older match may
+   exist.
+4. A failed lookup, a producer-deadline cutoff, or mixed local HEADs after no
+   open PR resolves to unknown. No stale mutable entry is a verdict.
 
-Pre-PR groups (resolution 4) are ordinary — a reviewer may fetch a branch
-before the PR is opened — and they are exactly the pairs rows 7–8 of the
-baton table exist for.
+The distinction is deliberate: merged is immutable, while a closed PR may be
+reopened with the same head SHA. A successful refresh that sees a reopen
+replaces the cached closed observation with open; a failed refresh after the
+closed entry expires yields unknown, not `↩`. The manual backtick+R refresh
+busts every mutable PR entry but never an immutable merged receipt.
+
+Merged receipts do not expire and are invalidated only when the pair key or
+HEAD changes. The `↩` state for a merged checkout therefore persists until
+put-back without allowing a mutable closed observation to become permanent.
+Pre-PR groups (a fresh resolution of none) are ordinary — a reviewer may
+fetch a branch before the PR is opened — and they are exactly the pairs rows
+7–8 of the baton table exist for.
 
 ### Roles
 
@@ -236,21 +273,22 @@ ticks at the 15 s status-interval), otherwise **quiet**, with
 version 1: both agents repaint the pane while they work (Claude Code's
 progress line; Codex's title spinner is itself pane output), so output
 silence means the same thing for both, and no per-vendor signal is consulted.
-`pane_current_command` is used only for eligibility and to name the agent in
-the popup. A hung agent that keeps repainting reads as active; the popup
-shows "active for N min" so that case is at least visible.
+The process-tree result determines eligibility; `pane_current_command` is
+display-only in the popup. A hung agent that keeps repainting reads as active;
+the popup shows "active for N min" so that case is at least visible.
 
 ### Baton rule
 
-Inputs per group: its shape; the resolved PR (open, closed receipt, or
-none); the classification of the **latest** PR comment; the question flag
-per window; the liveness state per window. The rule is evaluated top to
-bottom and the **first match is the result**, subject to the shape table
-above. Every input combination reaches a row.
+Inputs per group: its shape; the resolved PR (open, immutable merged receipt,
+fresh closed observation, none, or unknown); the classification of the
+**latest** PR comment; the question flag per window; the liveness state per
+window. The rule is evaluated top to bottom and the **first match is the
+result**, subject to the shape table above. Every input combination reaches
+a row.
 
 | # | Condition | Result |
 |---|---|---|
-| 1 | PR resolved as merged or closed (receipt bound to the current HEAD) | each window: `↩` (put this checkout back). This is the next action there and outranks everything below. |
+| 1 | PR resolved as merged or closed, with one shared local HEAD matching the PR head | each window: `↩` (put this checkout back). This is the next action there and outranks everything below. |
 | 2 | An enricher reports a window's last output ended in a question | that window: `?`. Sits above the comment rules because the question is newer than any handoff it followed; without an enricher the flag is simply absent and this row never matches. |
 | 3 | latest comment is a disposition: *approve* | implementer: `✓` (the merge is typed there) |
 | 4 | latest comment is a disposition: *changes requested* or *no new delta* | implementer: `▶` |
@@ -268,8 +306,9 @@ Two cross-cutting rules complete it:
   cut off by the producer deadline yields unknown for that group on that
   tick: no glyph, and the popup reads "unknown (lookup failed N s ago)". The
   previous tick's glyph is cleared, not kept; a stale `▶` is a wrong pointer.
-  A closed receipt is not a lookup and is unaffected. This is the rule
-  ADR-0002 drew for run state: a failed observation is not a verdict.
+  An immutable merged receipt is not a lookup and is unaffected; an expired
+  closed observation is. This is the rule ADR-0002 drew for run state: a
+  failed observation is not a verdict.
 
 ### Comment classifier
 
@@ -283,11 +322,13 @@ of keyword anywhere on it, refuses the whole line. The refusal is the safety
 property; `✓` is the one glyph that directs a merge, and it may not be
 earned by a sentence that merely contains the word.
 
-1. **Marker, when present, wins.** A line of the form `Handoff: approve`,
-   `Handoff: changes-requested`, `Handoff: no-new-delta`, or
-   `Handoff: addressed` among the last three non-empty lines is the
-   classification. This is the durable, machine-readable convention the
-   review discipline may adopt; version 1 does not depend on it.
+1. **One exact marker, when present, wins.** An unquoted, unadorned complete
+   line of the form `Handoff: approve`, `Handoff: changes-requested`,
+   `Handoff: no-new-delta`, or `Handoff: addressed` among the last three
+   non-empty lines is the classification. Two or more marker lines are
+   unrecognized rather than resolved by order; quoted, bulleted, and fenced
+   examples are not markers. This is the durable, machine-readable convention
+   the review discipline may adopt; version 1 does not depend on it.
 2. **Normalize the first non-empty line:** strip heading markers, emphasis,
    and backticks; lowercase.
 3. **Negation guard.** If the line contains any of `not`, `cannot`, `can't`,
@@ -298,10 +339,17 @@ earned by a sentence that merely contains the word.
    is: up to three words, then `review` or `re-review`, optionally `at|on|of
    <sha>`, optionally `disposition`, then any non-alphanumerics, optionally
    `<sha>` and more non-alphanumerics.
-   - *approve:* `approve`/`approved`/`lgtm` at line start followed by
-     `<end>`; a review heading followed by one of those; `reviewed …`
-     ending in the sentence `no blocking findings|issues.`; or the whole
-     line `no blocking findings|issues.`
+   - *approve:* an optional review heading followed by one verdict clause:
+     `approve`, `approved`, `lgtm`, or `approved / lgtm`. After the verdict,
+     the only accepted tails are (a) punctuation and end of line; (b)
+     `at|on`, optional `exact`, optional `rebased`, optional `head`, `<sha>`,
+     optional `against base <sha>`, then punctuation and end of line; or (c)
+     the exact suffix `, confirming the standing approval at this head.`.
+     Separately, the complete lines `reviewed locally. no blocking
+     findings|issues.`, `reviewed the pr diff in <path>. no blocking
+     findings|issues.`, and `no blocking findings|issues.` are accepted;
+     `<path>` is one non-whitespace path token. Any other prefix or tail is
+     unrecognized even when it contains an approval phrase.
    - *changes requested:* `changes` then at most two words then
      `requested`, at line start or after a review heading.
    - *no new delta:* that phrase at line start or after a review heading.
@@ -323,11 +371,16 @@ The guards are what refuse `Cannot approve this yet`, `Approval withheld
 pending the failing test`, `Not ready for approval`, `Approved with changes
 requested on <sha>`, `Pushed back on <sha>`, `LGTM-adjacent but blocked`,
 `Rebased; the new head <sha> is not ready`, and `No blocking findings?
-Several, actually.` — every one unrecognized, none a glyph. The anchors are
-what keep `Changes still requested on exact head <sha>` a disposition
-despite its commit reference, and `Both blockers addressed in <sha>` a
-completion. The cost of the guards on the real corpus is two comments,
-itemized in **Evidence**; both are refusals, which is the safe direction.
+Several, actually.`. The finite approval grammar additionally refuses
+`Approved if CI passes`, `LGTM except for the failing migration`, `Approve
+after addressing the blocker`, `Review: approved once the required test
+lands`, `Approved provided that the migration is fixed`, `LGTM assuming CI
+turns green`, and `Reviewed conditionally; no blocking findings.`. Every one
+is unrecognized; none produces a glyph. The anchors keep
+`Changes still requested on exact head <sha>` a disposition despite its
+commit reference, and `Both blockers addressed in <sha>` a completion. The
+cost of the guards on the real corpus is two comments, itemized in
+**Evidence**; both are refusals, which is the safe direction.
 
 ### Surfaces
 
@@ -354,20 +407,22 @@ slot: the `#(…)` in `status-right`, which tmux re-evaluates every
 `status-interval` for each attached client. One process per tick per
 session, bounded in time, and it does the whole session's work:
 
-1. list every hive window with `pane_current_path`, `pane_current_command`,
-   and `window_activity`; drop ineligible windows;
+1. list every hive window with `pane_current_path`, `pane_pid`, `pane_tty`,
+   `pane_current_command`, and `window_activity`; take one in-memory process
+   snapshot restricted to the session's pane TTYs, walk each tree from its
+   `pane_pid`, retain only agent kind/presence, and drop ineligible windows;
 2. compute each window's pair key and, from the checkout, its HEAD and the
    branch reflog (local, cheap); group windows by key and classify shape;
-3. resolve the PR **once per distinct pair key**: receipts and cache entries
-   from the private cache first (60 s TTL for open-PR entries; receipts do
-   not expire), then lookups through the existing `gh`/`fj` paths, run **in
-   parallel** across keys with at most 8 in flight, a 3 s timeout each, and
-   a **whole-producer deadline of 6 s** from process start. When the
-   deadline passes, the producer stops waiting: every key without a result
-   is unknown on this tick, its cache entry is left untouched, and the
-   process proceeds to step 6 regardless. N simultaneous outages therefore
-   cost one deadline, not N timeouts, and the 75 s freshness bound holds for
-   every key that did answer;
+3. resolve PR state **once per distinct pair key** using the algorithm above:
+   an exact immutable merged receipt first, then a fresh mutable entry, then
+   `gh`/`fj` lookups. Remote lookups run **in parallel** across keys with at
+   most 8 in flight, a 3 s timeout each, and a **whole-producer deadline of
+   6 s** from process start. When the deadline passes, the producer stops
+   waiting: every key without a result is unknown on this tick, no expired
+   mutable value becomes a verdict, and the process proceeds to step 6
+   regardless. N simultaneous outages therefore cost one deadline, not N
+   timeouts, and the 75 s freshness bound holds for every key that did
+   answer;
 4. apply the declared-role binding and lifecycle (ignore and clear a
    declaration whose stored key differs from the window's key; clear on
    merged/closed);
@@ -381,17 +436,18 @@ session, bounded in time, and it does the whole session's work:
 Because step 6 touches every window on every tick, both windows of a pair
 change together, and a handoff posted while the operator is in another
 window is picked up without any window-selection event. Worst-case staleness
-after a comment is one status-interval plus the cache TTL: 75 s. The manual
-backtick+R refresh also busts the open-PR cache (never receipts), for the
-operator who wants the answer now. `#(…)` runs only while a client is
-attached, which is exactly when the label can be seen.
+after a comment or reopen is one status-interval plus the mutable cache TTL:
+75 s. The manual backtick+R refresh also busts every mutable PR entry (never
+an immutable merged receipt), for the operator who wants the answer now.
+`#(…)` runs only while a client is attached, which is exactly when the label
+can be seen.
 
 `label-window` stays what it is; it reads the options the producer wrote and
 does no PR work of its own, so the hook path keeps ADR-0002's cost profile.
 
 ### Private cache
 
-The producer's cache and receipts live under
+The producer's mutable cache and merged receipts live under
 `${XDG_STATE_HOME:-$HOME/.local/state}/hive/turn/`, **not** under
 `/tmp/hive-tmux`. The directory is created with mode `0700` and re-`chmod`ed
 to `0700` on every producer start, so a permissive umask cannot widen it.
@@ -399,20 +455,22 @@ Each entry is one file per pair-key hash, created with `O_CREAT|O_EXCL` at
 mode `0600`, `fchmod`ed to `0600`, written in full, and moved into place
 with an atomic rename, the way run-dsl sidecars are written. An entry holds
 only the bounded fields the popup and the rule need: pair key, PR number,
-state, head SHA, latest comment id, its classification, its first line
-truncated to 80 characters, the PR title truncated to 80 characters,
-timestamps, and the receipt. The raw comment body is never written to disk.
+state, head SHA or HEAD set, latest comment id, its classification, its first
+line truncated to 80 characters, the PR title truncated to 80 characters,
+timestamps, and an immutable merged receipt when present. The raw comment
+body and pane process arguments are never written to disk.
 
 ### Data sources and enrichment
 
 Version 1 uses only tmux formats (`window_activity`, `pane_title`,
-`pane_current_command`, `pane_current_path`), `git` in the checkout (origin
-URL, default branch, branch, HEAD, the branch reflog), the declared-role
-input option, and the cached PR lookup. No hooks, no log parsing. Version 2
-adds optional enrichers — a Claude Code `Stop` hook, a Codex log reader —
-that may set the question flag and improve the summary line. An enricher
-that is absent, stale, or failing degrades to version 1 behavior; it never
-produces a glyph on its own, and it may set a role only by writing
+`pane_current_command`, `pane_current_path`, `pane_pid`, `pane_tty`), the
+in-memory process inventory for those TTYs, `git` in the checkout (origin URL,
+default branch, branch, HEAD, the branch reflog), the declared-role input
+option, and the cached PR lookup. No hooks, no log parsing. Version 2 adds
+optional enrichers — a Claude Code `Stop` hook, a Codex log reader — that may
+set the question flag and improve the summary line. An enricher that is
+absent, stale, or failing degrades to version 1 behavior; it never produces a
+glyph on its own, and it may set a role only by writing
 `@hive_turn_role_declared` with the same key binding the operator's command
 writes.
 
@@ -429,18 +487,23 @@ Identity is `(remote, branch)` because that is the least specific key that
 cannot collide inside a hive, and because `hive` already normalizes remotes
 for exactly this reason. Eligibility exists because key equality is
 necessary for a pair but not sufficient: two idle windows on `main` share a
-key and are not a pair, and a shell is not an agent. The shape table exists
-because the baton table assumes one implementer and one reviewer, and a
-group that is not that shape must say so rather than pick two of its
-members. Making the PR an attribute rather than a precondition is what lets
-the no-PR rows describe a real pair instead of an empty set.
+key and are not a pair, and a shell or arbitrary Node process is not an
+agent. Process ancestry and arguments carry the package identity that the
+generic `node` basename does not. The shape table exists because the baton
+table assumes one implementer and one reviewer, and a group that is not that
+shape must say so rather than pick two of its members. Making the PR an
+attribute rather than a precondition is what lets the no-PR rows describe a
+real pair instead of an empty set.
 
-Closed receipts exist because a time bound on a lookup is a time bound on
+Merged receipts exist because a time bound on a lookup is a time bound on
 the answer: the first draft's seven-day window turned a finished checkout
 into an apparent new baton on day eight with no branch, HEAD, or operator
-event. A receipt bound to `(pair key, HEAD)` changes only when the checkout
-changes, and the remaining lookup bound is a page count, which has no
-calendar in it.
+event. Merged is immutable, so a receipt bound to `(pair key, HEAD)` changes
+only when the checkout changes. Closed is not immutable: the platform can
+reopen a PR without changing its head SHA, so a cached closed observation
+must be revalidated and a failed revalidation must become unknown. Requiring
+one shared HEAD for terminal group state prevents one stale checkout from
+lending its closed/merged state to a different local revision.
 
 Roles come from the branch reflog because it is the one place the checkout
 itself records how the branch got there, it needs no network and no agent
@@ -457,12 +520,12 @@ undeclared case is not a hint.
 The classifier is anchored and guarded rather than permissive because the
 78-of-87 grammar that preceded it was compatible with the corpus and unsafe
 outside it: it would have shown `✓` for "cannot approve this yet". Anchors
-say where a verdict may stand; the negation guard and the family guard say
-when a line is not allowed to be a verdict at all; and both err toward
-refusal, which costs a glyph and never directs a merge. A negation blacklist
-that grows as counterexamples are found was rejected in favor of a guard
-that refuses every negation, at a measured cost of one real approval in the
-corpus, from before the discipline fixed its wording.
+say where a verdict may stand; the negation and family guards say when a line
+is not allowed to be a verdict at all; and a finite approval-tail grammar
+prevents a syntactically positive word from authorizing a conditional merge.
+These all err toward refusal, which costs a glyph and never directs a merge.
+The accepted tails cover the corpus's exact-head forms; novel prose uses the
+machine marker or resolves to unrecognized instead of growing a blacklist.
 
 The producer has a deadline because a per-lookup timeout bounds one lookup
 and nothing else: ten keys and one outage would have run the slot past its
@@ -496,8 +559,14 @@ additive because the mixed-vendor constraint is not going away.
     duplicate-role, all-unknown, three windows), plus an unrecognized latest
     comment, a row whose target role has no window, a lookup failure, a
     lookup timeout, and a deadline cut-off;
-  - **eligibility:** two idle windows on the default branch and a shell
-    window, none of which may form a group or receive a glyph;
+  - **eligibility:** two idle windows on the default branch, a shell window,
+    and an ordinary Node workload on a feature branch, none of which may form
+    a group or receive a glyph; live-shaped Claude and Codex process trees,
+    including a symlinked Codex entry script and its resolved package path,
+    must qualify; agent start and exit on the same pane must add and remove
+    eligibility on successive ticks, while a child tool process must not hide
+    the qualifying agent ancestor; a failed or malformed process snapshot
+    must clear eligibility and any prior glyph;
   - **successive ticks for roles, across a producer-process restart:**
     derive a role from the reflog, remove the reflog evidence, run the
     producer again as a fresh process, and require `unknown`/`none`;
@@ -505,24 +574,30 @@ additive because the mixed-vendor constraint is not going away.
     declaration to stand; change the branch, run again, and require the
     declaration ignored and cleared because its stored key no longer
     matches. In-memory state between calls is not permitted to pass these;
-  - **identity and receipts:** two windows with equal branch names on
+  - **identity and terminal state:** two windows with equal branch names on
     different remotes must neither group nor share a cache entry; two
     windows on the same remote and branch with no PR must pair and reach
-    rows 7–8; a branch whose PR closed must show `↩` while HEAD equals the
-    PR head, keep showing it after a clock advance of any size with HEAD
-    unchanged, keep showing it through a lookup failure, and resolve to
-    *none* once the branch advances;
+    rows 7–8; an open PR must remain group-wide when the two local HEADs
+    differ, while the same mixed-HEAD group with no open PR must resolve to
+    unknown; two or more open PRs on one head ref must resolve to unknown; a
+    full nonmatching terminal page must resolve to unknown while a short
+    nonmatching page resolves to none; a closed-unmerged PR may show `↩` only
+    while its mutable entry is fresh, must become open when the same PR and
+    SHA are reopened, and must become unknown when its entry expires and
+    refresh fails; a merged receipt must keep showing `↩` through arbitrary
+    clock advance and lookup failure; either terminal state must stop matching
+    when the branch advances;
   - **the classifier:** every recognized first-line form in the corpus as a
-    positive fixture; the corpus residue as negatives; the eight mutation
-    negatives named above plus `Approved pending CI` and `Review at <sha> —
-    approved, but changes requested on docs`; `Changes still requested on
-    exact head <sha>` as a SHA-bearing disposition; and the `Handoff:`
-    marker overriding a contradicting first line;
+    positive fixture; the corpus residue as negatives; all mutation negatives
+    named above plus `Approved pending CI` and `Review at <sha> — approved,
+    but changes requested on docs`; `Changes still requested on exact head
+    <sha>` as a SHA-bearing disposition; and the `Handoff:` marker overriding
+    a contradicting first line, while quoted and conflicting markers do not;
   - **the producer boundary:** N keys that all time out must yield N unknown
     results within one deadline, with no window left carrying the previous
     tick's glyph; the state directory must be `0700` and its files `0600`
-    under a `0000` umask and under a `0022` umask; an entry must never
-    contain the comment body;
+    under a `0000` umask and under a `0022` umask; an entry must never contain
+    the comment body or pane process arguments;
   - a PR-state transition (completion → disposition) delivered through a
     fake lookup with **no window-selection event**, asserting that one tick
     moves `@hive_turn_suffix` on both windows.
@@ -531,10 +606,10 @@ additive because the mixed-vendor constraint is not going away.
   and one lookup per distinct pair key per TTL rather than per window or per
   tick. A pair shares a cache entry; two same-named branches on different
   remotes do not.
-- Reading a branch reflog, HEAD, and the default branch per eligible window
-  per tick is local `git`; it is in the cost class ADR-0002 accepted for the
-  label path, and it is measured before the change ships, the way that ADR
-  measured its scan.
+- Reading a pane process tree plus the branch reflog, HEAD, and default branch
+  per window per tick is local work; it is in the cost class ADR-0002 accepted
+  for the label path, and it is measured before the change ships, the way that
+  ADR measured its scan.
 - Reflogs expire (`gc.reflogExpire`, 90 days by default) and are absent in
   some clone shapes, so a long-lived branch can lose its derived role. The
   result is *unknown*, shown as such, and one `hive tmux role` command fixes
@@ -561,8 +636,13 @@ None.
 
 ## Evidence
 
-- Pane titles, current commands, and idle times were read from the two live
-  hive sessions on 2026-09-06 (14 panes, two hives, both agents present).
+- Pane titles, current commands, idle times, and TTY process trees were read
+  from the two live hive sessions on 2026-09-06 (14 panes, two hives, both
+  agents present). The live Claude panes have a `claude` process. The live
+  Codex panes have `node <...>/bin/codex`, whose script resolves to
+  `<...>/node_modules/@openai/codex/bin/codex.js`, and a descendant native
+  `codex` binary under that package. Their generic tmux foreground values do
+  not establish those identities.
 - Reflog provenance was measured on this repository's own PR branch: the
   originating checkout reports `branch: Created from HEAD`; a fresh clone
   after `gh pr checkout` reports `branch: Created from origin/<branch>` with
@@ -577,9 +657,12 @@ None.
   header-only comments from PRs #7, #10, and #11 (written before the
   discipline fixed its wording), 4 comments that are not handoffs (a
   metadata-only PR-body refresh, a post-merge note, two progress notes), and
-  the 2 guard refusals itemized in **Consequences**. All 14 mutation
+  the 2 guard refusals itemized in **Consequences**. All 17 mutation
   negatives are unrecognized; all 18 positive fixtures, including a marker
   case, are recognized.
+- The installed GitHub CLI exposes `gh pr reopen`; a closed-unmerged PR is
+  therefore mutable without changing its head SHA and cannot support an
+  immutable receipt.
 - The identity and storage facts in **Context** were read from
   `scripts/hive.py`: `_normalize_origin_url` (remote dedup),
   `_label_cache_key` (workspace path hash), `_default_branch` (reads
@@ -666,17 +749,29 @@ None.
 - **Pairing only on an open PR.** Rejected: it made the no-PR rows
   unreachable for a two-window pair, and a reviewer can fetch a branch
   before the PR exists.
-- **A seven-day bound on resolving a closed PR.** Rejected after review: it
-  turned an untouched, finished checkout into an apparent new baton on day
-  eight. Receipts bound to `(pair key, HEAD)` and a count-bounded page
-  replace it; no state changes because time passed.
+- **A seven-day bound on resolving a terminal PR.** Rejected after review: it
+  turned an untouched, merged checkout into an apparent new baton on day
+  eight. Immutable merged receipts bound to `(pair key, HEAD)` replace that
+  bound; closed-unmerged observations stay mutable and are revalidated.
+- **An immutable receipt for a closed-unmerged PR.** Rejected after review: a
+  closed PR can reopen with the same head SHA, so the receipt would continue
+  to show `↩` after the baton became live again.
+- **One terminal verdict for a group with mixed local HEADs.** Rejected after
+  review: without an open PR, the two checkouts do not name one revision to
+  match against a closed or merged PR. The explicit unknown state exposes the
+  disagreement instead of lending one checkout's terminal state to the other.
+- **`pane_current_command` as agent identity.** Rejected after review: it is a
+  foreground basename, and Codex presents the same `node` basename as an
+  ordinary Node workload. A TTY-rooted process tree plus structural package
+  signatures replaces it.
 - **A broad substring classifier over the whole comment body.** Rejected:
   "fixed" inside a findings list would turn a rejection into a completion,
   and the corpus shows the verdict already lives on the first line.
-- **A permissive first-line grammar with a negation blacklist.** Rejected
-  after review: it covered 78 of 87 and also accepted `Cannot approve this
-  yet`. Positive anchors plus an unconditional negation guard and a family
-  guard replace it, at a measured cost of two refusals in the corpus.
+- **A permissive first-line grammar with a negation or conditional
+  blacklist.** Rejected after review: it covered 78 of 87 and accepted both
+  negative and novel conditional approval prose. Positive anchors, the
+  negation and family guards, and a finite set of complete approval tails
+  replace it, at a measured cost of two refusals in the corpus.
 - **Require a machine-readable marker from day one.** Rejected as a
   precondition: it would make the indicator blind to every comment already
   in the corpus and to any agent that has not adopted the convention. The
