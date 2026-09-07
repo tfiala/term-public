@@ -573,6 +573,7 @@ _ensure_epel
 # NAME            HAVE                                            DNF             APT             MANUAL           UPSTREAM
 _tool curl        "curl"                                          curl            curl            -
 _tool tar         "tar"                                           tar             tar             -
+_tool gzip        "gzip"                                          gzip            gzip            -
 _tool ncurses     "tic"                                           ncurses         ncurses-bin     -
 _tool tmux-terminfo "terminfo:tmux-256color"                      ncurses-term    ncurses-term    -
 _tool bash-completion "file:/usr/share/bash-completion/bash_completion" bash-completion bash-completion -

@@ -47,8 +47,10 @@ ARCH = 'ID=arch\n'
 # rpm, getent and every installed tool are deliberately absent.
 DRY_RUN_TOOLS = ("bash", "uname", "id", "basename", "grep", "cut", "head", "cat")
 # What a real-mode run additionally needs (all real coreutils).
+# gzip is real too: GNU tar shells out to it for -z (bsdtar on macOS does
+# not), so a sandbox without it fails only on Linux.
 REAL_MODE_TOOLS = DRY_RUN_TOOLS + (
-    "env", "awk", "mkdir", "rm", "mktemp", "find", "tar", "install", "ln", "chmod")
+    "env", "awk", "mkdir", "rm", "mktemp", "find", "tar", "gzip", "install", "ln", "chmod")
 
 # Packages the plan must request when the sandbox PATH hides every tool.
 # bash-completion is absent here on purpose: the script detects it by file,
