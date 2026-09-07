@@ -160,6 +160,8 @@ class TestGenerateTmuxConfig:
     def test_status_right_is_bounded(self, fake_hive):
         conf = hive._generate_tmux_config(fake_hive, hive._SHELL_PALETTE[0])
         assert 'set status-right-length 60' in conf
+        assert '@hive_turn_pair_line' in conf
+        assert '#(hive tmux turn-refresh' not in conf
         assert 'rev-parse --abbrev-ref HEAD' not in conf
 
     def test_refresh_bindings_use_shell_safe_session_name(self, fake_hive):
@@ -167,6 +169,7 @@ class TestGenerateTmuxConfig:
         assert '#{session_id}' not in conf
         assert conf.count('refresh-labels "#{session_name}"') == 2
         assert 'bind r run-shell -b' in conf
+        assert 'turn-refresh "#{session_name}" >/dev/null' in conf
         assert 'turn-refresh "#{session_name}" --bust-cache' in conf
 
     def test_window_formats_compose_run_and_turn_suffixes(self):
@@ -1246,6 +1249,51 @@ class TestTurnBatonRule:
 
 
 class TestTurnProducerBoundary:
+    def test_collects_existing_turn_outputs_for_delta_writes(self):
+        row = '\t'.join((
+            '@1', '1', '%1', '10', 'ttys001', '/workspace', 'node', '100',
+            'reviewer binding', 'Codex', '▶', 'reviewer', 'declared',
+            '2:re-review'))
+        listed = subprocess.CompletedProcess(
+            [], 0, stdout=f'{row}\n', stderr='')
+        with patch.object(hive.subprocess, 'run', return_value=listed):
+            windows = hive._collect_turn_windows('hive-0')
+        assert windows is not None
+        assert len(windows) == 1
+        window = windows[0]
+        assert (window.current_suffix, window.current_role,
+                window.current_role_source, window.current_target) == (
+                    '▶', 'reviewer', 'declared', '2:re-review')
+
+    def test_unchanged_turn_outputs_do_not_mutate_tmux(self):
+        window = _turn_window(1, 'reviewer')
+        window.current_suffix = '▶'
+        window.current_role = 'reviewer'
+        window.current_role_source = window.role_source
+        window.current_target = '1:re-review'
+        with patch.object(hive.subprocess, 'run') as run:
+            hive._set_turn_window_options(window, '▶', '1:re-review')
+        run.assert_not_called()
+
+    def test_writes_only_changed_outputs_and_stale_declaration(self):
+        window = _turn_window(1, 'reviewer')
+        window.current_suffix = '▶'
+        window.current_role = 'reviewer'
+        window.current_role_source = window.role_source
+        window.current_target = '1:re-review'
+        window.declared = 'reviewer stale-binding'
+        window.clear_declaration = True
+        written = subprocess.CompletedProcess([], 0, stdout='', stderr='')
+        with patch.object(
+                hive.subprocess, 'run', return_value=written) as run:
+            hive._set_turn_window_options(window, '', '2:put back')
+        assert [entry.args[0][-2:] for entry in run.call_args_list] == [
+            ['@hive_turn_suffix', ''],
+            ['@hive_turn_target', '2:put back'],
+            ['@hive_turn_role_declared', ''],
+        ]
+        assert window.declared == ''
+
     def test_groups_same_branch_by_normalized_remote_and_handles_no_pr_pair(
             self, tmp_path):
         first = _turn_window(1, 'implementer', activity=10)
@@ -1337,9 +1385,32 @@ class TestTurnProducerBoundary:
                 'verb': 're-review', 'kind': 'completion', 'reason': ''}},
         }
         with patch.object(hive, '_build_turn_session', return_value=snapshot), \
-             patch.object(hive, '_set_turn_window_options') as write:
+             patch.object(hive, '_set_turn_window_options') as write, \
+             patch.object(hive, '_set_turn_session_line') as set_line:
             assert hive._tmux_turn_refresh('hive-0')
         assert write.call_count == 2
+        set_line.assert_called_once_with('hive-0', '1⇄2 #7 ▶2')
+
+    def test_unchanged_pair_line_does_not_mutate_tmux(self):
+        shown = subprocess.CompletedProcess(
+            [], 0, stdout='1⇄2 #7 ▶2\n', stderr='')
+        with patch.object(
+                hive.subprocess, 'run', return_value=shown) as run:
+            hive._set_turn_session_line('hive-0', '1⇄2 #7 ▶2')
+        run.assert_called_once_with(
+            ['tmux', 'show-option', '-t', 'hive-0', '-v',
+             '@hive_turn_pair_line'], capture_output=True, text=True)
+
+    def test_changed_pair_line_updates_session_option(self):
+        shown = subprocess.CompletedProcess(
+            [], 0, stdout='old\n', stderr='')
+        written = subprocess.CompletedProcess([], 0, stdout='', stderr='')
+        with patch.object(
+                hive.subprocess, 'run', side_effect=(shown, written)) as run:
+            hive._set_turn_session_line('hive-0', '1⇄2 #7 ▶2')
+        assert run.call_args_list[-1].args[0] == [
+            'tmux', 'set-option', '-t', 'hive-0',
+            '@hive_turn_pair_line', '1⇄2 #7 ▶2']
 
     def test_terminal_tick_clears_bound_declarations(self):
         first = _turn_window(1, 'implementer')
@@ -1379,8 +1450,10 @@ class TestTurnProducerBoundary:
                 'verb': 're-review', 'kind': 'completion', 'reason': ''}},
         }
         with patch.object(hive, '_build_turn_session', return_value=snapshot), \
-             patch.object(hive, '_apply_turn_session'):
+             patch.object(hive, '_apply_turn_session'), \
+             patch.object(hive, '_set_turn_session_line') as set_line:
             assert hive._tmux_pairs('hive-0')
+        set_line.assert_called_once_with('hive-0', '1⇄2 #7 ▶2')
         output = capsys.readouterr().out
         assert '\x1b' not in output and '\x07' not in output
         assert 'handoff 1:implementer completion (10s ago)' in output

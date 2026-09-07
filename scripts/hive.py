@@ -2378,10 +2378,10 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
     lines += [
         'set status-left-length 20',
         '',
-        '# Status right (turn pair | compact branch [sync] | time).',
+        '# Status right (cached turn pair | compact branch [sync] | time).',
         'set status-right-length 60',
-        'set status-right " #(hive tmux turn-refresh '
-        '\\"#{session_name}\\")'
+        'set status-right "'
+        '#{?@hive_turn_pair_line, #{@hive_turn_pair_line},}'
         ' #(hive tmux status-context '
         '\\"#{pane_current_path}\\" \\"#{client_width}\\" '
         '\\"#{session_name}\\" \\"#{session_windows}\\")'
@@ -2409,6 +2409,7 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
         'if [ -n "$HIVE_NAME" ]; then'
         '  CONF="/tmp/hive-tmux/$HIVE_NAME.conf";'
         '  [ -f "$CONF" ] && tmux source-file "$CONF" &&'
+        '    hive tmux turn-refresh "#{session_name}" >/dev/null &&'
         '    hive tmux refresh-labels "#{session_name}" &&'
         '    tmux display-message "Reloaded: $CONF"'
         '    || tmux display-message "Reload failed: $CONF";'
@@ -2678,6 +2679,10 @@ class _TurnWindow:
     question: bool = False
     reason: str = ''
     clear_declaration: bool = False
+    current_suffix: str = ''
+    current_role: str = ''
+    current_role_source: str = ''
+    current_target: str = ''
 
     @property
     def pair_key(self) -> tuple[str, str] | None:
@@ -3332,6 +3337,8 @@ def _collect_turn_windows(session: str) -> list[_TurnWindow] | None:
         '#{window_id}', '#{window_index}', '#{pane_id}', '#{pane_pid}',
         '#{pane_tty}', '#{pane_current_path}', '#{pane_current_command}',
         '#{window_activity}', '#{@hive_turn_role_declared}', '#{pane_title}',
+        '#{@hive_turn_suffix}', '#{@hive_turn_role}',
+        '#{@hive_turn_role_source}', '#{@hive_turn_target}',
     ))
     try:
         result = subprocess.run(
@@ -3344,8 +3351,8 @@ def _collect_turn_windows(session: str) -> list[_TurnWindow] | None:
     windows = []
     try:
         for line in result.stdout.splitlines():
-            fields = line.split('\t', 9)
-            if len(fields) != 10:
+            fields = line.split('\t', 13)
+            if len(fields) != 14:
                 raise ValueError('short tmux row')
             windows.append(_TurnWindow(
                 window_id=fields[0],
@@ -3358,6 +3365,10 @@ def _collect_turn_windows(session: str) -> list[_TurnWindow] | None:
                 activity=float(fields[7] or 0),
                 declared=fields[8],
                 pane_title=fields[9][:80],
+                current_suffix=fields[10],
+                current_role=fields[11],
+                current_role_source=fields[12],
+                current_target=fields[13],
             ))
     except (TypeError, ValueError):
         return None
@@ -3611,21 +3622,25 @@ def _build_turn_session(session: str, now: float | None = None) -> dict | None:
 
 def _set_turn_window_options(window: _TurnWindow, suffix: str,
                              target: str) -> None:
-    """Rewrite all turn outputs for one window and clear stale declarations."""
+    """Write changed turn outputs and clear stale declarations."""
     role = window.role if window.eligible else 'unknown'
     source = window.role_source if window.eligible else 'none'
     options = (
-        ('@hive_turn_suffix', suffix),
-        ('@hive_turn_role', role),
-        ('@hive_turn_role_source', source),
-        ('@hive_turn_target', target),
+        ('@hive_turn_suffix', suffix, 'current_suffix'),
+        ('@hive_turn_role', role, 'current_role'),
+        ('@hive_turn_role_source', source, 'current_role_source'),
+        ('@hive_turn_target', target, 'current_target'),
     )
     if window.clear_declaration:
-        options += (('@hive_turn_role_declared', ''),)
-    for option, value in options:
-        subprocess.run(
+        options += (('@hive_turn_role_declared', '', 'declared'),)
+    for option, value, current_field in options:
+        if getattr(window, current_field) == value:
+            continue
+        result = subprocess.run(
             ['tmux', 'set-option', '-w', '-t', window.window_id,
              option, value], capture_output=True)
+        if result.returncode == 0:
+            setattr(window, current_field, value)
 
 
 def _apply_turn_session(snapshot: dict) -> None:
@@ -3673,6 +3688,19 @@ def _turn_pair_line(snapshot: dict) -> str:
     return ''
 
 
+def _set_turn_session_line(session: str, line: str) -> None:
+    """Update the cached status line only when its value changed."""
+    current = subprocess.run(
+        ['tmux', 'show-option', '-t', session, '-v', '@hive_turn_pair_line'],
+        capture_output=True, text=True)
+    current_line = current.stdout.rstrip('\n') if current.returncode == 0 else None
+    if current_line == line:
+        return
+    subprocess.run(
+        ['tmux', 'set-option', '-t', session, '@hive_turn_pair_line', line],
+        capture_output=True)
+
+
 def _tmux_turn_refresh(session: str, bust_cache: bool = False,
                        print_line: bool = True) -> bool:
     """Run one bounded session-wide turn producer tick."""
@@ -3682,8 +3710,9 @@ def _tmux_turn_refresh(session: str, bust_cache: bool = False,
     if snapshot is None:
         return False
     _apply_turn_session(snapshot)
+    line = _turn_pair_line(snapshot)
+    _set_turn_session_line(session, line)
     if print_line:
-        line = _turn_pair_line(snapshot)
         if line:
             sys.stdout.write(line)
     return True
@@ -3754,6 +3783,7 @@ def _tmux_pairs(session: str | None = None) -> bool:
     if snapshot is None:
         return False
     _apply_turn_session(snapshot)
+    _set_turn_session_line(session, _turn_pair_line(snapshot))
     print(f'Turn pairs in {_turn_bounded_text(session)}')
     print()
     grouped_ids = {
