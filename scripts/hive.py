@@ -20,6 +20,8 @@ Subcommands:
   tmux         Start or attach to a tmux dev session for a hive
     --list         List configured hives with their assigned colors
     --new-window   Open a new window on an unused workspace
+    pairs          Show implementer/reviewer turn detail for the session
+    role ROLE      Declare implementer/reviewer role, or clear it
 
 Apiary mode (--apiary):
   Operates across all configured hives defined in ~/.config/hive/apiary.json.
@@ -53,14 +55,17 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -200,9 +205,11 @@ def _git(args: list[str], cwd: str | Path | None = None,
         )
 
 
-def _git_out(args: list[str], cwd: str | Path | None = None) -> str | None:
+def _git_out(args: list[str], cwd: str | Path | None = None,
+             timeout: float | None = None) -> str | None:
     """Run a git command, return stripped stdout or None on failure."""
-    r = _git(args, cwd=cwd)
+    r = (_git(args, cwd=cwd) if timeout is None
+         else _git(args, cwd=cwd, timeout=timeout))
     if r.returncode != 0:
         return None
     return r.stdout.strip()
@@ -326,9 +333,12 @@ def _normalize_origin_url(url: str) -> str:
     return url
 
 
-def _get_origin_url(repo_path: Path) -> str | None:
+def _get_origin_url(repo_path: Path,
+                    timeout: float | None = None) -> str | None:
     """Get the normalized origin remote URL for a repo."""
-    url = _git_out(['config', '--get', 'remote.origin.url'], cwd=repo_path)
+    args = ['config', '--get', 'remote.origin.url']
+    url = (_git_out(args, cwd=repo_path) if timeout is None
+           else _git_out(args, cwd=repo_path, timeout=timeout))
     if url:
         return _normalize_origin_url(url)
     return None
@@ -353,13 +363,16 @@ def _fetch_all_parallel(repos: list[tuple[Path, list[Path]]]) -> None:
         t.join()
 
 
-def _default_branch(repo_path: Path) -> str:
+def _default_branch(repo_path: Path,
+                    timeout: float | None = None) -> str:
     """Determine the default branch for a repo.
 
     Reads origin/HEAD (set by ``git clone`` or ``git remote set-head``).
     Falls back to 'main' if the ref is missing.
     """
-    ref = _git_out(['symbolic-ref', 'refs/remotes/origin/HEAD'], cwd=repo_path)
+    args = ['symbolic-ref', 'refs/remotes/origin/HEAD']
+    ref = (_git_out(args, cwd=repo_path) if timeout is None
+           else _git_out(args, cwd=repo_path, timeout=timeout))
     if ref:
         # 'refs/remotes/origin/infra-dev' → 'infra-dev'
         # 'refs/remotes/origin/release/2026' → 'release/2026'
@@ -2365,10 +2378,11 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
     lines += [
         'set status-left-length 20',
         '',
-        '# Status right (compact branch [sync] | time). The helper budgets',
-        '# its fixed-width branch field around the session and numeric tabs.',
-        'set status-right-length 40',
-        'set status-right " #(hive tmux status-context '
+        '# Status right (turn pair | compact branch [sync] | time).',
+        'set status-right-length 60',
+        'set status-right " #(hive tmux turn-refresh '
+        '\\"#{session_name}\\")'
+        ' #(hive tmux status-context '
         '\\"#{pane_current_path}\\" \\"#{client_width}\\" '
         '\\"#{session_name}\\" \\"#{session_windows}\\")'
         '%H:%M PT "',
@@ -2426,6 +2440,14 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
         '  tmux display-message "Not in a hive session";'
         'fi\'',
         '',
+        '# backtick + p: implementer/reviewer turn pairs (hive only)',
+        'bind p run-shell -b \''
+        'if [ -n "$HIVE_ROOT" ]; then'
+        '  hive tmux popup --cwd "#{pane_current_path}" hive tmux pairs "#{session_name}";'
+        'else'
+        '  tmux display-message "Not in a hive session";'
+        'fi\'',
+        '',
         '# backtick + g/G/C-g: hive multi-repo management (hive only)',
         'bind g run-shell -b \''
         'if [ -n "$HIVE_ROOT" ]; then'
@@ -2452,7 +2474,8 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
         '# backtick + R: force-refresh all window labels (hive only)',
         'bind R run-shell -b \''
         'if [ -n "$HIVE_ROOT" ]; then'
-        '  hive tmux refresh-labels "#{session_name}" &&'
+        '  hive tmux turn-refresh "#{session_name}" --bust-cache >/dev/null &&'
+        '    hive tmux refresh-labels "#{session_name}" &&'
         '    tmux display-message "Labels refreshed" ||'
         '    tmux display-message "Label refresh failed";'
         'else'
@@ -2476,10 +2499,12 @@ _LABEL_CACHE_TTL = 300  # seconds — window hooks fire often; don't hammer fj
 _DEFAULT_BRANCHES = {'main', 'master', 'develop', 'dev',
                      'flow-dev', 'flow-prod', 'infra-dev', 'infra-prod'}
 _WINDOW_STATUS_FORMAT = (
-    ' #I#{?@hive_run_suffix, #{@hive_run_suffix},} ')
+    ' #I#{?@hive_run_suffix, #{@hive_run_suffix},}'
+    '#{?@hive_turn_suffix, #{@hive_turn_suffix},} ')
 _WINDOW_STATUS_CURRENT_FORMAT = (
     '#[reverse,bold][#I]#[default]'
-    '#{?@hive_run_suffix, #{@hive_run_suffix},}')
+    '#{?@hive_run_suffix, #{@hive_run_suffix},}'
+    '#{?@hive_turn_suffix, #{@hive_turn_suffix},}')
 
 
 def _label_cache_key(workspace: Path) -> str:
@@ -2541,13 +2566,13 @@ def _branch_field_width(client_width: str, session_name: str,
     except (TypeError, ValueError):
         return 4
 
-    # Session badge + numeric tabs (including one run glyph each) + the leading
-    # space and clock at right. Sequential windows above 9 need one more index
-    # column. Reserve the largest ordinary sync indicator (9 visible columns)
-    # and two columns of slack for tmux's list arrows/spacing.
-    tab_width = (windows * 4) + max(0, windows - 9)
+    # Session badge + numeric tabs (including one run and one turn glyph each)
+    # + the leading space and clock at right. Sequential windows above 9 need
+    # one more index column. Reserve the compact pair line, the largest ordinary
+    # sync indicator, and tmux's list arrows/spacing.
+    tab_width = (windows * 6) + max(0, windows - 9)
     available = (
-        width - (len(session_name) + 3) - tab_width - 13 - 9 - 2)
+        width - (len(session_name) + 3) - tab_width - 18 - 13 - 9 - 2)
     for field_width in (10, 6, 4):
         if available >= field_width:
             return field_width
@@ -2595,6 +2620,1211 @@ def _compute_window_label(workspace: Path) -> dict:
     else:
         label = name
     return {'branch': branch, 'default': default, 'pr': pr, 'label': label}
+
+
+# --- turn indicator -----------------------------------------------------------
+
+_TURN_CACHE_TTL = 60
+_TURN_ACTIVE_TTL = 30
+_TURN_LOCAL_TIMEOUT = 1.0
+_TURN_LOOKUP_TIMEOUT = 3.0
+_TURN_PRODUCER_DEADLINE = 6.0
+_TURN_MAX_PARALLEL = 8
+_TURN_TERMINAL_LIMIT = 30
+_TURN_PROCESS_SNAPSHOT_MAX = 1024 * 1024
+_TURN_PR_JSON_MAX = 256 * 1024
+_TURN_STATE_DIR = Path(os.environ.get(
+    'XDG_STATE_HOME', str(Path.home() / '.local' / 'state'))) / 'hive' / 'turn'
+
+_TURN_MARKERS = {
+    'Handoff: approve': 'approve',
+    'Handoff: changes-requested': 'changes requested',
+    'Handoff: no-new-delta': 'no new delta',
+    'Handoff: addressed': 'completion',
+}
+_TURN_NEGATION_RE = re.compile(
+    r"\b(?:not|cannot|can't|isn't|aren't|won't|don't|never|withheld|"
+    r'blocked|pending)\b', re.IGNORECASE)
+_TURN_REVIEW_PREFIX_RE = re.compile(
+    r'^(?:(?:[a-z0-9_-]+\s+){0,3}(?:review|re-review)'
+    r'(?:\s+(?:at|on|of)\s+[0-9a-f]{7,40})?'
+    r'(?:\s+disposition)?(?:\s*[:—-]\s*|\s+)'
+    r'(?:[0-9a-f]{7,40}\s*[:—-]\s*)?)', re.IGNORECASE)
+
+
+@dataclass
+class _TurnWindow:
+    """One tmux window and the bounded turn facts derived for it."""
+
+    window_id: str
+    index: int
+    pane_id: str
+    pane_pid: int
+    pane_tty: str
+    pane_path: str
+    pane_command: str
+    activity: float
+    declared: str = ''
+    pane_title: str = ''
+    agent: str = ''
+    workspace: Path | None = None
+    remote: str = ''
+    branch: str = ''
+    head: str = ''
+    role: str = 'unknown'
+    role_source: str = 'none'
+    eligible: bool = False
+    reason: str = ''
+    clear_declaration: bool = False
+
+    @property
+    def pair_key(self) -> tuple[str, str] | None:
+        """The group identity when the window has enough local git facts."""
+        if not self.remote or not self.branch:
+            return None
+        return self.remote, self.branch
+
+
+def _turn_process_snapshot(ttys: set[str]) -> dict[int, dict] | None:
+    """Read one process snapshot limited to the supplied pane TTYs.
+
+    Raw argv is retained only in this return value. Callers reduce it to an
+    agent kind before any cache or tmux option is written.
+    """
+    names = sorted({tty.removeprefix('/dev/') for tty in ttys if tty})
+    if not names:
+        return {}
+    try:
+        result = subprocess.run(
+            ['ps', '-t', ','.join(names), '-o',
+             'pid=,ppid=,tty=,comm=,args='],
+            capture_output=True, text=True, timeout=1.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    if len(result.stdout.encode(errors='replace')) > _TURN_PROCESS_SNAPSHOT_MAX:
+        return None
+
+    records: dict[int, dict] = {}
+    try:
+        for line in result.stdout.splitlines():
+            fields = line.strip().split(None, 4)
+            if len(fields) < 4:
+                raise ValueError('short ps row')
+            pid, ppid = int(fields[0]), int(fields[1])
+            records[pid] = {
+                'pid': pid,
+                'ppid': ppid,
+                'tty': fields[2],
+                'comm': fields[3],
+                'args': fields[4] if len(fields) == 5 else fields[3],
+            }
+    except (TypeError, ValueError):
+        return None
+    return records
+
+
+def _turn_descendants(root_pid: int, records: dict[int, dict]) -> list[dict]:
+    """Return the root and every descendant in a process snapshot."""
+    children: dict[int, list[int]] = {}
+    for record in records.values():
+        children.setdefault(record['ppid'], []).append(record['pid'])
+    found = []
+    pending = [root_pid]
+    seen: set[int] = set()
+    while pending:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        record = records.get(pid)
+        if record is not None:
+            found.append(record)
+        pending.extend(children.get(pid, []))
+    return found
+
+
+def _turn_codex_package_path(path: Path) -> bool:
+    """True when a resolved path sits under node_modules/@openai/codex."""
+    parts = path.parts
+    return any(parts[i:i + 3] == ('node_modules', '@openai', 'codex')
+               for i in range(max(0, len(parts) - 2)))
+
+
+def _turn_resolved_path(value: str) -> Path | None:
+    """Resolve one process argv path without guessing relative commands."""
+    path = Path(value)
+    if not path.is_absolute():
+        return None
+    try:
+        return path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+
+
+def _turn_process_agent(root_pid: int, records: dict[int, dict]) -> str | None:
+    """Identify exactly one supported agent below a tmux pane shell."""
+    agents: set[str] = set()
+    for record in _turn_descendants(root_pid, records):
+        comm = Path(record.get('comm', '')).name
+        try:
+            argv = shlex.split(record.get('args', ''))
+        except ValueError:
+            continue
+        argv0 = Path(argv[0]).name if argv else ''
+        if comm == 'claude' or argv0 == 'claude':
+            agents.add('claude')
+            continue
+
+        if comm == 'node' or argv0 == 'node':
+            if len(argv) < 2:
+                continue
+            entry = _turn_resolved_path(argv[1])
+            if (entry is not None and _turn_codex_package_path(entry)
+                    and entry.name == 'codex.js'
+                    and entry.parent.name == 'bin'):
+                agents.add('codex')
+            continue
+
+        executable = _turn_resolved_path(argv[0]) if argv else None
+        if (comm == 'codex' or argv0 == 'codex') and executable is not None:
+            if _turn_codex_package_path(executable):
+                agents.add('codex')
+    return next(iter(agents)) if len(agents) == 1 else None
+
+
+def _turn_pair_binding(pair_key: tuple[str, str]) -> str:
+    """Stable declaration binding for a normalized remote and branch."""
+    return f'{pair_key[0]}#{pair_key[1]}'
+
+
+def _turn_remote_host(remote: str) -> str:
+    """Extract a normalized host from URL and scp-style git remotes."""
+    if '://' in remote:
+        return (urlparse(remote).hostname or '').lower()
+    authority = remote.split(':', 1)[0]
+    return authority.rsplit('@', 1)[-1].lower()
+
+
+def _turn_declared_role(value: str,
+                        pair_key: tuple[str, str]) -> str | None:
+    """Return a declaration only when its embedded pair key still matches."""
+    try:
+        role, binding = value.split(' ', 1)
+    except ValueError:
+        return None
+    if role not in ('implementer', 'reviewer'):
+        return None
+    return role if binding == _turn_pair_binding(pair_key) else None
+
+
+def _derive_turn_role(workspace: Path, remote: str, branch: str,
+                      default: str) -> str | None:
+    """Derive checkout provenance from the branch's oldest reflog subject."""
+    reflog = _git_out(
+        ['reflog', 'show', '--format=%gs', f'refs/heads/{branch}'],
+        cwd=workspace, timeout=_TURN_LOCAL_TIMEOUT)
+    if not reflog:
+        return None
+    oldest = next((line.strip() for line in reversed(reflog.splitlines())
+                   if line.strip()), '')
+    if oldest in (f'branch: Created from {default}',
+                  f'branch: Created from refs/heads/{default}',
+                  'branch: Created from HEAD'):
+        return 'implementer'
+
+    # The fetched-checkout reflog shape is currently proved only for GitHub.
+    if _turn_remote_host(remote) != 'github.com':
+        return None
+    reviewer_sources = (
+        f'branch: Created from origin/{branch}',
+        f'branch: Created from refs/remotes/origin/{branch}',
+    )
+    if oldest in reviewer_sources:
+        return 'reviewer'
+    lowered = oldest.lower()
+    if lowered.startswith('fetch ') and (
+            f'/{branch.lower()}' in lowered or 'refs/pull/' in lowered):
+        return 'reviewer'
+    return None
+
+
+def _turn_marker_lines(body: str) -> list[str]:
+    """Return exact, non-fenced marker lines among the last three lines."""
+    lines: list[tuple[str, bool]] = []
+    in_fence = False
+    fence = ''
+    for raw in body.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith(('```', '~~~')):
+            token = stripped[:3]
+            if not in_fence:
+                in_fence, fence = True, token
+            elif token == fence:
+                in_fence, fence = False, ''
+            if stripped:
+                lines.append((raw, True))
+            continue
+        if stripped:
+            lines.append((raw, in_fence))
+    markers = []
+    for raw, fenced in lines[-3:]:
+        if not fenced and raw == raw.strip() and raw in _TURN_MARKERS:
+            markers.append(raw)
+    return markers
+
+
+def _turn_first_line(body: str) -> str:
+    """Return the first non-empty comment line, bounded for storage/display."""
+    return _turn_bounded_text(next((line for line in body.splitlines()
+                                    if line.strip()), ''), 80)
+
+
+def _turn_bounded_text(value: object, limit: int = 80) -> str:
+    """Make remote or pane text safe for a terminal and bounded storage."""
+    printable = ''.join(character if character.isprintable() else ' '
+                        for character in str(value or ''))
+    return ' '.join(printable.split())[:limit]
+
+
+def _turn_normalize_line(line: str) -> str:
+    """Normalize Markdown decoration without changing the prose contract."""
+    line = re.sub(r'^#{1,6}\s*', '', line.strip())
+    return line.replace('**', '').replace('__', '').replace('`', '').lower()
+
+
+def _turn_strip_review_heading(line: str) -> str:
+    """Remove one bounded review heading, if present."""
+    match = _TURN_REVIEW_PREFIX_RE.match(line)
+    return line[match.end():].lstrip() if match else line
+
+
+def _turn_approval_form(line: str) -> bool:
+    """Recognize only the ADR's finite set of complete approval lines."""
+    if re.fullmatch(r'no blocking (?:findings|issues)\.?', line):
+        return True
+    if re.fullmatch(
+            r'reviewed locally\. no blocking (?:findings|issues)\.?', line):
+        return True
+    if re.fullmatch(
+            r'reviewed the pr diff in \S+\. no blocking '
+            r'(?:findings|issues)\.?', line):
+        return True
+
+    verdict_line = _turn_strip_review_heading(line)
+    match = re.match(r'^(approved\s*/\s*lgtm|approved|approve|lgtm)\b',
+                     verdict_line)
+    if not match:
+        return False
+    tail = verdict_line[match.end():]
+    if re.fullmatch(r'[\s.,;:!)/-]*', tail):
+        return True
+    if tail == ', confirming the standing approval at this head.':
+        return True
+    return re.fullmatch(
+        r'\s+(?:at|on)\s+(?:exact\s+)?(?:rebased\s+)?(?:head\s+)?'
+        r'[0-9a-f]{7,40}(?:\s+against\s+base\s+[0-9a-f]{7,40})?'
+        r'[.,;:!)]*', tail) is not None
+
+
+def _turn_changes_form(line: str) -> bool:
+    """Recognize an anchored changes-requested disposition."""
+    line = _turn_strip_review_heading(line)
+    return re.match(
+        r'^changes(?:\s+\S+){0,2}\s+requested(?:$|[\s.,;:!)/])', line) \
+        is not None
+
+
+def _turn_no_delta_form(line: str) -> bool:
+    """Recognize an anchored no-new-delta disposition."""
+    line = _turn_strip_review_heading(line)
+    return re.match(r'^no new delta(?:$|[\s.,;:!)/])', line) is not None
+
+
+def _turn_completion_form(line: str) -> bool:
+    """Recognize the bounded completion forms observed in the PR corpus."""
+    sha = r'[0-9a-f]{7,40}'
+    end = r'(?=$|[\s.,;:!)/])'
+    patterns = (
+        rf'^(?:\S+\s+){{0,6}}addressed\s+in\s+{sha}{end}',
+        rf'^addressed(?:\s+\S+){{0,6}}\s+in\s+{sha}{end}',
+        rf'^fixed\s+in\s+{sha}{end}',
+        rf'^pushed\s+{sha}{end}',
+        rf'\band\s+pushed\s+{sha}{end}',
+        rf'\bnew\s+head\s+{sha}(?:$|[,;. )]|\s+ci\b)',
+    )
+    if any(re.search(pattern, line) for pattern in patterns):
+        return True
+    return (line.startswith('addressed') and len(line) <= 80
+            and re.search(r'\bin the latest push(?:$|[.,;:!])', line)
+            is not None)
+
+
+def _classify_turn_comment(body: str) -> str:
+    """Classify one PR comment without allowing ambiguous merge directions."""
+    markers = _turn_marker_lines(body)
+    if len(markers) > 1:
+        return 'unrecognized'
+    if len(markers) == 1:
+        return _TURN_MARKERS[markers[0]]
+
+    first = next((line.strip()[:2000] for line in body.splitlines()
+                  if line.strip()), '')
+    if not first:
+        return 'unrecognized'
+    line = _turn_normalize_line(first)
+    if _TURN_NEGATION_RE.search(line):
+        return 'unrecognized'
+
+    families = {
+        'approval': bool(re.search(
+            r'\b(?:approve|approved|approval|lgtm)\b|'
+            r'\bno blocking (?:findings|issues)\b', line)),
+        'changes': bool(re.search(
+            r'\bchanges(?:\s+\S+){0,2}\s+requested\b', line)),
+        'no-delta': bool(re.search(r'\bno new delta\b', line)),
+        'completion': bool(re.search(
+            r'\b(?:addressed|fixed|pushed)\b|\bnew head\b', line)),
+    }
+    if sum(families.values()) != 1:
+        return 'unrecognized'
+    if families['approval'] and _turn_approval_form(line):
+        return 'approve'
+    if families['changes'] and _turn_changes_form(line):
+        return 'changes requested'
+    if families['no-delta'] and _turn_no_delta_form(line):
+        return 'no new delta'
+    if families['completion'] and _turn_completion_form(line):
+        return 'completion'
+    return 'unrecognized'
+
+
+def _ensure_turn_state_dir() -> bool:
+    """Create and re-tighten the private turn-state directory."""
+    try:
+        _TURN_STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(_TURN_STATE_DIR, 0o700)
+        return True
+    except OSError:
+        return False
+
+
+def _turn_cache_path(pair_key: tuple[str, str]) -> Path:
+    """Return the non-revealing cache path for one pair key."""
+    encoded = json.dumps(pair_key, separators=(',', ':')).encode()
+    return _TURN_STATE_DIR / f'turn-{hashlib.sha256(encoded).hexdigest()}.json'
+
+
+def _read_turn_cache(pair_key: tuple[str, str]) -> dict | None:
+    """Read a cache entry only when its full key matches the requested key."""
+    path = _turn_cache_path(pair_key)
+    try:
+        if path.stat().st_size > 65536:
+            return None
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict) or data.get('pair') != list(pair_key):
+        return None
+    return data
+
+
+def _write_private_json(path: Path, data: dict) -> bool:
+    """Atomically write one 0600 JSON file under the 0700 state directory."""
+    if not _ensure_turn_state_dir():
+        return False
+    temporary = path.with_name(
+        f'.{path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}')
+    fd = None
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w') as stream:
+            fd = None
+            json.dump(data, stream, separators=(',', ':'), sort_keys=True)
+            stream.write('\n')
+            stream.flush()
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+        return True
+    except OSError:
+        if fd is not None:
+            os.close(fd)
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        return False
+
+
+def _bounded_turn_pr(result: dict) -> dict:
+    """Reduce a remote/cache result to the fields allowed on disk."""
+    try:
+        number = int(result.get('number') or 0)
+    except (TypeError, ValueError):
+        number = 0
+    state = str(result.get('state') or 'unknown').lower()
+    if state not in ('open', 'closed', 'merged', 'none', 'unknown'):
+        state = 'unknown'
+    bounded = {
+        'state': state,
+        'reason': _turn_bounded_text(result.get('reason', '')),
+        'number': number,
+        'title': _turn_bounded_text(result.get('title', '')),
+        'head_sha': str(result.get('head_sha') or '')[:40],
+    }
+    comment = result.get('comment')
+    if isinstance(comment, dict):
+        classification = str(
+            comment.get('classification') or 'unrecognized')
+        if classification not in (
+                'approve', 'changes requested', 'no new delta',
+                'completion', 'unrecognized'):
+            classification = 'unrecognized'
+        bounded['comment'] = {
+            'id': str(comment.get('id') or '')[:100],
+            'classification': classification,
+            'first_line': _turn_bounded_text(comment.get('first_line', '')),
+            'created_at': str(comment.get('created_at') or '')[:40],
+        }
+    return bounded
+
+
+def _cached_turn_pr(pair_key: tuple[str, str], heads: tuple[str, ...],
+                    now: float) -> dict | None:
+    """Resolve an exact merged receipt or a fresh mutable observation."""
+    data = _read_turn_cache(pair_key)
+    if data is None:
+        return None
+    if len(heads) == 1:
+        receipt = data.get('merged_receipt')
+        if (isinstance(receipt, dict)
+                and receipt.get('head_sha') == heads[0]
+                and receipt.get('state') == 'merged'):
+            return _bounded_turn_pr(receipt)
+    mutable = data.get('mutable')
+    if not isinstance(mutable, dict):
+        return None
+    try:
+        age = now - float(mutable['observed_at'])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if age < 0 or age >= _TURN_CACHE_TTL:
+        return None
+    if mutable.get('heads') != list(heads):
+        return None
+    result = mutable.get('result')
+    if not isinstance(result, dict):
+        return None
+    bounded = _bounded_turn_pr(result)
+    bounded['_observed_at'] = float(mutable['observed_at'])
+    return bounded
+
+
+def _save_turn_pr(pair_key: tuple[str, str], heads: tuple[str, ...],
+                  result: dict, now: float) -> None:
+    """Persist one mutable result or one immutable merged receipt."""
+    bounded = _bounded_turn_pr(result)
+    old = _read_turn_cache(pair_key) or {}
+    data: dict = {'version': 1, 'pair': list(pair_key)}
+    old_receipt = old.get('merged_receipt')
+    if (len(heads) == 1 and isinstance(old_receipt, dict)
+            and old_receipt.get('head_sha') == heads[0]
+            and old_receipt.get('state') == 'merged'):
+        data['merged_receipt'] = old_receipt
+    if bounded['state'] == 'merged' and len(heads) == 1:
+        data['merged_receipt'] = bounded
+    elif result.get('_cacheable', True):
+        data['mutable'] = {
+            'observed_at': now,
+            'heads': list(heads),
+            'result': bounded,
+        }
+    _write_private_json(_turn_cache_path(pair_key), data)
+
+
+def _bust_turn_mutable_cache() -> None:
+    """Remove mutable observations while preserving immutable receipts."""
+    if not _ensure_turn_state_dir():
+        return
+    try:
+        paths = list(_TURN_STATE_DIR.glob('turn-*.json'))
+    except OSError:
+        return
+    for path in paths:
+        try:
+            if path.stat().st_size > 65536:
+                continue
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(data, dict) or 'mutable' not in data:
+            continue
+        data.pop('mutable', None)
+        _write_private_json(path, data)
+
+
+def _turn_cli_for_remote(remote: str) -> str:
+    """Choose the repository's native PR CLI without crossing host APIs."""
+    return 'gh' if _turn_remote_host(remote) == 'github.com' else 'fj'
+
+
+def _run_turn_pr_cli(cli: str, repo_path: Path, args: list[str],
+                     deadline: float) -> list | dict | None:
+    """Run one JSON PR command within both lookup deadlines."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    try:
+        result = subprocess.run(
+            [cli, 'pr', *args], cwd=repo_path, capture_output=True, text=True,
+            timeout=min(_TURN_LOOKUP_TIMEOUT, remaining))
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    if len(result.stdout.encode(errors='replace')) > _TURN_PR_JSON_MAX:
+        return None
+    try:
+        parsed = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return parsed if isinstance(parsed, (list, dict)) else None
+
+
+def _turn_pr_state(pr: dict) -> str:
+    """Normalize GitHub/Forgejo state fields."""
+    if pr.get('mergedAt') or pr.get('merged_at') or pr.get('merged'):
+        return 'merged'
+    state = str(pr.get('state') or '').lower()
+    return state if state in ('open', 'closed', 'merged') else 'unknown'
+
+
+def _latest_turn_comment(comments: object) -> dict | None:
+    """Reduce the latest API comment without retaining its raw body."""
+    if not isinstance(comments, list) or not comments:
+        return None
+    usable = [comment for comment in comments if isinstance(comment, dict)]
+    if not usable:
+        return None
+    latest = max(usable, key=lambda comment: str(
+        comment.get('createdAt') or comment.get('created_at') or ''))
+    body = str(latest.get('body') or '')
+    return {
+        'id': latest.get('id') or latest.get('databaseId') or '',
+        'classification': _classify_turn_comment(body),
+        'first_line': _turn_first_line(body),
+        'created_at': latest.get('createdAt')
+        or latest.get('created_at') or '',
+    }
+
+
+def _lookup_turn_pr(repo_path: Path, pair_key: tuple[str, str],
+                    heads: tuple[str, ...], deadline: float) -> dict:
+    """Resolve live PR state conservatively for one remote/branch group."""
+    cli = _turn_cli_for_remote(pair_key[0])
+    fields = 'number,title,state,headRefOid,updatedAt,mergedAt'
+    open_prs = _run_turn_pr_cli(
+        cli, repo_path,
+        ['list', '--head', pair_key[1], '--state', 'open', '--limit', '2',
+         '--json', fields], deadline)
+    if not isinstance(open_prs, list):
+        return {'state': 'unknown', 'reason': 'lookup failed',
+                '_cacheable': False}
+    if len(open_prs) >= 2:
+        return {'state': 'unknown', 'reason': 'multiple open PRs'}
+    if len(open_prs) == 1:
+        number = open_prs[0].get('number')
+        if not number:
+            return {'state': 'unknown', 'reason': 'invalid open PR',
+                    '_cacheable': False}
+        viewed = _run_turn_pr_cli(
+            cli, repo_path,
+            ['view', str(number), '--json',
+             'number,title,state,headRefOid,mergedAt,comments', '--jq',
+             '{number,title,state,headRefOid,mergedAt,'
+             'comments:(.comments[-1:] // [])}'], deadline)
+        if not isinstance(viewed, dict):
+            return {'state': 'unknown', 'reason': 'lookup failed',
+                    '_cacheable': False}
+        if _turn_pr_state(viewed) != 'open':
+            return {'state': 'unknown', 'reason': 'PR changed during lookup',
+                    '_cacheable': False}
+        return {
+            'state': 'open',
+            'number': viewed.get('number') or number,
+            'title': viewed.get('title') or open_prs[0].get('title') or '',
+            'head_sha': viewed.get('headRefOid') or '',
+            'comment': _latest_turn_comment(viewed.get('comments')),
+        }
+
+    if len(heads) != 1:
+        return {'state': 'unknown', 'reason': 'mixed local HEADs'}
+    terminal_args = [
+        'list', '--head', pair_key[1], '--state', 'all', '--limit',
+        str(_TURN_TERMINAL_LIMIT), '--json', fields]
+    if cli == 'gh':
+        terminal_args += ['--search', 'sort:updated-desc']
+    terminal = _run_turn_pr_cli(
+        cli, repo_path, terminal_args, deadline)
+    if not isinstance(terminal, list):
+        return {'state': 'unknown', 'reason': 'lookup failed',
+                '_cacheable': False}
+    if any(_turn_pr_state(pr) == 'open' for pr in terminal
+           if isinstance(pr, dict)):
+        return {'state': 'unknown', 'reason': 'PR changed during lookup',
+                '_cacheable': False}
+    for pr in terminal:
+        if not isinstance(pr, dict) or pr.get('headRefOid') != heads[0]:
+            continue
+        state = _turn_pr_state(pr)
+        if state not in ('closed', 'merged'):
+            continue
+        return {
+            'state': state,
+            'number': pr.get('number') or 0,
+            'title': pr.get('title') or '',
+            'head_sha': heads[0],
+        }
+    if len(terminal) >= _TURN_TERMINAL_LIMIT:
+        return {'state': 'unknown', 'reason': 'terminal history truncated'}
+    return {'state': 'none'}
+
+
+def _collect_turn_windows(session: str) -> list[_TurnWindow] | None:
+    """Read the active pane facts for every window in one tmux session."""
+    fmt = '\t'.join((
+        '#{window_id}', '#{window_index}', '#{pane_id}', '#{pane_pid}',
+        '#{pane_tty}', '#{pane_current_path}', '#{pane_current_command}',
+        '#{window_activity}', '#{@hive_turn_role_declared}', '#{pane_title}',
+    ))
+    try:
+        result = subprocess.run(
+            ['tmux', 'list-windows', '-t', session, '-F', fmt],
+            capture_output=True, text=True, timeout=1.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    windows = []
+    try:
+        for line in result.stdout.splitlines():
+            fields = line.split('\t', 9)
+            if len(fields) != 10:
+                raise ValueError('short tmux row')
+            windows.append(_TurnWindow(
+                window_id=fields[0],
+                index=int(fields[1]),
+                pane_id=fields[2],
+                pane_pid=int(fields[3]),
+                pane_tty=fields[4],
+                pane_path=fields[5],
+                pane_command=fields[6],
+                activity=float(fields[7] or 0),
+                declared=fields[8],
+                pane_title=fields[9][:80],
+            ))
+    except (TypeError, ValueError):
+        return None
+    return windows
+
+
+def _populate_turn_window(window: _TurnWindow,
+                          records: dict[int, dict] | None) -> None:
+    """Attach agent, git, and role facts to one collected tmux window."""
+    if records is None:
+        window.reason = 'process snapshot failed'
+        return
+    window.agent = _turn_process_agent(window.pane_pid, records) or ''
+    if not window.agent:
+        window.reason = 'no supported agent'
+        return
+    toplevel = _git_out(
+        ['rev-parse', '--show-toplevel'], cwd=window.pane_path,
+        timeout=_TURN_LOCAL_TIMEOUT)
+    if not toplevel:
+        window.reason = 'not a git checkout'
+        return
+    window.workspace = Path(toplevel)
+    window.remote = _get_origin_url(
+        window.workspace, timeout=_TURN_LOCAL_TIMEOUT) or ''
+    window.branch = _git_out(
+        ['rev-parse', '--abbrev-ref', 'HEAD'], cwd=window.workspace,
+        timeout=_TURN_LOCAL_TIMEOUT) or ''
+    window.head = _git_out(
+        ['rev-parse', 'HEAD'], cwd=window.workspace,
+        timeout=_TURN_LOCAL_TIMEOUT) or ''
+    if (not window.remote or not window.branch or window.branch == 'HEAD'
+            or not window.head):
+        window.reason = 'incomplete git identity'
+        return
+    default = _default_branch(window.workspace, timeout=_TURN_LOCAL_TIMEOUT)
+    if window.branch == default:
+        window.reason = 'default branch'
+        return
+    window.eligible = True
+
+    pair_key = window.pair_key
+    assert pair_key is not None
+    declared = _turn_declared_role(window.declared, pair_key)
+    if declared:
+        window.role = declared
+        window.role_source = 'declared'
+        return
+    if window.declared:
+        window.clear_declaration = True
+    derived = _derive_turn_role(
+        window.workspace, window.remote, window.branch, default)
+    if derived:
+        window.role = derived
+        window.role_source = 'reflog'
+
+
+def _turn_group_shape(windows: list[_TurnWindow]) -> str:
+    """Classify a key group without silently selecting a pair subset."""
+    if len(windows) == 1:
+        return 'singleton'
+    roles = sorted(window.role for window in windows)
+    if len(windows) == 2 and roles == ['implementer', 'reviewer']:
+        return 'pair'
+    return 'malformed'
+
+
+def _turn_unknown_decision(windows: list[_TurnWindow], reason: str) -> dict:
+    """Build a no-glyph decision with a bounded diagnostic."""
+    return {
+        'suffixes': {window.window_id: '' for window in windows},
+        'target': '',
+        'verb': '',
+        'kind': 'unknown',
+        'reason': reason[:80],
+    }
+
+
+def _decide_turn(windows: list[_TurnWindow], pr: dict, now: float) -> dict:
+    """Apply the ADR-0003 baton table to one group."""
+    suffixes = {window.window_id: '' for window in windows}
+    state = pr.get('state', 'unknown')
+    if state in ('merged', 'closed'):
+        return {
+            'suffixes': {window.window_id: '↩' for window in windows},
+            'target': '', 'verb': 'put back', 'kind': 'terminal',
+            'reason': state,
+        }
+
+    questions = [window for window in windows
+                 if getattr(window, 'question', False)]
+    if questions:
+        for window in questions:
+            suffixes[window.window_id] = '?'
+        return {
+            'suffixes': suffixes, 'target': questions[0].window_id,
+            'verb': 'answer question', 'kind': 'question',
+            'reason': 'question',
+        }
+
+    if state == 'unknown':
+        return _turn_unknown_decision(
+            windows, str(pr.get('reason') or 'PR state unknown'))
+
+    shape = _turn_group_shape(windows)
+    comment = pr.get('comment') if state == 'open' else None
+    classification = (comment or {}).get('classification') if comment else None
+
+    target_role = ''
+    glyph = ''
+    verb = ''
+    kind = classification or 'idle'
+    if classification == 'approve':
+        target_role, glyph, verb = 'implementer', '✓', 'merge pr'
+    elif classification in ('changes requested', 'no new delta'):
+        target_role, glyph, verb = (
+            'implementer', '▶', 'address review feedback')
+    elif classification == 'completion':
+        target_role, glyph, verb = 'reviewer', '▶', 're-review'
+    elif classification:
+        return _turn_unknown_decision(windows, 'unrecognized handoff')
+
+    if target_role:
+        if shape == 'malformed':
+            return _turn_unknown_decision(windows, f'{shape} group')
+        targets = [window for window in windows if window.role == target_role]
+        if len(targets) != 1:
+            return _turn_unknown_decision(
+                windows, f'next: {target_role} — no window')
+        target = targets[0]
+        suffixes[target.window_id] = glyph
+        return {
+            'suffixes': suffixes, 'target': target.window_id,
+            'verb': verb, 'kind': kind, 'reason': '',
+        }
+
+    if shape == 'malformed':
+        return _turn_unknown_decision(windows, 'malformed group')
+    if shape == 'singleton':
+        return {
+            'suffixes': suffixes, 'target': '', 'verb': '',
+            'kind': 'idle', 'reason': 'unpaired',
+        }
+    active = [window for window in windows
+              if max(0, now - window.activity) < _TURN_ACTIVE_TTL]
+    if active:
+        return {
+            'suffixes': suffixes, 'target': '', 'verb': '',
+            'kind': 'idle', 'reason': 'active',
+        }
+    earliest = min(window.activity for window in windows)
+    targets = [window for window in windows if window.activity == earliest]
+    if len(targets) != 1:
+        return _turn_unknown_decision(windows, 'equal quiet-since')
+    target = targets[0]
+    suffixes[target.window_id] = '▶'
+    return {
+        'suffixes': suffixes, 'target': target.window_id,
+        'verb': 'continue', 'kind': 'quiet', 'reason': '',
+    }
+
+
+def _resolve_turn_prs(groups: dict[tuple[str, str], list[_TurnWindow]],
+                      started: float, now: float) -> dict[tuple[str, str], dict]:
+    """Resolve uncached group PRs in parallel under one producer deadline."""
+    resolved: dict[tuple[str, str], dict] = {}
+    misses: dict[tuple[str, str], tuple[tuple[str, ...], Path]] = {}
+    for pair_key, windows in groups.items():
+        heads = tuple(sorted({window.head for window in windows}))
+        cached = _cached_turn_pr(pair_key, heads, now)
+        if cached is not None:
+            resolved[pair_key] = cached
+            continue
+        workspace = next((window.workspace for window in windows
+                          if window.workspace is not None), None)
+        if workspace is None:
+            resolved[pair_key] = {
+                'state': 'unknown', 'reason': 'workspace unavailable'}
+            continue
+        misses[pair_key] = heads, workspace
+
+    if not misses:
+        return resolved
+    deadline = started + _TURN_PRODUCER_DEADLINE
+    executor = ThreadPoolExecutor(
+        max_workers=min(_TURN_MAX_PARALLEL, len(misses)))
+    futures = {
+        executor.submit(_lookup_turn_pr, workspace, pair_key, heads, deadline):
+        (pair_key, heads)
+        for pair_key, (heads, workspace) in misses.items()
+    }
+    remaining = max(0, deadline - time.monotonic())
+    done, pending = wait(futures, timeout=remaining)
+    for future in done:
+        pair_key, heads = futures[future]
+        try:
+            result = future.result()
+        except Exception:
+            result = {'state': 'unknown', 'reason': 'lookup failed',
+                      '_cacheable': False}
+        cacheable = result.get('_cacheable', True)
+        result = _bounded_turn_pr(result)
+        if not cacheable:
+            result['_cacheable'] = False
+        result['_observed_at'] = now
+        resolved[pair_key] = result
+        _save_turn_pr(pair_key, heads, result, now)
+    for future in pending:
+        pair_key, _heads = futures[future]
+        future.cancel()
+        resolved[pair_key] = {
+            'state': 'unknown', 'reason': 'producer deadline',
+            '_cacheable': False, '_observed_at': now}
+    executor.shutdown(wait=False, cancel_futures=True)
+    return resolved
+
+
+def _build_turn_session(session: str, now: float | None = None) -> dict | None:
+    """Collect and decide all turn state for one tmux session."""
+    started = time.monotonic()
+    observed_at = time.time() if now is None else now
+    _ensure_turn_state_dir()
+    windows = _collect_turn_windows(session)
+    if windows is None:
+        return None
+    records = _turn_process_snapshot({window.pane_tty for window in windows})
+    for window in windows:
+        _populate_turn_window(window, records)
+
+    groups: dict[tuple[str, str], list[_TurnWindow]] = {}
+    for window in windows:
+        if window.eligible and window.pair_key is not None:
+            groups.setdefault(window.pair_key, []).append(window)
+    prs = _resolve_turn_prs(groups, started, observed_at)
+    decisions = {}
+    for pair_key, members in groups.items():
+        pr = prs[pair_key]
+        if pr.get('state') in ('closed', 'merged'):
+            for window in members:
+                if window.declared:
+                    window.clear_declaration = True
+        decisions[pair_key] = _decide_turn(members, pr, observed_at)
+    return {
+        'session': session,
+        'observed_at': observed_at,
+        'windows': windows,
+        'groups': groups,
+        'prs': prs,
+        'decisions': decisions,
+    }
+
+
+def _set_turn_window_options(window: _TurnWindow, suffix: str,
+                             target: str) -> None:
+    """Rewrite all turn outputs for one window and clear stale declarations."""
+    role = window.role if window.eligible else 'unknown'
+    source = window.role_source if window.eligible else 'none'
+    options = (
+        ('@hive_turn_suffix', suffix),
+        ('@hive_turn_role', role),
+        ('@hive_turn_role_source', source),
+        ('@hive_turn_target', target),
+    )
+    if window.clear_declaration:
+        options += (('@hive_turn_role_declared', ''),)
+    for option, value in options:
+        subprocess.run(
+            ['tmux', 'set-option', '-w', '-t', window.window_id,
+             option, value], capture_output=True)
+
+
+def _apply_turn_session(snapshot: dict) -> None:
+    """Write one complete producer tick, including clears, to tmux."""
+    by_window: dict[str, tuple[str, str]] = {}
+    for pair_key, windows in snapshot['groups'].items():
+        decision = snapshot['decisions'][pair_key]
+        target = decision['target']
+        target_window = next(
+            (window for window in windows if window.window_id == target), None)
+        target_value = ''
+        if target_window is not None:
+            target_value = f'{target_window.index}:{decision["verb"]}'[:80]
+        elif decision['verb']:
+            target_value = decision['verb'][:80]
+        for window in windows:
+            by_window[window.window_id] = (
+                decision['suffixes'].get(window.window_id, ''), target_value)
+    for window in snapshot['windows']:
+        suffix, target = by_window.get(window.window_id, ('', ''))
+        _set_turn_window_options(window, suffix, target)
+
+
+def _turn_pair_line(snapshot: dict) -> str:
+    """Render the first actionable group as a compact status-right line."""
+    ordered = sorted(snapshot['groups'].items(),
+                     key=lambda item: min(w.index for w in item[1]))
+    for pair_key, windows in ordered:
+        decision = snapshot['decisions'][pair_key]
+        glyph_windows = [
+            (window, decision['suffixes'].get(window.window_id, ''))
+            for window in windows
+            if decision['suffixes'].get(window.window_id, '')]
+        if not glyph_windows:
+            continue
+        indices = '⇄'.join(str(window.index)
+                           for window in sorted(windows, key=lambda w: w.index))
+        pr = snapshot['prs'][pair_key]
+        pr_part = f' #{pr["number"]}' if pr.get('number') else ''
+        if len(glyph_windows) == 1:
+            window, glyph = glyph_windows[0]
+            return f'{indices}{pr_part} {glyph}{window.index}'
+        glyph = glyph_windows[0][1]
+        return f'{indices}{pr_part} {glyph}'
+    return ''
+
+
+def _tmux_turn_refresh(session: str, bust_cache: bool = False,
+                       print_line: bool = True) -> bool:
+    """Run one bounded session-wide turn producer tick."""
+    if bust_cache:
+        _bust_turn_mutable_cache()
+    snapshot = _build_turn_session(session)
+    if snapshot is None:
+        return False
+    _apply_turn_session(snapshot)
+    if print_line:
+        line = _turn_pair_line(snapshot)
+        if line:
+            sys.stdout.write(line)
+    return True
+
+
+def _format_turn_duration(age: float) -> str:
+    """Format a nonnegative duration compactly for the pairs popup."""
+    age = max(0, age)
+    if age < 60:
+        return f'{int(age)}s'
+    if age < 3600:
+        return f'{int(age // 60)}m'
+    if age < 86400:
+        return f'{int(age // 3600)}h'
+    return f'{int(age // 86400)}d'
+
+
+def _format_turn_age(created_at: str, now: float) -> str:
+    """Format the age of an ISO comment timestamp for the pairs popup."""
+    epoch = _parse_iso_timestamp(created_at)
+    return '' if epoch is None else _format_turn_duration(now - epoch)
+
+
+def _turn_shape_detail(windows: list[_TurnWindow]) -> str:
+    """Name a group shape precisely enough to diagnose malformed groups."""
+    shape = _turn_group_shape(windows)
+    if shape != 'malformed':
+        return shape
+    if len(windows) > 2:
+        return f'{len(windows)} windows'
+    if any(window.role == 'unknown' for window in windows):
+        return 'roles unknown'
+    return ' + '.join(window.role for window in windows)
+
+
+def _turn_liveness_text(window: _TurnWindow, now: float) -> str:
+    """Describe liveness using only the sampled last-output timestamp."""
+    seconds = max(0, now - window.activity)
+    age = _format_turn_duration(seconds)
+    if seconds < _TURN_ACTIVE_TTL:
+        return f'{window.index}:active (output {age} ago)'
+    return f'{window.index}:quiet since {age} ago'
+
+
+def _turn_handoff_source(windows: list[_TurnWindow],
+                         classification: str) -> str:
+    """Name the unique window role that authors a recognized handoff."""
+    source_role = {
+        'approve': 'reviewer',
+        'changes requested': 'reviewer',
+        'no new delta': 'reviewer',
+        'completion': 'implementer',
+    }.get(classification)
+    if not source_role:
+        return ''
+    sources = [window for window in windows if window.role == source_role]
+    if len(sources) == 1:
+        return f'{sources[0].index}:{source_role}'
+    return source_role
+
+
+def _tmux_pairs(session: str | None = None) -> bool:
+    """Print a detailed, freshly evaluated pair table for one session."""
+    session = session or _current_session()
+    if not session:
+        return False
+    snapshot = _build_turn_session(session)
+    if snapshot is None:
+        return False
+    _apply_turn_session(snapshot)
+    print(f'Turn pairs in {_turn_bounded_text(session)}')
+    print()
+    grouped_ids = {
+        window.window_id for windows in snapshot['groups'].values()
+        for window in windows}
+    if not snapshot['groups']:
+        print('  (no participating groups)')
+    ordered = sorted(snapshot['groups'].items(),
+                     key=lambda item: min(w.index for w in item[1]))
+    for pair_key, windows in ordered:
+        windows = sorted(windows, key=lambda window: window.index)
+        shape = _turn_shape_detail(windows)
+        roles = ' + '.join(
+            f'{window.index}:{window.role}({window.role_source})'
+            for window in windows)
+        pr = snapshot['prs'][pair_key]
+        title = _turn_bounded_text(pr.get('title', ''))
+        pr_text = (f' #{pr["number"]} {title}'
+                   if pr.get('number') else '')
+        print(f'  {shape} — {roles}{pr_text}'.rstrip())
+        decision = snapshot['decisions'][pair_key]
+        if decision['target']:
+            target = next(window for window in windows
+                          if window.window_id == decision['target'])
+            print(f'            next {target.index}:{target.role} — '
+                  f'{decision["verb"]}')
+        elif decision['verb']:
+            print(f'            next all — {decision["verb"]}')
+        else:
+            reason = decision['reason'] or decision['kind']
+            observed_at = pr.get('_observed_at')
+            if pr.get('state') == 'unknown' and observed_at is not None:
+                age = _format_turn_duration(
+                    snapshot['observed_at'] - observed_at)
+                reason = f'unknown ({reason} {age} ago)'
+            print(f'            {reason}')
+        print('            ' + ', '.join(
+            _turn_liveness_text(window, snapshot['observed_at'])
+            for window in windows))
+        comment = pr.get('comment')
+        if comment:
+            age = _format_turn_age(
+                comment.get('created_at', ''), snapshot['observed_at'])
+            suffix = f' ({age} ago)' if age else ''
+            classification = comment.get('classification', 'unrecognized')
+            source = _turn_handoff_source(windows, classification)
+            source = f'{source} ' if source else ''
+            first_line = _turn_bounded_text(comment.get('first_line', ''))
+            print(f'            handoff {source}{classification}{suffix}: '
+                  f'{first_line}')
+    for window in sorted(snapshot['windows'], key=lambda item: item.index):
+        if window.window_id in grouped_ids:
+            continue
+        summary = _turn_bounded_text(
+            window.pane_title or window.pane_command, 50)
+        reason = _turn_bounded_text(window.reason)
+        print(f'  not participating — {window.index}:{summary} — {reason}')
+    return True
+
+
+def _tmux_role(role: str) -> bool:
+    """Declare or clear the current window's turn role."""
+    try:
+        result = subprocess.run(
+            ['tmux', 'display-message', '-p',
+             '#{session_name}\t#{window_id}\t#{pane_current_path}'],
+            capture_output=True, text=True, timeout=1.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0:
+        return False
+    fields = result.stdout.rstrip('\n').split('\t', 2)
+    if len(fields) != 3:
+        return False
+    session, window_id, pane_path = fields
+    value = ''
+    branch = ''
+    if role != 'clear':
+        toplevel = _git_out(
+            ['rev-parse', '--show-toplevel'], cwd=pane_path,
+            timeout=_TURN_LOCAL_TIMEOUT)
+        if not toplevel:
+            return False
+        workspace = Path(toplevel)
+        remote = _get_origin_url(workspace, timeout=_TURN_LOCAL_TIMEOUT)
+        branch = _git_out(
+            ['rev-parse', '--abbrev-ref', 'HEAD'], cwd=workspace,
+            timeout=_TURN_LOCAL_TIMEOUT) or ''
+        if (not remote or not branch or branch == 'HEAD'
+                or branch == _default_branch(
+                    workspace, timeout=_TURN_LOCAL_TIMEOUT)):
+            return False
+        value = f'{role} {_turn_pair_binding((remote, branch))}'
+    written = subprocess.run(
+        ['tmux', 'set-option', '-w', '-t', window_id,
+         '@hive_turn_role_declared', value], capture_output=True)
+    if written.returncode != 0:
+        return False
+    _tmux_turn_refresh(session, print_line=False)
+    if role == 'clear':
+        print('Turn role declaration cleared.')
+    else:
+        print(f'Turn role declared: {role} ({branch})')
+    return True
 
 
 # --- run-dsl status integration -----------------------------------------------
@@ -2984,6 +4214,20 @@ def cmd_tmux(args: argparse.Namespace) -> None:
         if not _tmux_refresh_labels(args.session):
             sys.exit(1)
         return
+    if action == 'turn-refresh':
+        if not _tmux_turn_refresh(
+                args.session, bust_cache=getattr(args, 'bust_cache', False)):
+            sys.exit(1)
+        return
+    if action == 'pairs':
+        if not _tmux_pairs(args.session):
+            sys.exit(1)
+        return
+    if action == 'role':
+        if not _tmux_role(args.role):
+            print(f'{CROSS()} Could not set turn role', file=sys.stderr)
+            sys.exit(1)
+        return
     if action == 'status-context':
         _tmux_status_context(args.pane_path, args.client_width,
                              args.session_name, args.window_count)
@@ -3173,6 +4417,7 @@ def _tmux_start(hive: Path, color: dict, new_window: bool) -> None:
     subprocess.run(['tmux', 'source-file', '-t', session_name, str(config_path)])
 
     _tmux_refresh_labels(session_name)
+    _tmux_turn_refresh(session_name, print_line=False)
 
     subprocess.run(['tmux', 'select-window', '-t', f'{session_name}:1'],
                    capture_output=True)
@@ -3406,6 +4651,14 @@ def main():
     tmux_label.add_argument('window_id')
     tmux_refresh = tmux_sub.add_parser('refresh-labels')
     tmux_refresh.add_argument('session')
+    tmux_turn = tmux_sub.add_parser('turn-refresh')
+    tmux_turn.add_argument('session')
+    tmux_turn.add_argument('--bust-cache', action='store_true')
+    tmux_pairs = tmux_sub.add_parser('pairs')
+    tmux_pairs.add_argument('session', nargs='?')
+    tmux_role = tmux_sub.add_parser('role')
+    tmux_role.add_argument(
+        'role', choices=('implementer', 'reviewer', 'clear'))
     tmux_context = tmux_sub.add_parser('status-context')
     tmux_context.add_argument('pane_path')
     tmux_context.add_argument('client_width')

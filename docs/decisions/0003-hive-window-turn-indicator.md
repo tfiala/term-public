@@ -1,7 +1,7 @@
 # ADR-0003: Hive Window Turn Indicator — Who Holds the Baton in an Implementer/Reviewer Pair
 
-**Kind:** proposal
-**Status:** proposed
+**Kind:** decision
+**Status:** implemented
 **Date:** 2026-09-06
 **Revisit:** Agent CLIs converge on a standard "waiting for input" signal (a title convention, an OSC sequence, or a cross-vendor hook), which would replace the inference in this ADR with a fact; the PR platform lets the two sessions act under distinct identities, which would make the comment author authoritative for the role; the review discipline adopts the `Handoff:` marker below, which would let the first-line grammar shrink to a fallback; or pairs routinely grow beyond two windows, at which point the one-glyph label stops fitting the shape of the work.
 **Supersedes:** none
@@ -130,7 +130,7 @@ Operator vocabulary is stable enough to classify: a review starts with
 "pull, checkout pr #X, review"; an implementation starts with "implement
 issue #Y" or is freeform.
 
-## Proposed Decision
+## Decision
 
 Add a **turn indicator** for interactive agent windows, built PR-first and
 agent-agnostic, with per-agent enrichment strictly additive. Every rule below
@@ -663,6 +663,15 @@ None.
 - The installed GitHub CLI exposes `gh pr reopen`; a closed-unmerged PR is
   therefore mutable without changing its head SHA and cannot support an
   immutable receipt.
+- `scripts/hive.py` implements the version-1 producer, structural agent
+  identity, role lifecycle, conservative GitHub/Forgejo PR adapter, private
+  cache, baton table, four tmux outputs, status line, role command, and pairs
+  popup. `tests/test_hive_tmux.py` carries the table, mutation, lifecycle,
+  permission, timeout, and tmux-parser regressions described above.
+- A read-only live measurement on 2026-09-06 identified all four supported
+  agent windows in the current `term-public` session from one TTY-restricted
+  process snapshot in 8.4 ms. Process arguments were reduced in memory to an
+  agent kind and were not printed or stored.
 - The identity and storage facts in **Context** were read from
   `scripts/hive.py`: `_normalize_origin_url` (remote dedup),
   `_label_cache_key` (workspace path hash), `_default_branch` (reads
