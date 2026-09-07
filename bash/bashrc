@@ -176,10 +176,18 @@ if command -v nvim >/dev/null 2>&1; then
       alias "${name}=NVIM_APPNAME=${appname} nvim"
     fi
   }
-  _term_public_nvim_flavor_alias va  nvim-astro5
+  source "$TERM_PUBLIC_ROOT/neovim/configs.bash"
+  for _tp_nvim_spec in "${TERM_PUBLIC_NVIM_CONFIG_SPECS[@]}"; do
+    IFS='|' read -r _tp_nvim_alias _tp_nvim_appname _tp_nvim_url _tp_nvim_branch \
+      <<< "$_tp_nvim_spec"
+    _term_public_nvim_flavor_alias "$_tp_nvim_alias" "$_tp_nvim_appname"
+  done
+  unset TERM_PUBLIC_NVIM_CONFIG_SPECS
+  unset _tp_nvim_spec _tp_nvim_alias _tp_nvim_appname _tp_nvim_url
+  unset _tp_nvim_branch
+
+  # Unmanaged legacy AstroNvim config, retained for existing machines.
   _term_public_nvim_flavor_alias var nvim-astro
-  _term_public_nvim_flavor_alias vl  nvim-lazyvim
-  _term_public_nvim_flavor_alias vn  nvim-nvchad
   unset -f _term_public_nvim_flavor_alias
 
   vv() {

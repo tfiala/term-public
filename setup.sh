@@ -106,6 +106,34 @@ backup_and_copy_file() {
   chmod u+x "$2"
 }
 
+# install_nvim_config
+# $1 - NVIM_APPNAME / directory name under XDG_CONFIG_HOME
+# $2 - public git clone URL
+# $3 - branch containing the personalized configuration
+# Existing config directories are user-owned working trees and are never
+# updated or replaced. A shallow clone is sufficient: each config repository
+# manages its own plugins and lockfile after Neovim starts.
+install_nvim_config() {
+  local appname="$1" source_url="$2" branch="$3" destination
+  destination="$CONFIG_HOME/$appname"
+
+  if [[ -d "$destination" ]]; then
+    return 0
+  fi
+  if [[ -e "$destination" || -L "$destination" ]]; then
+    echo "ERROR: Neovim config destination is not a directory: $destination" >&2
+    return 1
+  fi
+  if ! command -v git >/dev/null 2>&1; then
+    echo "ERROR: git is required to install Neovim config: $appname" >&2
+    return 1
+  fi
+
+  mkdir -p "$CONFIG_HOME"
+  git clone --depth 1 --branch "$branch" -- "$source_url" "$destination"
+  echo "Installed Neovim config: $appname"
+}
+
 # _repo_identity
 # $1 - path to a checkout root
 # Prints the checkout's git origin normalized to host/owner/repo, or
@@ -344,6 +372,17 @@ if (( OVERLAY_CONFLICT_COUNT > 0 )); then
   echo "  Installed links were not changed; rerun setup.sh after reconciling the files above." >&2
   exit "$OVERLAY_CONFLICT_EXIT_STATUS"
 fi
+
+# Keep the install targets and the interactive aliases on one manifest so an
+# alias can never silently point at a differently named checkout.
+source "$ROOT_DIR/neovim/configs.bash"
+for _nvim_spec in "${TERM_PUBLIC_NVIM_CONFIG_SPECS[@]}"; do
+  IFS='|' read -r _nvim_alias _nvim_appname _nvim_url _nvim_branch \
+    <<< "$_nvim_spec"
+  install_nvim_config "$_nvim_appname" "$_nvim_url" "$_nvim_branch"
+done
+unset TERM_PUBLIC_NVIM_CONFIG_SPECS
+unset _nvim_spec _nvim_alias _nvim_appname _nvim_url _nvim_branch
 
 if [[ ! -f "$LOCAL_DIR/env.local" ]]; then
   cp "$LOCAL_DIR/env.local.template" "$LOCAL_DIR/env.local"

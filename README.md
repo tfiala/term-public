@@ -6,6 +6,7 @@ Ubuntu) you reach from it over SSH, with:
 - Ghostty (macOS; Linux hosts are its SSH targets)
 - `bash` 5.x + Starship prompt + `bash-completion` 2.x (Homebrew bash on
   macOS, the system bash on Linux)
+- LazyVim, NvChad, and AstroNvim config checkouts with short launcher aliases
 - a `hive` workflow for multi-checkout hives and `tmux`-backed dev sessions
 
 ## Scope
@@ -28,6 +29,7 @@ It avoids:
 - `bash/` shell config (`bash_profile`, `bashrc`, `inputrc`)
 - `starship/` prompt config
 - `tmux/` base tmux config (carries the Claude-CLI-safe settings)
+- `neovim/configs.bash` Neovim config sources, app names, and aliases
 - `scripts/hive.py` hive/apiary/tmux entrypoint
 - `setup.sh` symlink installer
 - `setup/bootstrap-macos.sh` package/bootstrap helper (macOS)
@@ -97,7 +99,10 @@ scripts/start-shell-preview.sh --ghostty  # in a fresh Ghostty window
    - **RHEL 9 family / Ubuntu:** run `setup/bootstrap-linux.sh` (add
      `--dry-run` first to see the plan). Details under
      [Linux hosts](#linux-hosts-rhel-ubuntu).
-2. Run `./setup.sh` from the repo root to link config files into place.
+2. Run `./setup.sh` from the repo root to link config files into place and
+   clone any missing Neovim configs into `$XDG_CONFIG_HOME` (default
+   `~/.config`).
+   Existing Neovim config directories are never updated or replaced.
    It also unlinks zsh-era symlinks (`~/.zshrc`, `~/.zshenv`,
    `~/.p10k.zsh`) left by earlier versions of this repo — only when the
    link target is verifiably a term-public checkout — restoring `.bak`
@@ -110,6 +115,26 @@ scripts/start-shell-preview.sh --ghostty  # in a fresh Ghostty window
    any installed links are replaced, so interactive and unattended callers
    both detect the incomplete switch.
 3. Restart Ghostty and open a new shell.
+
+## Neovim configs
+
+`setup.sh` installs three independent public config repositories. The shell
+aliases select them through Neovim's `NVIM_APPNAME`; they are available when
+`nvim` is on `PATH` (or installed as `~/apps/nvim.appimage`).
+
+| Alias | `NVIM_APPNAME` | Source | Branch |
+|---|---|---|---|
+| `vl` | `nvim-lazyvim` | [`tfiala/nvim-config`](https://github.com/tfiala/nvim-config) | `tfiala` |
+| `vn` | `nvim-nvchad` | [`tfiala/nvim-nvchad`](https://github.com/tfiala/nvim-nvchad) | `tfiala` |
+| `va` | `nvim-astro5` | [`tfiala/nvim-astro5`](https://github.com/tfiala/nvim-astro5) | `tfiala` |
+
+The repositories are cloned from their personalized `tfiala` configuration
+branch with shallow history (their default `main` branches are upstream
+starter baselines, not these installed configs).
+After installation, each directory is an ordinary working tree: setup leaves
+its branch, remotes, local changes, and lockfiles alone on every later run.
+`v` continues to launch the default `nvim`, and `vv` presents every `nvim-*`
+directory under the XDG config home as a numbered selector.
 
 ## Linux hosts (RHEL, Ubuntu)
 
