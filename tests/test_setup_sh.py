@@ -32,3 +32,16 @@ class TestBinInstallsAreCopies:
                 assert line.strip().startswith('backup_and_copy_file '), (
                     f'{dest} must be installed with backup_and_copy_file, '
                     f'got: {line.strip()}')
+
+
+class TestGhosttyTerminfo:
+    """xterm-ghostty is installed from the app bundle on macOS and from the
+    vendored source everywhere else, in that order."""
+
+    def test_bundle_preferred_then_vendored_source(self):
+        text = SETUP_SH.read_text()
+        assert text.index('-d "$_ghostty_ti"') < text.index(
+            'tic -x "$ROOT_DIR/ghostty/xterm-ghostty.terminfo"')
+
+    def test_vendored_source_is_tracked(self):
+        assert (REPO_ROOT / 'ghostty' / 'xterm-ghostty.terminfo').is_file()

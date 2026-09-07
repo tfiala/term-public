@@ -1,9 +1,11 @@
 # term-public
 
-Public terminal baseline for macOS with:
+Public terminal baseline for macOS, and for the Linux hosts (RHEL 9 family,
+Ubuntu) you reach from it over SSH, with:
 
-- Ghostty
-- Homebrew `bash` 5.x + Starship prompt + `bash-completion@2`
+- Ghostty (macOS; Linux hosts are its SSH targets)
+- `bash` 5.x + Starship prompt + `bash-completion` 2.x (Homebrew bash on
+  macOS, the system bash on Linux)
 - a `hive` workflow for multi-checkout hives and `tmux`-backed dev sessions
 
 ## Scope
@@ -28,7 +30,11 @@ It avoids:
 - `tmux/` base tmux config (carries the Claude-CLI-safe settings)
 - `scripts/hive.py` hive/apiary/tmux entrypoint
 - `setup.sh` symlink installer
-- `setup/bootstrap-macos.sh` package/bootstrap helper
+- `setup/bootstrap-macos.sh` package/bootstrap helper (macOS)
+- `setup/bootstrap-linux.sh` package/bootstrap helper (RHEL 9 family, Ubuntu)
+- `ghostty/xterm-ghostty.terminfo` vendored terminfo source, compiled by
+  `setup.sh` on hosts without the Ghostty app bundle
+- `tests/smoke/bootstrap-linux.sh` post-bootstrap check for a Linux host
 - `local/` untracked per-machine overlay created by `setup.sh`
 - `docs/decisions/` architecture decision records ([index](docs/decisions/README.md))
 
@@ -46,7 +52,10 @@ macOS ships bash 3.2 (2007, GPLv2 freeze) at `/bin/bash`, which is not
 acceptable as a daily shell — `setup/bootstrap-macos.sh` installs Homebrew
 bash, registers it in `/etc/shells`, and `chsh`es the login shell to it.
 `tmux/tmux.conf` also pins `default-shell` to Homebrew bash so hive tmux
-sessions run it even before (or without) the `chsh`.
+sessions run it even before (or without) the `chsh`. Linux already ships
+bash 5.x as `/usr/bin/bash`; there `setup/bootstrap-linux.sh` leaves the
+system shell alone and `tmux.conf` pins that path instead (see
+[Linux hosts](#linux-hosts-rhel-ubuntu)).
 
 vi editing mode with `jk` to escape is set in `bash/bashrc` (bash only);
 `bash/inputrc` keeps only mild readline defaults so other readline programs
@@ -81,9 +90,13 @@ scripts/start-shell-preview.sh --ghostty  # in a fresh Ghostty window
 
 ## Install
 
-1. Run `setup/bootstrap-macos.sh` to install baseline dependencies and
-   switch the login shell to Homebrew bash (prompts for your password for
-   `/etc/shells` and `chsh`).
+1. Install the dependencies for your OS:
+   - **macOS:** run `setup/bootstrap-macos.sh` to install baseline
+     dependencies and switch the login shell to Homebrew bash (prompts for
+     your password for `/etc/shells` and `chsh`).
+   - **RHEL 9 family / Ubuntu:** run `setup/bootstrap-linux.sh` (add
+     `--dry-run` first to see the plan). Details under
+     [Linux hosts](#linux-hosts-rhel-ubuntu).
 2. Run `./setup.sh` from the repo root to link config files into place.
    It also unlinks zsh-era symlinks (`~/.zshrc`, `~/.zshenv`,
    `~/.p10k.zsh`) left by earlier versions of this repo — only when the
@@ -97,6 +110,88 @@ scripts/start-shell-preview.sh --ghostty  # in a fresh Ghostty window
    any installed links are replaced, so interactive and unattended callers
    both detect the incomplete switch.
 3. Restart Ghostty and open a new shell.
+
+## Linux hosts (RHEL, Ubuntu)
+
+A Linux host gets the same shell stack as the Mac — bash 5 + Starship, tmux
+with the hive config, fzf/ripgrep/fd/bat/eza/gh/jq — and is treated as the
+SSH target of a Ghostty window rather than a Ghostty host. Supported: the
+RHEL 9 family (RHEL, Rocky, AlmaLinux, CentOS Stream; Fedora takes the same
+`dnf` path) and Ubuntu/Debian.
+
+```bash
+setup/bootstrap-linux.sh --dry-run   # print the plan: every privileged/network command, nothing changed
+setup/bootstrap-linux.sh             # install (sudo, or run as root; without either see below)
+./setup.sh                           # link config, install the xterm-ghostty terminfo
+tests/smoke/bootstrap-linux.sh       # optional: prove it took
+```
+
+What the bootstrap does, and the order it does it in:
+
+- **Package manager first, upstream release second — per tool.** Each tool
+  is skipped if already complete, then requested from `dnf`/`apt` one
+  package per call, and only if that fails — or reports success while the
+  tool is still incomplete — is it installed from the project's own GitHub
+  release (starship, ripgrep, fd, bat, eza, gh, jq, fzf have one; tmux,
+  git, bash-completion, python3 do not and are reported instead). Release
+  binaries go to `/usr/local/bin` (`--bin-dir` overrides), are fetched over
+  HTTPS, and are checked against the project's per-asset `.sha256` where
+  one is published. Nothing is piped from `curl` into a shell. fzf is two
+  artifacts, the binary and the shell bindings `bash/bashrc` sources; each
+  is checked and repaired on its own, at the installed binary's version, so
+  an interrupted run or a hand-installed bare binary is completed on the
+  next run rather than skipped as present.
+- **Never a distribution upgrade.** The script installs a tool set; it does
+  not run `dnf upgrade` or `apt-get upgrade`, and a failed package-index
+  refresh is a warning, not a stop. A RHEL host whose subscription has
+  lapsed still gets everything EPEL and its enabled repos provide (fzf,
+  ripgrep, fd, bat, gh live in EPEL, which the script enables when
+  missing), and the upstream fallback covers the rest — on RHEL 9 that is
+  starship and eza, which no enabled repo carries. One unreachable repo or
+  missing package never aborts the run; the summary lists anything it could
+  not install and exits non-zero in that case.
+- **Without root or sudo** the package-manager steps are skipped, the
+  upstream releases go to `~/bin` (first on PATH via `bash/bashrc`), and the
+  tools that only a package can provide are reported. Enough for a working
+  prompt on a box you do not administer.
+- **`--dry-run`** prints each privileged command and, for every upstream
+  fallback, the concrete download, verification and install commands it
+  would run, with `<latest>` standing in for a release version that is
+  resolved over the network at run time.
+- **Login shell.** Linux already ships bash 5.x, so nothing is installed
+  or registered in `/etc/shells`; `chsh -s /bin/bash` runs only when the
+  account's login shell is something else (it prompts for your password).
+- **Ghostty is not installed.** `setup.sh` compiles the vendored
+  `ghostty/xterm-ghostty.terminfo` into `~/.terminfo`, so an SSH session
+  from a Ghostty window keeps `TERM=xterm-ghostty` instead of the
+  `xterm-256color` fallback in `bash/bashrc`. Regenerate the file after a
+  Ghostty upgrade with the command in its header; the test suite compares
+  it against the installed bundle on a Mac.
+
+Other differences from the macOS baseline:
+
+- `tmux/tmux.conf` pins `default-shell` to `/usr/bin/bash` on Linux (the
+  line is inert on macOS, which has no such path); a hand-built
+  `/usr/local/bin/bash` still wins.
+- `bash/bashrc` finds `bash-completion` and fzf's key bindings at the RHEL
+  (`/usr/share/fzf/shell`), Debian (`/usr/share/doc/fzf/examples`) and
+  `~/.fzf/shell` (upstream fallback) locations as well as the Homebrew
+  prefixes.
+- On Ubuntu the packages install `fdfind` and `batcat`; the bootstrap links
+  `~/bin/fd` and `~/bin/bat` to them so the upstream names work.
+- `bash/bash_profile` sources `~/.profile` when — and only when — bash
+  itself would have read it: no prior `~/.bash_profile` (preserved as
+  `.bak`) and no `~/.bash_login`. Ubuntu's stock `~/.profile` is the
+  account's login file and puts `~/bin` and `~/.local/bin` on PATH;
+  linking `~/.bash_profile` would otherwise shadow it silently.
+- `term-theme` is macOS-only (it flips the system appearance). On Linux,
+  `hive tmux` reads the mode from `~/.cache/term-theme/mode` if present
+  and defaults to night otherwise.
+
+CI runs the bootstrap for real on every push: natively on `ubuntu-latest`
+and inside an `almalinux:9` container as root, each followed by `setup.sh`
+and the smoke test, so both package-manager paths and the upstream fallbacks
+are exercised.
 
 ## Per-Machine Overlay
 
@@ -304,4 +399,5 @@ Run:
 pytest
 ```
 
-GitHub Actions runs the test suite on push and pull request.
+GitHub Actions runs the test suite on push and pull request, plus the two
+Linux bootstrap jobs described under [Linux hosts](#linux-hosts-rhel-ubuntu).

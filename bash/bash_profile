@@ -23,6 +23,16 @@ if [[ -f "$HOME/.bash_profile.bak" ]]; then
   _TERM_PUBLIC_BASHRC_ACTIVE=1
   source "$HOME/.bash_profile.bak"
   unset _TERM_PUBLIC_BASHRC_ACTIVE
+elif [[ ! -f "$HOME/.bash_login" && -f "$HOME/.profile" ]]; then
+  # A login bash reads the first of ~/.bash_profile, ~/.bash_login and
+  # ~/.profile.  Linking ~/.bash_profile shadows a ~/.profile that was the
+  # account's login file until now (the stock shape on Ubuntu, where it also
+  # puts ~/bin and ~/.local/bin on PATH).  Source it under exactly bash's own
+  # rule -- only when neither earlier file existed -- and hold the bashrc
+  # guard, since the stock ~/.profile re-sources ~/.bashrc.
+  _TERM_PUBLIC_BASHRC_ACTIVE=1
+  source "$HOME/.profile"
+  unset _TERM_PUBLIC_BASHRC_ACTIVE
 fi
 
 unset _TERM_PUBLIC_PROFILE_ACTIVE
