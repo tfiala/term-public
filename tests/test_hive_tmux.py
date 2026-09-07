@@ -121,8 +121,8 @@ class TestGenerateTmuxConfig:
 
     def test_keybindings_guard_on_hive_root(self, fake_hive):
         conf = hive._generate_tmux_config(fake_hive, hive._SHELL_PALETTE[0])
-        for key in ('bind 0', 'bind c', 'bind b', 'bind g', 'bind G', 'bind C-g',
-                    'bind R', 'bind r'):
+        for key in ('bind 0', 'bind c', 'bind b', 'bind p', 'bind g', 'bind G',
+                    'bind C-g', 'bind R', 'bind r'):
             assert key in conf
         assert '$HIVE_ROOT' in conf
 
@@ -141,6 +141,8 @@ class TestGenerateTmuxConfig:
         assert 'hive tmux label-window' in conf
         assert 'hive tmux refresh-labels' in conf
         assert 'hive tmux status-context' in conf
+        assert 'hive tmux turn-refresh' in conf
+        assert 'hive tmux pairs' in conf
         assert 'set-hook after-new-window' in conf
         assert 'hive tmux popup' in conf
         assert 'hive tmux runs' in conf
@@ -149,7 +151,7 @@ class TestGenerateTmuxConfig:
 
     def test_status_right_is_bounded(self, fake_hive):
         conf = hive._generate_tmux_config(fake_hive, hive._SHELL_PALETTE[0])
-        assert 'set status-right-length 40' in conf
+        assert 'set status-right-length 60' in conf
         assert 'rev-parse --abbrev-ref HEAD' not in conf
 
     def test_refresh_bindings_use_shell_safe_session_name(self, fake_hive):
@@ -157,6 +159,13 @@ class TestGenerateTmuxConfig:
         assert '#{session_id}' not in conf
         assert conf.count('refresh-labels "#{session_name}"') == 2
         assert 'bind r run-shell -b' in conf
+        assert 'turn-refresh "#{session_name}" --bust-cache' in conf
+
+    def test_window_formats_compose_run_and_turn_suffixes(self):
+        assert '@hive_run_suffix' in hive._WINDOW_STATUS_FORMAT
+        assert '@hive_turn_suffix' in hive._WINDOW_STATUS_FORMAT
+        assert '@hive_run_suffix' in hive._WINDOW_STATUS_CURRENT_FORMAT
+        assert '@hive_turn_suffix' in hive._WINDOW_STATUS_CURRENT_FORMAT
 
 
 class TestWriteTmuxConfig:
@@ -264,16 +273,16 @@ class TestCompactBranch:
 
 class TestBranchFieldWidth:
     def test_wide_client_uses_ten_columns(self):
-        assert hive._branch_field_width('107', 'workingal-1', '9') == 10
+        assert hive._branch_field_width('120', 'workingal-1', '9') == 10
 
     def test_narrow_client_steps_down(self):
-        assert hive._branch_field_width('80', 'workingal-1', '9') == 6
-        assert hive._branch_field_width('78', 'workingal-1', '9') == 4
-        assert hive._branch_field_width('77', 'workingal-1', '9') == 0
+        assert hive._branch_field_width('116', 'workingal-1', '9') == 6
+        assert hive._branch_field_width('114', 'workingal-1', '9') == 4
+        assert hive._branch_field_width('113', 'workingal-1', '9') == 0
 
-    def test_reserves_run_glyphs_two_digit_tabs_and_sync(self):
-        assert hive._branch_field_width('84', 'workingal-1', '10') == 4
-        assert hive._branch_field_width('82', 'workingal-1', '10') == 0
+    def test_reserves_turn_pair_run_glyphs_two_digit_tabs_and_sync(self):
+        assert hive._branch_field_width('121', 'workingal-1', '10') == 4
+        assert hive._branch_field_width('120', 'workingal-1', '10') == 0
 
     def test_invalid_dimensions_fail_to_small_field(self):
         assert hive._branch_field_width('unknown', 'workingal-1', '9') == 4
@@ -290,7 +299,7 @@ class TestTmuxStatusContext:
 
         with patch.object(hive, '_git_out', side_effect=fake_git_out), \
              patch.object(hive, '_tmux_git_sync') as git_sync:
-            hive._tmux_status_context('/repo', '107', 'workingal-1', '9')
+            hive._tmux_status_context('/repo', '120', 'workingal-1', '9')
         assert capsys.readouterr().out == 'fix/aprl   | '
         git_sync.assert_called_once_with('/repo')
 
@@ -498,6 +507,879 @@ class TestRefreshLabels:
         label.assert_not_called()
 
 
+# --- turn indicator (ADR-0003) ----------------------------------------------
+
+
+class TestTurnCommentClassifier:
+    @pytest.mark.parametrize(('line', 'expected'), [
+        ('Review disposition: LGTM at exact head `86e43ea0` against base '
+         '`d2f42c47`.', 'approve'),
+        ('Approved / LGTM on exact rebased head `83ebe092`.', 'approve'),
+        ('Approved at `ca464e32`.', 'approve'),
+        ('## Re-review: `174c671` — approved', 'approve'),
+        ('Independent full-PR review at `c265a4f8` — **approved**, '
+         'confirming the standing approval at this head.', 'approve'),
+        ('Reviewed locally. No blocking findings.', 'approve'),
+        ('Reviewed the PR diff in `tmux/tmux.conf`. No blocking findings.',
+         'approve'),
+        ('No blocking issues.', 'approve'),
+        ('## Review — approve, one non-blocking nit', 'approve'),
+        ('Approved. One non-blocking nit below.', 'approve'),
+        ('LGTM with one nit', 'approve'),
+        ('Approved on exact head `abcdef1`, one non-blocking nit.', 'approve'),
+        ('Changes still requested on exact head `abcdef1`',
+         'changes requested'),
+        ('## Re-review — no new delta', 'no new delta'),
+        ('Both blockers addressed in `ca464e3`; CI in flight.', 'completion'),
+        ('Addressed the review notes in `6bafaf6`.', 'completion'),
+        ('Fixed in dbc4f93.', 'completion'),
+        ('Implemented the convergence fix and pushed `31e8a2b`.',
+         'completion'),
+        ('Rebased onto current main; new head `83ebe09`, CI in flight.',
+         'completion'),
+        ('Addressed all notes in the latest push:', 'completion'),
+    ])
+    def test_recognized_corpus_forms(self, line, expected):
+        assert hive._classify_turn_comment(line) == expected
+
+    @pytest.mark.parametrize('line', [
+        'Cannot approve this yet',
+        'Approval withheld pending the failing test',
+        'Not ready for approval',
+        'Approved with changes requested on abcdef1',
+        'Pushed back on abcdef1',
+        'LGTM-adjacent but blocked',
+        'Rebased; the new head abcdef1 is not ready',
+        'No blocking findings? Several, actually.',
+        'Approved if CI passes',
+        'LGTM except for the failing migration',
+        'Approve after addressing the blocker',
+        'Review: approved once the required test lands',
+        'Approved provided that the migration is fixed',
+        'LGTM assuming CI turns green',
+        'Reviewed conditionally; no blocking findings.',
+        'Approved pending CI',
+        'Review at abcdef1 — approved, but changes requested on docs',
+        'Approved, but do not merge',
+        'LGTM — hold the merge',
+        'approved (sarcasm)',
+        'Approved / LGTM on exact rebased head abcdef1, but see the nit below',
+        'Approved, one blocking nit',
+        'Approved, one nit but do not merge',
+    ])
+    def test_mutation_negatives_never_direct_a_turn(self, line):
+        assert hive._classify_turn_comment(line) == 'unrecognized'
+
+    def test_one_exact_marker_overrides_first_line(self):
+        body = 'Changes requested on exact head abcdef1\n\nHandoff: approve\n'
+        assert hive._classify_turn_comment(body) == 'approve'
+
+    @pytest.mark.parametrize('body', [
+        'Progress note\n\n> Handoff: approve',
+        'Progress note\n\n- Handoff: approve',
+        'Progress note\n```\nHandoff: approve\n```',
+        'Progress note\nHandoff: approve\nHandoff: addressed',
+    ])
+    def test_quoted_fenced_or_conflicting_markers_do_not_override(self, body):
+        assert hive._classify_turn_comment(body) == 'unrecognized'
+
+    def test_remote_summary_text_cannot_emit_terminal_controls(self):
+        assert hive._turn_bounded_text(
+            'Title\x1b]52;c;payload\x07\nnext') == 'Title ]52;c;payload next'
+
+
+class TestTurnProcessIdentity:
+    def _record(self, pid, ppid, comm, args):
+        return {'pid': pid, 'ppid': ppid, 'tty': 'ttys001',
+                'comm': comm, 'args': args}
+
+    def test_symlinked_codex_entry_resolves_to_package(self, tmp_path):
+        package = tmp_path / 'lib/node_modules/@openai/codex/bin'
+        package.mkdir(parents=True)
+        entry = package / 'codex.js'
+        entry.write_text('')
+        bindir = tmp_path / 'bin'
+        bindir.mkdir()
+        link = bindir / 'codex'
+        link.symlink_to(entry)
+        records = {
+            10: self._record(10, 1, 'bash', 'bash'),
+            11: self._record(11, 10, 'node', f'node {link}'),
+        }
+        assert hive._turn_process_agent(10, records) == 'codex'
+
+    def test_ordinary_node_is_not_codex(self, tmp_path):
+        script = tmp_path / 'server.js'
+        script.write_text('')
+        records = {
+            10: self._record(10, 1, 'bash', 'bash'),
+            11: self._record(11, 10, 'node', f'node {script}'),
+        }
+        assert hive._turn_process_agent(10, records) is None
+
+    def test_native_codex_descendant_under_package_qualifies(self, tmp_path):
+        binary = (tmp_path / 'node_modules/@openai/codex/vendor/bin/codex')
+        binary.parent.mkdir(parents=True)
+        binary.write_text('')
+        records = {
+            10: self._record(10, 1, 'bash', 'bash'),
+            11: self._record(11, 10, str(binary), str(binary)),
+        }
+        assert hive._turn_process_agent(10, records) == 'codex'
+
+    def test_child_tool_does_not_hide_claude_ancestor(self):
+        records = {
+            10: self._record(10, 1, 'bash', 'bash'),
+            11: self._record(11, 10, 'claude', 'claude'),
+            12: self._record(12, 11, 'python', 'python worker.py'),
+        }
+        assert hive._turn_process_agent(10, records) == 'claude'
+
+    def test_two_agent_signatures_fail_closed(self, tmp_path):
+        package = tmp_path / 'node_modules/@openai/codex/bin'
+        package.mkdir(parents=True)
+        entry = package / 'codex.js'
+        entry.write_text('')
+        records = {
+            10: self._record(10, 1, 'bash', 'bash'),
+            11: self._record(11, 10, 'claude', 'claude'),
+            12: self._record(12, 10, 'node', f'node {entry}'),
+        }
+        assert hive._turn_process_agent(10, records) is None
+
+    def test_malformed_snapshot_fails_closed(self):
+        result = MagicMock(returncode=0, stdout='not-a-process-row\n')
+        with patch.object(hive.subprocess, 'run', return_value=result):
+            assert hive._turn_process_snapshot({'/dev/ttys001'}) is None
+
+
+class TestTurnRoles:
+    def test_role_command_writes_role_and_exact_pair_binding(self, tmp_path,
+                                                               capsys):
+        displayed = subprocess.CompletedProcess(
+            [], 0, stdout=f'hive-0\t@1\t{tmp_path}\n', stderr='')
+        written = subprocess.CompletedProcess([], 0, stdout='', stderr='')
+
+        def fake_git(args, cwd=None, timeout=None):
+            if args[:2] == ['rev-parse', '--show-toplevel']:
+                return str(tmp_path)
+            if args[:2] == ['rev-parse', '--abbrev-ref']:
+                return 'feat/thing'
+            return None
+
+        with patch.object(hive.subprocess, 'run',
+                          side_effect=[displayed, written]) as run, \
+             patch.object(hive, '_git_out', side_effect=fake_git), \
+             patch.object(hive, '_get_origin_url',
+                          return_value='git@github.com:acme/widget'), \
+             patch.object(hive, '_default_branch', return_value='main'), \
+             patch.object(hive, '_tmux_turn_refresh', return_value=True):
+            assert hive._tmux_role('reviewer')
+        binding = hive._turn_pair_binding(
+            ('git@github.com:acme/widget', 'feat/thing'))
+        assert run.call_args_list[1].args[0][-1] == f'reviewer {binding}'
+        assert 'Turn role declared: reviewer' in capsys.readouterr().out
+
+    def test_role_clear_does_not_require_git_checkout(self, capsys):
+        displayed = subprocess.CompletedProcess(
+            [], 0, stdout='hive-0\t@1\t/not-a-repo\n', stderr='')
+        written = subprocess.CompletedProcess([], 0, stdout='', stderr='')
+        with patch.object(hive.subprocess, 'run',
+                          side_effect=[displayed, written]) as run, \
+             patch.object(hive, '_git_out') as git_out, \
+             patch.object(hive, '_tmux_turn_refresh', return_value=True):
+            assert hive._tmux_role('clear')
+        git_out.assert_not_called()
+        assert run.call_args_list[1].args[0][-1] == ''
+        assert 'declaration cleared' in capsys.readouterr().out
+
+    def test_declaration_is_bound_to_exact_pair_key(self):
+        key = ('git@github.com:acme/widget', 'feat/thing')
+        value = f'reviewer {hive._turn_pair_binding(key)}'
+        assert hive._turn_declared_role(value, key) == 'reviewer'
+        assert hive._turn_declared_role(
+            value, (key[0], 'feat/other')) is None
+
+    @pytest.mark.parametrize(('oldest', 'expected'), [
+        ('branch: Created from HEAD', 'implementer'),
+        ('branch: Created from main', 'implementer'),
+        ('branch: Created from origin/feat/thing', 'reviewer'),
+    ])
+    def test_derives_measured_reflog_shapes(self, tmp_path, oldest, expected):
+        with patch.object(hive, '_git_out', return_value=f'newest\n{oldest}'):
+            assert hive._derive_turn_role(
+                tmp_path, 'git@github.com:acme/widget', 'feat/thing', 'main') \
+                == expected
+
+    def test_forgejo_fetched_shape_derives_reviewer(self, tmp_path):
+        with patch.object(
+                hive, '_git_out',
+                return_value='branch: Created from origin/feat/thing'):
+            assert hive._derive_turn_role(
+                tmp_path, 'ssh://forgejo/acme/widget', 'feat/thing', 'main') \
+                == 'reviewer'
+
+    @pytest.mark.parametrize(('remote', 'cli'), [
+        ('git@github.com:acme/widget', 'gh'),
+        ('https://github.com/acme/widget', 'gh'),
+        ('ssh://git@forgejo.home/acme/widget', 'fj'),
+        ('git@notgithub.com:acme/widget', 'fj'),
+    ])
+    def test_pr_cli_selection_uses_the_exact_remote_host(self, remote, cli):
+        assert hive._turn_cli_for_remote(remote) == cli
+
+    def test_missing_reflog_does_not_latch(self, tmp_path):
+        with patch.object(hive, '_git_out', return_value=None):
+            assert hive._derive_turn_role(
+                tmp_path, 'git@github.com:acme/widget', 'feat/thing', 'main') \
+                is None
+
+    def test_fresh_window_loses_derived_role_when_evidence_disappears(
+            self, tmp_path):
+        def window():
+            return hive._TurnWindow(
+                window_id='@1', index=1, pane_id='%1', pane_pid=10,
+                pane_tty='ttys001', pane_path=str(tmp_path),
+                pane_command='claude', activity=0)
+
+        def git_out_with_reflog(args, cwd=None, timeout=None):
+            if args[:2] == ['rev-parse', '--show-toplevel']:
+                return str(tmp_path)
+            if args[:2] == ['rev-parse', '--abbrev-ref']:
+                return 'feat/thing'
+            if args == ['rev-parse', 'HEAD']:
+                return 'a' * 40
+            if args[:2] == ['reflog', 'show']:
+                return 'branch: Created from HEAD'
+            return None
+
+        records = {10: {'pid': 10, 'ppid': 1, 'tty': 'ttys001',
+                        'comm': 'claude', 'args': 'claude'}}
+        first = window()
+        with patch.object(hive, '_git_out', side_effect=git_out_with_reflog), \
+             patch.object(hive, '_get_origin_url',
+                          return_value='git@github.com:acme/widget'), \
+             patch.object(hive, '_default_branch', return_value='main'):
+            hive._populate_turn_window(first, records)
+        assert (first.role, first.role_source) == ('implementer', 'reflog')
+
+        second = window()
+        with patch.object(hive, '_git_out',
+                          side_effect=lambda args, cwd=None, timeout=None:
+                          None if args[:2] == ['reflog', 'show']
+                          else git_out_with_reflog(args, cwd, timeout)), \
+             patch.object(hive, '_get_origin_url',
+                          return_value='git@github.com:acme/widget'), \
+             patch.object(hive, '_default_branch', return_value='main'):
+            hive._populate_turn_window(second, records)
+        assert (second.role, second.role_source) == ('unknown', 'none')
+
+    def test_branch_change_clears_stale_declaration(self, tmp_path):
+        old_key = ('git@github.com:acme/widget', 'feat/old')
+        window = hive._TurnWindow(
+            window_id='@1', index=1, pane_id='%1', pane_pid=10,
+            pane_tty='ttys001', pane_path=str(tmp_path),
+            pane_command='claude', activity=0,
+            declared=f'reviewer {hive._turn_pair_binding(old_key)}')
+        records = {10: {'pid': 10, 'ppid': 1, 'tty': 'ttys001',
+                        'comm': 'claude', 'args': 'claude'}}
+
+        def fake_git(args, cwd=None, timeout=None):
+            if args[:2] == ['rev-parse', '--show-toplevel']:
+                return str(tmp_path)
+            if args[:2] == ['rev-parse', '--abbrev-ref']:
+                return 'feat/new'
+            if args == ['rev-parse', 'HEAD']:
+                return 'a' * 40
+            return None
+
+        with patch.object(hive, '_git_out', side_effect=fake_git), \
+             patch.object(hive, '_get_origin_url',
+                          return_value='git@github.com:acme/widget'), \
+             patch.object(hive, '_default_branch', return_value='main'), \
+             patch.object(hive, '_derive_turn_role', return_value=None):
+            hive._populate_turn_window(window, records)
+        assert window.clear_declaration is True
+        assert window.role == 'unknown'
+
+    @pytest.mark.parametrize(('branch', 'agent', 'expected_reason'), [
+        ('HEAD', 'claude', 'incomplete git identity'),
+        ('main', 'claude', 'default branch'),
+        ('feat/thing', 'bash', 'no supported agent'),
+    ])
+    def test_detached_default_and_shell_windows_are_ineligible(
+            self, tmp_path, branch, agent, expected_reason):
+        window = hive._TurnWindow(
+            window_id='@1', index=1, pane_id='%1', pane_pid=10,
+            pane_tty='ttys001', pane_path=str(tmp_path),
+            pane_command=agent, activity=0)
+        records = {10: {'pid': 10, 'ppid': 1, 'tty': 'ttys001',
+                        'comm': agent, 'args': agent}}
+
+        def fake_git(args, cwd=None, timeout=None):
+            if args[:2] == ['rev-parse', '--show-toplevel']:
+                return str(tmp_path)
+            if args[:2] == ['rev-parse', '--abbrev-ref']:
+                return branch
+            if args == ['rev-parse', 'HEAD']:
+                return 'a' * 40
+            return None
+
+        with patch.object(hive, '_git_out', side_effect=fake_git), \
+             patch.object(hive, '_get_origin_url',
+                          return_value='git@github.com:acme/widget'), \
+             patch.object(hive, '_default_branch', return_value='main'):
+            hive._populate_turn_window(window, records)
+        assert window.eligible is False
+        assert window.reason == expected_reason
+
+    def test_agent_start_and_exit_change_eligibility_on_successive_ticks(
+            self, tmp_path):
+        def window():
+            return hive._TurnWindow(
+                window_id='@1', index=1, pane_id='%1', pane_pid=10,
+                pane_tty='ttys001', pane_path=str(tmp_path),
+                pane_command='bash', activity=0)
+
+        def fake_git(args, cwd=None, timeout=None):
+            if args[:2] == ['rev-parse', '--show-toplevel']:
+                return str(tmp_path)
+            if args[:2] == ['rev-parse', '--abbrev-ref']:
+                return 'feat/thing'
+            if args == ['rev-parse', 'HEAD']:
+                return 'a' * 40
+            return None
+
+        agent_records = {
+            10: {'pid': 10, 'ppid': 1, 'tty': 'ttys001',
+                 'comm': 'bash', 'args': 'bash'},
+            11: {'pid': 11, 'ppid': 10, 'tty': 'ttys001',
+                 'comm': 'claude', 'args': 'claude'},
+        }
+        shell_records = {10: agent_records[10]}
+        started, exited = window(), window()
+        with patch.object(hive, '_git_out', side_effect=fake_git), \
+             patch.object(hive, '_get_origin_url',
+                          return_value='git@github.com:acme/widget'), \
+             patch.object(hive, '_default_branch', return_value='main'), \
+             patch.object(hive, '_derive_turn_role', return_value=None):
+            hive._populate_turn_window(started, agent_records)
+            hive._populate_turn_window(exited, shell_records)
+        assert started.eligible is True
+        assert exited.eligible is False
+        assert exited.reason == 'no supported agent'
+
+
+class TestTurnPrivateCache:
+    @pytest.mark.parametrize('mask', [0o000, 0o022])
+    def test_modes_are_private_under_any_umask(self, tmp_path, mask):
+        state = tmp_path / 'state/hive/turn'
+        old_umask = os.umask(mask)
+        try:
+            with patch.object(hive, '_TURN_STATE_DIR', state):
+                path = state / 'entry.json'
+                assert hive._write_private_json(path, {'ok': True})
+        finally:
+            os.umask(old_umask)
+        assert state.stat().st_mode & 0o777 == 0o700
+        assert path.stat().st_mode & 0o777 == 0o600
+
+    def test_closed_observation_expires_but_merged_receipt_does_not(self,
+                                                                    tmp_path):
+        key = ('git@github.com:acme/widget', 'feat/thing')
+        heads = ('a' * 40,)
+        with patch.object(hive, '_TURN_STATE_DIR', tmp_path / 'turn'):
+            hive._save_turn_pr(
+                key, heads, {'state': 'closed', 'head_sha': heads[0]}, 10)
+            assert hive._cached_turn_pr(key, heads, 69.999)['state'] == 'closed'
+            assert hive._cached_turn_pr(key, heads, 70) is None
+            hive._save_turn_pr(
+                key, heads, {'state': 'merged', 'head_sha': heads[0]}, 80)
+            assert hive._cached_turn_pr(key, heads, 100000)['state'] == 'merged'
+
+    def test_version_one_receipt_is_invalidated_before_forgejo_recheck(
+            self, tmp_path):
+        key = ('ssh://git@forgejo.home/acme/widget', 'feat/thing')
+        heads = ('a' * 40,)
+        with patch.object(hive, '_TURN_STATE_DIR', tmp_path / 'turn'):
+            path = hive._turn_cache_path(key)
+            hive._write_private_json(path, {
+                'version': 1, 'pair': list(key),
+                'merged_receipt': {
+                    'state': 'merged', 'head_sha': heads[0], 'number': 9}})
+            assert hive._cached_turn_pr(key, heads, 20) is None
+            hive._save_turn_pr(
+                key, heads, {'state': 'closed', 'head_sha': heads[0]}, 20)
+            assert hive._cached_turn_pr(key, heads, 21)['state'] == 'closed'
+            refreshed = json.loads(path.read_text())
+            assert refreshed['version'] == hive._TURN_CACHE_VERSION == 2
+            assert 'merged_receipt' not in refreshed
+
+    def test_reopened_pr_replaces_closed_observation_at_same_head(self,
+                                                                  tmp_path):
+        key = ('git@github.com:acme/widget', 'feat/thing')
+        heads = ('a' * 40,)
+        with patch.object(hive, '_TURN_STATE_DIR', tmp_path / 'turn'):
+            hive._save_turn_pr(
+                key, heads, {'state': 'closed', 'head_sha': heads[0]}, 10)
+            hive._save_turn_pr(
+                key, heads, {'state': 'open', 'head_sha': heads[0]}, 71)
+            assert hive._cached_turn_pr(key, heads, 72)['state'] == 'open'
+
+    def test_head_advance_invalidates_receipt(self, tmp_path):
+        key = ('git@github.com:acme/widget', 'feat/thing')
+        with patch.object(hive, '_TURN_STATE_DIR', tmp_path / 'turn'):
+            hive._save_turn_pr(
+                key, ('a' * 40,),
+                {'state': 'merged', 'head_sha': 'a' * 40}, 10)
+            assert hive._cached_turn_pr(key, ('b' * 40,), 20) is None
+
+    def test_manual_bust_preserves_only_merged_receipt(self, tmp_path):
+        key = ('git@github.com:acme/widget', 'feat/thing')
+        heads = ('a' * 40,)
+        state = tmp_path / 'turn'
+        with patch.object(hive, '_TURN_STATE_DIR', state):
+            hive._save_turn_pr(
+                key, heads, {'state': 'merged', 'head_sha': heads[0]}, 10)
+            path = hive._turn_cache_path(key)
+            data = json.loads(path.read_text())
+            data['mutable'] = {'observed_at': 10, 'heads': list(heads),
+                               'result': {'state': 'closed'}}
+            hive._write_private_json(path, data)
+            hive._bust_turn_mutable_cache()
+            after = json.loads(path.read_text())
+        assert 'mutable' not in after
+        assert after['merged_receipt']['state'] == 'merged'
+
+    def test_cache_never_persists_body_or_process_arguments(self, tmp_path):
+        key = ('git@github.com:acme/widget', 'feat/thing')
+        result = {
+            'state': 'open', 'number': 7, 'title': 'A' * 100,
+            'body': 'secret body', 'args': '--secret token',
+            'comment': {'id': '1', 'classification': 'completion',
+                        'first_line': 'B' * 100, 'body': 'raw body'},
+        }
+        with patch.object(hive, '_TURN_STATE_DIR', tmp_path / 'turn'):
+            hive._save_turn_pr(key, ('a',), result, 10)
+            text = hive._turn_cache_path(key).read_text()
+        assert 'secret body' not in text
+        assert '--secret' not in text
+        assert 'raw body' not in text
+        assert 'A' * 81 not in text
+        assert 'B' * 81 not in text
+
+
+class TestTurnPrLookup:
+    @pytest.mark.parametrize(('pr', 'expected'), [
+        ({'state': 'OPEN', 'merged': False,
+          'mergedAt': '0001-01-01T00:00:00Z'}, 'open'),
+        ({'state': 'CLOSED', 'merged': False,
+          'mergedAt': '0001-01-01T00:00:00Z'}, 'closed'),
+        ({'state': 'OPEN',
+          'mergedAt': '0001-01-01T00:00:00+00:00'}, 'open'),
+        ({'state': 'MERGED', 'merged': True,
+          'mergedAt': '0001-01-01T00:00:00Z'}, 'merged'),
+        ({'state': 'OPEN', 'mergedAt': None}, 'open'),
+        ({'state': 'MERGED',
+          'mergedAt': '2026-09-07T00:00:00Z'}, 'merged'),
+        ({'state': 'OPEN', 'mergedAt': 'not-a-time'}, 'open'),
+    ])
+    def test_pr_state_normalizes_real_github_and_forgejo_shapes(
+            self, pr, expected):
+        assert hive._turn_pr_state(pr) == expected
+
+    def test_cli_timeout_and_oversized_json_fail_closed(self, tmp_path):
+        with patch.object(
+                hive.subprocess, 'run',
+                side_effect=subprocess.TimeoutExpired('gh', 1)):
+            assert hive._run_turn_pr_cli(
+                'gh', tmp_path, ['list'], time.monotonic() + 5) is None
+        oversized = MagicMock(
+            returncode=0, stdout=' ' * (hive._TURN_PR_JSON_MAX + 1))
+        with patch.object(hive.subprocess, 'run', return_value=oversized):
+            assert hive._run_turn_pr_cli(
+                'gh', tmp_path, ['list'], time.monotonic() + 5) is None
+
+    def test_open_pr_is_group_wide_across_mixed_heads(self, tmp_path):
+        responses = [
+            [{'number': 7, 'state': 'OPEN'}],
+            {'number': 7, 'state': 'OPEN', 'title': 'Turn',
+             'headRefOid': 'b' * 40,
+             'comments': [{'id': 'c', 'createdAt': '2026-09-06T00:00:00Z',
+                           'body': 'Addressed in `abcdef1`.'}]},
+        ]
+        with patch.object(hive, '_run_turn_pr_cli', side_effect=responses):
+            result = hive._lookup_turn_pr(
+                tmp_path, ('git@github.com:acme/widget', 'feat/thing'),
+                ('a' * 40, 'b' * 40), time.monotonic() + 5)
+        assert result['state'] == 'open'
+        assert result['comment']['classification'] == 'completion'
+
+    def test_forgejo_zero_merge_time_open_pr_remains_open(self, tmp_path):
+        zero = '0001-01-01T00:00:00Z'
+        responses = [
+            [{'number': 1088, 'state': 'OPEN', 'merged': False,
+              'mergedAt': zero}],
+            {'number': 1088, 'state': 'OPEN', 'merged': False,
+             'mergedAt': zero, 'headRefOid': 'b' * 40, 'comments': []},
+        ]
+        with patch.object(
+                hive, '_run_turn_pr_cli', side_effect=responses) as run:
+            result = hive._lookup_turn_pr(
+                tmp_path, ('ssh://git@forgejo.home/infra/home-dc',
+                           'adr-0111-digitalstorm-node'),
+                ('a' * 40, 'b' * 40), time.monotonic() + 5)
+        assert result['state'] == 'open'
+        assert all(any('merged' in arg for arg in call.args[2])
+                   for call in run.call_args_list)
+
+    @pytest.mark.parametrize(('terminal', 'expected'), [
+        ({'number': 7, 'state': 'MERGED', 'merged': True,
+          'mergedAt': '2026-09-07T00:00:00Z',
+          'headRefName': 'refs/pull/7/head', 'headRefOid': 'wanted'},
+         'merged'),
+        ({'number': 9, 'state': 'CLOSED', 'merged': False,
+          'mergedAt': '0001-01-01T00:00:00Z',
+          'headRefName': 'refs/pull/9/head', 'headRefOid': 'wanted'},
+         'closed'),
+    ])
+    def test_forgejo_terminal_lookup_matches_sha_after_branch_deletion(
+            self, tmp_path, terminal, expected):
+        unrelated_open = {
+            'number': 1088, 'state': 'OPEN', 'merged': False,
+            'mergedAt': '0001-01-01T00:00:00Z', 'headRefOid': 'elsewhere'}
+        with patch.object(
+                hive, '_run_turn_pr_cli',
+                side_effect=[[], [unrelated_open, terminal]]) as run:
+            result = hive._lookup_turn_pr(
+                tmp_path, ('ssh://git@forgejo.home/acme/widget',
+                           'feat/deleted'),
+                ('wanted',), time.monotonic() + 5)
+        assert result['state'] == expected
+        terminal_args = run.call_args_list[1].args[2]
+        assert '--head' not in terminal_args
+        assert any('merged' in arg for arg in terminal_args)
+
+    def test_forgejo_multiple_prs_at_same_sha_is_unknown(self, tmp_path):
+        matches = [
+            {'number': number, 'state': 'MERGED', 'merged': True,
+             'headRefOid': 'wanted'}
+            for number in (7, 8)]
+        with patch.object(
+                hive, '_run_turn_pr_cli', side_effect=[[], matches]):
+            result = hive._lookup_turn_pr(
+                tmp_path, ('ssh://git@forgejo.home/acme/widget',
+                           'feat/deleted'),
+                ('wanted',), time.monotonic() + 5)
+        assert result == {
+            'state': 'unknown', 'reason': 'multiple PRs at local HEAD'}
+
+    def test_multiple_open_prs_are_unknown(self, tmp_path):
+        with patch.object(hive, '_run_turn_pr_cli', return_value=[{}, {}]):
+            result = hive._lookup_turn_pr(
+                tmp_path, ('git@github.com:acme/widget', 'feat/thing'),
+                ('a',), time.monotonic() + 5)
+        assert result == {'state': 'unknown', 'reason': 'multiple open PRs'}
+
+    def test_no_open_pr_with_mixed_heads_is_unknown(self, tmp_path):
+        run = MagicMock(return_value=[])
+        with patch.object(hive, '_run_turn_pr_cli', run):
+            result = hive._lookup_turn_pr(
+                tmp_path, ('git@github.com:acme/widget', 'feat/thing'),
+                ('a', 'b'), time.monotonic() + 5)
+        assert result['reason'] == 'mixed local HEADs'
+        assert run.call_count == 1
+
+    def test_full_nonmatching_terminal_page_is_unknown(self, tmp_path):
+        responses = [[], [
+            {'number': i, 'state': 'CLOSED', 'headRefOid': str(i)}
+            for i in range(hive._TURN_TERMINAL_LIMIT)]]
+        with patch.object(hive, '_run_turn_pr_cli', side_effect=responses):
+            result = hive._lookup_turn_pr(
+                tmp_path, ('git@github.com:acme/widget', 'feat/thing'),
+                ('wanted',), time.monotonic() + 5)
+        assert result['reason'] == 'terminal history truncated'
+
+    def test_short_nonmatching_terminal_page_proves_none(self, tmp_path):
+        with patch.object(
+                hive, '_run_turn_pr_cli', side_effect=[[], []]) as run:
+            result = hive._lookup_turn_pr(
+                tmp_path, ('git@github.com:acme/widget', 'feat/thing'),
+                ('wanted',), time.monotonic() + 5)
+        assert result == {'state': 'none'}
+        assert run.call_args_list[1].args[2][-2:] == [
+            '--search', 'sort:updated-desc']
+
+    @pytest.mark.parametrize(('state', 'merged_at', 'expected'), [
+        ('CLOSED', None, 'closed'),
+        ('MERGED', '2026-09-06T00:00:00Z', 'merged'),
+    ])
+    def test_terminal_state_must_match_shared_head(self, tmp_path, state,
+                                                   merged_at, expected):
+        terminal = {'number': 7, 'state': state, 'headRefOid': 'wanted',
+                    'mergedAt': merged_at}
+        with patch.object(hive, '_run_turn_pr_cli',
+                          side_effect=[[], [terminal]]):
+            result = hive._lookup_turn_pr(
+                tmp_path, ('git@github.com:acme/widget', 'feat/thing'),
+                ('wanted',), time.monotonic() + 5)
+        assert result['state'] == expected
+        assert result['head_sha'] == 'wanted'
+
+    def test_lookup_failure_is_unknown_and_not_cacheable(self, tmp_path):
+        with patch.object(hive, '_run_turn_pr_cli', return_value=None):
+            result = hive._lookup_turn_pr(
+                tmp_path, ('git@github.com:acme/widget', 'feat/thing'),
+                ('a',), time.monotonic() + 5)
+        assert result['state'] == 'unknown'
+        assert result['_cacheable'] is False
+
+
+def _turn_window(index, role='unknown', activity=0):
+    return hive._TurnWindow(
+        window_id=f'@{index}', index=index, pane_id=f'%{index}', pane_pid=index,
+        pane_tty=f'ttys{index:03}', pane_path=f'/repo-{index}',
+        pane_command='agent', activity=activity, role=role,
+        role_source='reflog', eligible=True)
+
+
+class TestTurnBatonRule:
+    def _pair(self, now=100):
+        return [_turn_window(1, 'implementer', now - 60),
+                _turn_window(2, 'reviewer', now - 50)]
+
+    @pytest.mark.parametrize(('classification', 'target', 'glyph', 'verb'), [
+        ('approve', '@1', '✓', 'merge pr'),
+        ('changes requested', '@1', '▶', 'address review feedback'),
+        ('no new delta', '@1', '▶', 'address review feedback'),
+        ('completion', '@2', '▶', 're-review'),
+    ])
+    def test_comment_handoffs_target_the_role(self, classification, target,
+                                              glyph, verb):
+        windows = self._pair()
+        decision = hive._decide_turn(
+            windows, {'state': 'open',
+                      'comment': {'classification': classification}}, 100)
+        assert decision['target'] == target
+        assert decision['suffixes'][target] == glyph
+        assert decision['verb'] == verb
+
+    def test_named_question_flag_defaults_off_and_outranks_comments(self):
+        windows = self._pair()
+        assert all(window.question is False for window in windows)
+        windows[0].question = True
+        decision = hive._decide_turn(
+            windows, {'state': 'open',
+                      'comment': {'classification': 'completion'}}, 100)
+        assert decision['target'] == '@1'
+        assert decision['suffixes'] == {'@1': '?', '@2': ''}
+
+    @pytest.mark.parametrize('state', ['closed', 'merged'])
+    def test_terminal_state_outranks_shape_and_comments(self, state):
+        windows = [_turn_window(1), _turn_window(2), _turn_window(3)]
+        decision = hive._decide_turn(
+            windows, {'state': state,
+                      'comment': {'classification': 'completion'}}, 100)
+        assert set(decision['suffixes'].values()) == {'↩'}
+        assert decision['verb'] == 'put back'
+
+    def test_unrecognized_latest_comment_is_unknown(self):
+        decision = hive._decide_turn(
+            self._pair(), {'state': 'open',
+                           'comment': {'classification': 'unrecognized'}}, 100)
+        assert set(decision['suffixes'].values()) == {''}
+        assert decision['reason'] == 'unrecognized handoff'
+
+    def test_active_pair_without_comments_has_no_glyph(self):
+        windows = self._pair()
+        windows[0].activity = 95
+        decision = hive._decide_turn(windows, {'state': 'none'}, 100)
+        assert set(decision['suffixes'].values()) == {''}
+        assert decision['reason'] == 'active'
+
+    def test_quiet_pair_targets_the_earlier_quiet_since(self):
+        decision = hive._decide_turn(self._pair(), {'state': 'none'}, 100)
+        assert decision['target'] == '@1'
+        assert decision['suffixes']['@1'] == '▶'
+
+    def test_equal_quiet_since_is_unknown(self):
+        windows = self._pair()
+        windows[1].activity = windows[0].activity
+        decision = hive._decide_turn(windows, {'state': 'none'}, 100)
+        assert decision['reason'] == 'equal quiet-since'
+
+    def test_singleton_only_targets_its_own_role(self):
+        reviewer = [_turn_window(2, 'reviewer')]
+        completion = hive._decide_turn(
+            reviewer, {'state': 'open',
+                       'comment': {'classification': 'completion'}}, 100)
+        approval = hive._decide_turn(
+            reviewer, {'state': 'open',
+                       'comment': {'classification': 'approve'}}, 100)
+        assert completion['suffixes']['@2'] == '▶'
+        assert approval['reason'] == 'next: implementer — no window'
+
+    def test_duplicate_roles_and_three_windows_are_malformed(self):
+        duplicate = [_turn_window(1, 'reviewer'), _turn_window(2, 'reviewer')]
+        three = self._pair() + [_turn_window(3, 'implementer')]
+        assert hive._turn_group_shape(duplicate) == 'malformed'
+        assert hive._turn_group_shape(three) == 'malformed'
+        for windows in (duplicate, three):
+            decision = hive._decide_turn(
+                windows, {'state': 'open',
+                          'comment': {'classification': 'completion'}}, 100)
+            assert decision['reason'] == 'malformed group'
+
+    def test_unknown_pr_state_clears_all_glyphs(self):
+        decision = hive._decide_turn(
+            self._pair(), {'state': 'unknown', 'reason': 'lookup failed'}, 100)
+        assert set(decision['suffixes'].values()) == {''}
+        assert decision['reason'] == 'lookup failed'
+
+
+class TestTurnProducerBoundary:
+    def test_groups_same_branch_by_normalized_remote_and_handles_no_pr_pair(
+            self, tmp_path):
+        first = _turn_window(1, 'implementer', activity=10)
+        second = _turn_window(2, 'reviewer', activity=20)
+        other = _turn_window(3, 'implementer', activity=30)
+        for window in (first, second, other):
+            window.branch = 'feat/thing'
+            window.head = 'a' * 40
+            window.workspace = tmp_path
+        first.remote = second.remote = 'git@github.com:acme/widget'
+        other.remote = 'git@github.com:elsewhere/widget'
+
+        def no_prs(groups, started, now):
+            return {key: {'state': 'none'} for key in groups}
+
+        with patch.object(hive, '_collect_turn_windows',
+                          return_value=[first, second, other]), \
+             patch.object(hive, '_turn_process_snapshot', return_value={}), \
+             patch.object(hive, '_populate_turn_window'), \
+             patch.object(hive, '_resolve_turn_prs', side_effect=no_prs):
+            snapshot = hive._build_turn_session('hive-0', now=100)
+        assert snapshot is not None
+        assert len(snapshot['groups']) == 2
+        pair_key = (first.remote, first.branch)
+        assert snapshot['groups'][pair_key] == [first, second]
+        assert snapshot['decisions'][pair_key]['target'] == '@1'
+
+    def test_applies_outputs_to_every_window_and_clears_ineligible(self):
+        first = _turn_window(1, 'implementer')
+        second = _turn_window(2, 'reviewer')
+        inactive = _turn_window(3)
+        inactive.eligible = False
+        inactive.reason = 'default branch'
+        key = ('remote', 'branch')
+        first.remote = second.remote = key[0]
+        first.branch = second.branch = key[1]
+        snapshot = {
+            'windows': [first, second, inactive],
+            'groups': {key: [first, second]},
+            'decisions': {key: {
+                'suffixes': {'@1': '▶', '@2': ''}, 'target': '@1',
+                'verb': 'address review feedback', 'kind': 'changes requested',
+                'reason': ''}},
+        }
+        with patch.object(hive, '_set_turn_window_options') as write:
+            hive._apply_turn_session(snapshot)
+        assert write.call_count == 3
+        write.assert_any_call(first, '▶', '1:address review feedback')
+        write.assert_any_call(second, '', '1:address review feedback')
+        write.assert_any_call(inactive, '', '')
+
+    def test_deadline_marks_every_unfinished_key_unknown(self, tmp_path):
+        key1 = ('one', 'branch')
+        key2 = ('two', 'branch')
+        groups = {}
+        for key, index in ((key1, 1), (key2, 2)):
+            window = _turn_window(index, 'implementer')
+            window.remote, window.branch, window.head = key[0], key[1], 'a'
+            window.workspace = tmp_path
+            groups[key] = [window]
+
+        gate = __import__('threading').Event()
+
+        def blocked(*args):
+            gate.wait(0.2)
+            return {'state': 'none'}
+
+        with patch.object(hive, '_cached_turn_pr', return_value=None), \
+             patch.object(hive, '_lookup_turn_pr', side_effect=blocked), \
+             patch.object(hive, '_TURN_PRODUCER_DEADLINE', 0):
+            resolved = hive._resolve_turn_prs(
+                groups, time.monotonic(), time.time())
+        gate.set()
+        assert {result['reason'] for result in resolved.values()} \
+            == {'producer deadline'}
+
+    def test_turn_refresh_rewrites_both_windows_without_selection_event(self):
+        first = _turn_window(1, 'implementer')
+        second = _turn_window(2, 'reviewer')
+        key = ('remote', 'branch')
+        first.remote = second.remote = key[0]
+        first.branch = second.branch = key[1]
+        snapshot = {
+            'session': 'hive-0', 'windows': [first, second],
+            'groups': {key: [first, second]},
+            'prs': {key: {'state': 'open', 'number': 7}},
+            'decisions': {key: {
+                'suffixes': {'@1': '', '@2': '▶'}, 'target': '@2',
+                'verb': 're-review', 'kind': 'completion', 'reason': ''}},
+        }
+        with patch.object(hive, '_build_turn_session', return_value=snapshot), \
+             patch.object(hive, '_set_turn_window_options') as write:
+            assert hive._tmux_turn_refresh('hive-0')
+        assert write.call_count == 2
+
+    def test_terminal_tick_clears_bound_declarations(self):
+        first = _turn_window(1, 'implementer')
+        second = _turn_window(2, 'reviewer')
+        key = ('remote', 'branch')
+        for window in (first, second):
+            window.remote, window.branch, window.head = key[0], key[1], 'a'
+            window.declared = f'{window.role} {hive._turn_pair_binding(key)}'
+        with patch.object(hive, '_collect_turn_windows',
+                          return_value=[first, second]), \
+             patch.object(hive, '_turn_process_snapshot', return_value={}), \
+             patch.object(hive, '_populate_turn_window'), \
+             patch.object(hive, '_resolve_turn_prs',
+                          return_value={key: {'state': 'merged'}}):
+            snapshot = hive._build_turn_session('hive-0', now=100)
+        assert snapshot is not None
+        assert all(window.clear_declaration for window in snapshot['windows'])
+
+    def test_pairs_popup_names_handoff_liveness_and_sanitizes_remote_text(
+            self, capsys):
+        first = _turn_window(1, 'implementer', activity=95)
+        second = _turn_window(2, 'reviewer', activity=40)
+        key = ('remote', 'branch')
+        first.remote = second.remote = key[0]
+        first.branch = second.branch = key[1]
+        snapshot = {
+            'session': 'hive-0', 'observed_at': 100,
+            'windows': [first, second], 'groups': {key: [first, second]},
+            'prs': {key: {
+                'state': 'open', 'number': 7, 'title': 'Safe\x1b[31m title',
+                'comment': {
+                    'classification': 'completion',
+                    'first_line': 'Pushed\x07 abcdef1',
+                    'created_at': '1970-01-01T00:01:30Z'}}},
+            'decisions': {key: {
+                'suffixes': {'@1': '', '@2': '▶'}, 'target': '@2',
+                'verb': 're-review', 'kind': 'completion', 'reason': ''}},
+        }
+        with patch.object(hive, '_build_turn_session', return_value=snapshot), \
+             patch.object(hive, '_apply_turn_session'):
+            assert hive._tmux_pairs('hive-0')
+        output = capsys.readouterr().out
+        assert '\x1b' not in output and '\x07' not in output
+        assert 'handoff 1:implementer completion (10s ago)' in output
+        assert '1:active (output 5s ago)' in output
+        assert '2:quiet since 1m ago' in output
+
+
 # --- git-sync indicator ------------------------------------------------------
 
 
@@ -583,6 +1465,31 @@ class TestCmdTmuxDispatch:
              pytest.raises(SystemExit) as exc:
             hive.cmd_tmux(args)
         assert exc.value.code == 1
+
+    def test_turn_refresh_action_routes_with_cache_bust(self):
+        args = self._args(tmux_action='turn-refresh', session='infra-0',
+                          bust_cache=True)
+        with patch.object(hive, '_tmux_turn_refresh', return_value=True) as fn:
+            hive.cmd_tmux(args)
+        fn.assert_called_once_with('infra-0', bust_cache=True)
+
+    def test_pairs_action_routes(self):
+        args = self._args(tmux_action='pairs', session='infra-0')
+        with patch.object(hive, '_tmux_pairs', return_value=True) as fn:
+            hive.cmd_tmux(args)
+        fn.assert_called_once_with('infra-0')
+
+    def test_pairs_without_session_uses_current_tmux_session(self):
+        with patch.object(hive, '_current_session', return_value='infra-0'), \
+             patch.object(hive, '_build_turn_session', return_value=None) as fn:
+            assert hive._tmux_pairs() is False
+        fn.assert_called_once_with('infra-0')
+
+    def test_role_action_routes(self):
+        args = self._args(tmux_action='role', role='reviewer')
+        with patch.object(hive, '_tmux_role', return_value=True) as fn:
+            hive.cmd_tmux(args)
+        fn.assert_called_once_with('reviewer')
 
     def test_status_context_action_routes(self):
         args = self._args(tmux_action='status-context', pane_path='/x',

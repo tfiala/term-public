@@ -373,6 +373,10 @@ hive tmux
 hive tmux --hive ~/src/infra
 hive tmux --list
 hive tmux --new-window
+hive tmux role implementer
+hive tmux role reviewer
+hive tmux role clear
+hive tmux pairs
 ```
 
 `hive tmux` starts (or attaches to) a per-hive tmux session — one window per
@@ -386,6 +390,18 @@ or a dropped SSH connection. The `tmux/tmux.conf` base config carries the
 settings that make Claude CLI render correctly inside tmux (notably
 `allow-passthrough on` plus synchronized output) and pins `default-shell` to
 Homebrew bash.
+
+Agent windows on the same non-default `(remote, branch)` also get the
+ADR-0003 turn indicator: `▶` marks the next prompt, `✓` marks the implementer
+window where an approved PR is merged, `?` is reserved for a future
+question-aware enricher, and `↩` means the PR is terminal and the checkout can
+be put back. Eligibility comes from the pane's process tree, so an ordinary
+Node process is never mistaken for Codex. Roles normally come from branch
+reflog provenance; use `hive tmux role implementer|reviewer` in a pane when
+that provenance is absent, and `hive tmux role clear` to remove the override.
+Backtick+`p` opens the pair detail popup. Backtick+`R` clears mutable PR
+observations and refreshes immediately while preserving immutable merged
+receipts.
 
 Window selection keeps the single-key path for the first ten workspaces:
 backtick+`1` through `9` select those window numbers, and backtick+`0` selects
