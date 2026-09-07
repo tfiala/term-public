@@ -407,7 +407,11 @@ Cheapest first, and they stack:
   which kind, how long ago), the next window, and the verb to type there
   (`re-review`, `address review feedback`, `merge pr`, `put back`).
   Singleton, malformed, ineligible, and unknown windows get a row each, with
-  the pane title as the summary and the reason no glyph is shown.
+  the pane title as the summary and the reason no glyph is shown. Popup
+  bindings pass `#{client_name}` and `#{pane_id}` through to tmux's
+  `-c target-client` and `-t target-pane`; a server can have several attached
+  hive clients, and a background launcher has no reliable implicit display
+  context.
 
 ### Refresh producer
 

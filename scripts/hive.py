@@ -2435,7 +2435,7 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
         '# backtick + a: run-dsl status popup (hive only)',
         'bind a run-shell -b \''
         'if [ -n "$HIVE_ROOT" ]; then'
-        '  hive tmux popup --cwd "#{pane_current_path}" hive tmux runs --hive-root "$HIVE_ROOT";'
+        '  hive tmux popup --client "#{client_name}" --pane "#{pane_id}" --cwd "#{pane_current_path}" hive tmux runs --hive-root "$HIVE_ROOT";'
         'else'
         '  tmux display-message "Not in a hive session";'
         'fi\'',
@@ -2443,7 +2443,7 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
         '# backtick + p: implementer/reviewer turn pairs (hive only)',
         'bind p run-shell -b \''
         'if [ -n "$HIVE_ROOT" ]; then'
-        '  hive tmux popup --cwd "#{pane_current_path}" hive tmux pairs "#{session_name}";'
+        '  hive tmux popup --client "#{client_name}" --pane "#{pane_id}" --cwd "#{pane_current_path}" hive tmux pairs "#{session_name}";'
         'else'
         '  tmux display-message "Not in a hive session";'
         'fi\'',
@@ -2452,21 +2452,21 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
         'bind g run-shell -b \''
         'if [ -n "$HIVE_ROOT" ]; then'
         '  tmux display-message "Hive: fetching status..." &&'
-        '  hive tmux popup --cwd "#{pane_current_path}" hive --color status --compact;'
+        '  hive tmux popup --client "#{client_name}" --pane "#{pane_id}" --cwd "#{pane_current_path}" hive --color status --compact;'
         'else'
         '  tmux display-message "Not in a hive session";'
         'fi\'',
         'bind G run-shell -b \''
         'if [ -n "$HIVE_ROOT" ]; then'
         '  tmux display-message "Hive: pulling repos..." &&'
-        '  hive tmux popup --cwd "#{pane_current_path}" hive --color pull --compact;'
+        '  hive tmux popup --client "#{client_name}" --pane "#{pane_id}" --cwd "#{pane_current_path}" hive --color pull --compact;'
         'else'
         '  tmux display-message "Not in a hive session";'
         'fi\'',
         'bind C-g run-shell -b \''
         'if [ -n "$HIVE_ROOT" ]; then'
         '  tmux display-message "Hive: pulling + pushing repos..." &&'
-        '  hive tmux popup --cwd "#{pane_current_path}" hive --color pull --compact --push;'
+        '  hive tmux popup --client "#{client_name}" --pane "#{pane_id}" --cwd "#{pane_current_path}" hive --color pull --compact --push;'
         'else'
         '  tmux display-message "Not in a hive session";'
         'fi\'',
@@ -4269,7 +4269,10 @@ def cmd_tmux(args: argparse.Namespace) -> None:
         _tmux_git_sync(args.pane_path)
         return
     if action == 'popup':
-        _tmux_popup(getattr(args, 'cwd', None), args.command)
+        _tmux_popup(
+            getattr(args, 'cwd', None), args.command,
+            client=getattr(args, 'client', None),
+            pane=getattr(args, 'pane', None))
         return
     if action == 'runs':
         hive = _resolve_tmux_hive(getattr(args, 'hive_root', None))
@@ -4517,16 +4520,23 @@ def _tmux_git_sync(pane_path: str) -> None:
             pass
 
 
-def _tmux_popup(cwd: str | None, command: list[str]) -> None:
+def _tmux_popup(cwd: str | None, command: list[str],
+                client: str | None = None, pane: str | None = None) -> None:
     """Run a command and show its output in a dynamically-sized tmux popup.
 
     Captures the command's output to a temp file, sizes the popup to fit
     (clamped to 80% of the window), and uses `less -R` when the content
     overflows. Invoked by the backtick keybindings.
     """
+    target_args = []
+    if client:
+        target_args += ['-c', client]
+    if pane:
+        target_args += ['-t', pane]
     if not command:
         subprocess.run(
-            ['tmux', 'display-message', 'hive tmux popup: no command'],
+            ['tmux', 'display-message', *target_args,
+             'hive tmux popup: no command'],
             capture_output=True)
         return
 
@@ -4542,7 +4552,8 @@ def _tmux_popup(cwd: str | None, command: list[str]) -> None:
             out.write(f'hive tmux popup: {exc}\n')
 
     def _dim(fmt: str, default: int) -> int:
-        r = subprocess.run(['tmux', 'display-message', '-p', fmt],
+        r = subprocess.run(
+            ['tmux', 'display-message', '-p', *target_args, fmt],
                            capture_output=True, text=True)
         try:
             return int(r.stdout.strip())
@@ -4557,11 +4568,13 @@ def _tmux_popup(cwd: str | None, command: list[str]) -> None:
     max_h = max(5, win_h * 80 // 100)
     if pop_h > max_h:
         # Content overflows — page it with less so the popup can scroll.
-        subprocess.run(['tmux', 'display-popup', '-w', str(pop_w),
+        subprocess.run(['tmux', 'display-popup', *target_args,
+                        '-w', str(pop_w),
                         '-h', str(max_h), '-E',
                         f"less -R '{tmpfile}'; rm -f '{tmpfile}'"])
     else:
-        subprocess.run(['tmux', 'display-popup', '-w', str(pop_w),
+        subprocess.run(['tmux', 'display-popup', *target_args,
+                        '-w', str(pop_w),
                         '-h', str(pop_h),
                         f"cat '{tmpfile}'; rm -f '{tmpfile}'"])
 
@@ -4700,6 +4713,8 @@ def main():
     tmux_gitsync = tmux_sub.add_parser('git-sync')
     tmux_gitsync.add_argument('pane_path')
     tmux_popup = tmux_sub.add_parser('popup')
+    tmux_popup.add_argument('--client')
+    tmux_popup.add_argument('--pane')
     tmux_popup.add_argument('--cwd')
     tmux_popup.add_argument('command', nargs=argparse.REMAINDER)
     tmux_runs = tmux_sub.add_parser('runs')

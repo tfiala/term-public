@@ -149,6 +149,14 @@ class TestGenerateTmuxConfig:
         assert 'hive tmux --hive' in conf
         assert 'hive-ci-popup' in conf
 
+    def test_popup_bindings_target_originating_client(self, fake_hive):
+        conf = hive._generate_tmux_config(fake_hive, hive._SHELL_PALETTE[0])
+        popup_lines = [line for line in conf.splitlines()
+                       if 'hive tmux popup' in line]
+        assert len(popup_lines) == 5
+        assert all('--client "#{client_name}"' in line
+                   and '--pane "#{pane_id}"' in line for line in popup_lines)
+
     def test_status_right_is_bounded(self, fake_hive):
         conf = hive._generate_tmux_config(fake_hive, hive._SHELL_PALETTE[0])
         assert 'set status-right-length 60' in conf
@@ -1507,10 +1515,12 @@ class TestCmdTmuxDispatch:
 
     def test_popup_action_routes(self):
         args = self._args(tmux_action='popup', cwd='/x',
+                          client='/dev/ttys000', pane='%7',
                           command=['hive', 'status'])
         with patch.object(hive, '_tmux_popup') as fn:
             hive.cmd_tmux(args)
-        fn.assert_called_once_with('/x', ['hive', 'status'])
+        fn.assert_called_once_with(
+            '/x', ['hive', 'status'], client='/dev/ttys000', pane='%7')
 
     def test_exits_when_tmux_missing(self):
         args = self._args(tmux_action=None, hive=None, list_hives=False)
@@ -1531,6 +1541,51 @@ class TestCmdTmuxDispatch:
              patch.object(hive, '_resolve_tmux_hive', return_value=None):
             with pytest.raises(SystemExit):
                 hive.cmd_tmux(args)
+
+
+class TestTmuxPopup:
+    @pytest.mark.parametrize(('line_count', 'paged'), ((1, False), (100, True)))
+    def test_targets_originating_client_for_dimensions_and_popup(
+            self, tmp_path, line_count, paged):
+        tmpfile = tmp_path / 'popup-output'
+        fd = os.open(tmpfile, os.O_CREAT | os.O_RDWR)
+
+        def fake_run(args, **kwargs):
+            if args == ['hive', 'status']:
+                kwargs['stdout'].write('status output\n' * line_count)
+                return subprocess.CompletedProcess(args, 0)
+            if args[:3] == ['tmux', 'display-message', '-p']:
+                value = '120\n' if args[-1] == '#{window_width}' else '40\n'
+                return subprocess.CompletedProcess(
+                    args, 0, stdout=value, stderr='')
+            return subprocess.CompletedProcess(args, 0, stdout='', stderr='')
+
+        with patch('tempfile.mkstemp', return_value=(fd, str(tmpfile))), \
+             patch.object(hive.subprocess, 'run', side_effect=fake_run) as run:
+            hive._tmux_popup(
+                '/workspace', ['hive', 'status'],
+                client='/dev/ttys000', pane='%7')
+
+        calls = [entry.args[0] for entry in run.call_args_list]
+        dimension_calls = [args for args in calls
+                           if args[:3] == ['tmux', 'display-message', '-p']]
+        assert len(dimension_calls) == 2
+        assert all(args[3:7] == ['-c', '/dev/ttys000', '-t', '%7']
+                   for args in dimension_calls)
+        popup_calls = [args for args in calls
+                       if args[:2] == ['tmux', 'display-popup']]
+        assert len(popup_calls) == 1
+        assert popup_calls[0][2:6] == [
+            '-c', '/dev/ttys000', '-t', '%7']
+        assert ('-E' in popup_calls[0]) is paged
+
+    def test_no_command_message_targets_originating_client(self):
+        with patch.object(hive.subprocess, 'run') as run:
+            hive._tmux_popup(
+                None, [], client='/dev/ttys000', pane='%7')
+        run.assert_called_once_with(
+            ['tmux', 'display-message', '-c', '/dev/ttys000', '-t', '%7',
+             'hive tmux popup: no command'], capture_output=True)
 
 
 # --- Pane environment seeding ------------------------------------------------
