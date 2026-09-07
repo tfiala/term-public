@@ -201,13 +201,15 @@ Resolution proceeds in this order:
 3. Otherwise query the remote for at most two open PRs whose head ref is the
    branch. Exactly one is the group's open PR; two results means two or more
    and is unknown ("multiple open PRs"). If none exists and the group has one
-   shared local HEAD, inspect one count-bounded page (at most 30) of the most
-   recently updated closed or
-   merged PRs with that head ref and match that HEAD to the PR head SHA. A
-   merged match writes an immutable receipt; a closed-unmerged match is only
-   a mutable 60 s cache entry. With no match, a short page proves none; a full
-   page is unknown ("terminal history truncated") because an older match may
-   exist.
+   shared local HEAD, inspect one count-bounded page (at most 30) of recent PRs
+   and match that HEAD to the PR head SHA. GitHub keeps the deleted head name,
+   so its terminal page remains filtered by branch. Forgejo rewrites a deleted
+   head to `refs/pull/<N>/head`, so its terminal page is repository-wide and
+   the exact head SHA is the predicate; more than one Forgejo PR at that SHA is
+   unknown rather than guessed. A merged match writes an immutable receipt; a
+   closed-unmerged match is only a mutable 60 s cache entry. With no match, a
+   short page proves none; a full page is unknown ("terminal history
+   truncated") because an older match may exist.
 4. A failed lookup, a producer-deadline cutoff, or mixed local HEADs after no
    open PR resolves to unknown. No stale mutable entry is a verdict.
 
@@ -247,8 +249,9 @@ Inputs:
    taking the oldest entry:
    - `branch: Created from HEAD` or `branch: Created from <default-branch>`
      → implementer (the branch was born here);
-   - `branch: Created from <remote>/<branch>`, or an entry recording a fetch
-     of the PR head → reviewer (the branch was fetched here);
+   - `branch: Created from <remote>/<branch>` on GitHub or Forgejo, or a
+     GitHub entry recording a fetch of the PR head → reviewer (the branch was
+     fetched here);
    - anything else, or no reflog → unknown.
 
 Outputs, rewritten on every tick: `@hive_turn_role` (the effective role:
@@ -343,8 +346,11 @@ earned by a sentence that merely contains the word.
      `approve`, `approved`, `lgtm`, or `approved / lgtm`. After the verdict,
      the only accepted tails are (a) punctuation and end of line; (b)
      `at|on`, optional `exact`, optional `rebased`, optional `head`, `<sha>`,
-     optional `against base <sha>`, then punctuation and end of line; or (c)
-     the exact suffix `, confirming the standing approval at this head.`.
+     optional `against base <sha>`, then punctuation and end of line; (c) the
+     exact suffix `, confirming the standing approval at this head.`; or (d)
+     one complete `one [non-blocking] nit [below]` clause after a comma,
+     period, or `with`, either after the bare verdict or its exact-head tail.
+     No text may follow that bounded clause.
      Separately, the complete lines `reviewed locally. no blocking
      findings|issues.`, `reviewed the pr diff in <path>. no blocking
      findings|issues.`, and `no blocking findings|issues.` are accepted;
@@ -460,6 +466,11 @@ line truncated to 80 characters, the PR title truncated to 80 characters,
 timestamps, and an immutable merged receipt when present. The raw comment
 body and pane process arguments are never written to disk.
 
+Cache schema version 2 invalidates version-1 receipts before using them.
+Version 1 treated Forgejo's truthy year-one `mergedAt` zero value as a merge,
+so retaining one of those receipts would preserve a closed-unmerged false
+positive forever and bypass the corrected adapter.
+
 ### Data sources and enrichment
 
 Version 1 uses only tmux formats (`window_activity`, `pane_title`,
@@ -524,8 +535,9 @@ say where a verdict may stand; the negation and family guards say when a line
 is not allowed to be a verdict at all; and a finite approval-tail grammar
 prevents a syntactically positive word from authorizing a conditional merge.
 These all err toward refusal, which costs a glyph and never directs a merge.
-The accepted tails cover the corpus's exact-head forms; novel prose uses the
-machine marker or resolves to unrecognized instead of growing a blacklist.
+The accepted tails cover the corpus's exact-head forms and the bounded common
+case of one nit; novel prose uses the machine marker or resolves to
+unrecognized instead of growing a blacklist.
 
 The producer has a deadline because a per-lookup timeout bounds one lookup
 and nothing else: ten keys and one outage would have run the slot past its
@@ -586,7 +598,9 @@ additive because the mixed-vendor constraint is not going away.
     SHA are reopened, and must become unknown when its entry expires and
     refresh fails; a merged receipt must keep showing `↩` through arbitrary
     clock advance and lookup failure; either terminal state must stop matching
-    when the branch advances;
+    when the branch advances; Forgejo's zero-time `mergedAt` must not imply a
+    merge, and a deleted Forgejo branch must resolve a terminal PR by exact
+    head SHA without treating unrelated open PRs as a race;
   - **the classifier:** every recognized first-line form in the corpus as a
     positive fixture; the corpus residue as negatives; all mutation negatives
     named above plus `Approved pending CI` and `Review at <sha> — approved,
@@ -615,10 +629,8 @@ additive because the mixed-vendor constraint is not going away.
   result is *unknown*, shown as such, and one `hive tmux role` command fixes
   it; it is never a silently wrong role, and never a latched one.
 - The reflog shapes above were measured for a locally created branch and for
-  `gh pr checkout`. `fj pr checkout` also creates a tracking branch, but its
-  exact reflog line has not been captured; it goes into the fixture set
-  before the derived rule is trusted on a Forgejo hive, and until then those
-  windows resolve to unknown rather than to a guess.
+  both `gh pr checkout` and `fj pr checkout`; both checkout commands produced
+  `branch: Created from origin/<branch>` on the reviewer side.
 - Row 2 does not fire until an enricher exists, so in version 1 a question
   left by the last speaker still reads as a handoff. This is the current
   behavior, so it is a known gap rather than a regression.
@@ -646,7 +658,14 @@ None.
 - Reflog provenance was measured on this repository's own PR branch: the
   originating checkout reports `branch: Created from HEAD`; a fresh clone
   after `gh pr checkout` reports `branch: Created from origin/<branch>` with
-  `branch.<name>.remote`/`.merge` set to the tracking upstream.
+  `branch.<name>.remote`/`.merge` set to the tracking upstream. A live
+  Forgejo checkout measured on 2026-09-07 has the same oldest-entry shape.
+- Live Forgejo PR JSON measured on 2026-09-07 uses `merged: false` plus the
+  truthy zero-time string `mergedAt: 0001-01-01T00:00:00Z` for both open and
+  closed-unmerged PRs. It also rewrites a deleted merged branch's
+  `headRefName` to `refs/pull/<N>/head` while preserving `headRefOid`. The
+  adapter therefore uses the boolean merge fact and matches the bounded
+  repository-wide terminal page by exact local HEAD.
 - The comment corpus is this repository's 87 PR comments across PRs #7–#38,
   read through the API on 2026-09-06. The initial four-phrase grammar
   recognized 65. A loose grammar (approval words anywhere, completion verb
@@ -657,9 +676,9 @@ None.
   header-only comments from PRs #7, #10, and #11 (written before the
   discipline fixed its wording), 4 comments that are not handoffs (a
   metadata-only PR-body refresh, a post-merge note, two progress notes), and
-  the 2 guard refusals itemized in **Consequences**. All 17 mutation
-  negatives are unrecognized; all 18 positive fixtures, including a marker
-  case, are recognized.
+  the 2 guard refusals itemized in **Consequences**. All 23 mutation
+  negatives are unrecognized; all 20 first-line positive fixtures plus the
+  marker case are recognized.
 - The installed GitHub CLI exposes `gh pr reopen`; a closed-unmerged PR is
   therefore mutable without changing its head SHA and cannot support an
   immutable receipt.

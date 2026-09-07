@@ -2625,6 +2625,7 @@ def _compute_window_label(workspace: Path) -> dict:
 # --- turn indicator -----------------------------------------------------------
 
 _TURN_CACHE_TTL = 60
+_TURN_CACHE_VERSION = 2
 _TURN_ACTIVE_TTL = 30
 _TURN_LOCAL_TIMEOUT = 1.0
 _TURN_LOOKUP_TIMEOUT = 3.0
@@ -2674,6 +2675,7 @@ class _TurnWindow:
     role: str = 'unknown'
     role_source: str = 'none'
     eligible: bool = False
+    question: bool = False
     reason: str = ''
     clear_declaration: bool = False
 
@@ -2834,9 +2836,6 @@ def _derive_turn_role(workspace: Path, remote: str, branch: str,
                   'branch: Created from HEAD'):
         return 'implementer'
 
-    # The fetched-checkout reflog shape is currently proved only for GitHub.
-    if _turn_remote_host(remote) != 'github.com':
-        return None
     reviewer_sources = (
         f'branch: Created from origin/{branch}',
         f'branch: Created from refs/remotes/origin/{branch}',
@@ -2844,8 +2843,10 @@ def _derive_turn_role(workspace: Path, remote: str, branch: str,
     if oldest in reviewer_sources:
         return 'reviewer'
     lowered = oldest.lower()
-    if lowered.startswith('fetch ') and (
-            f'/{branch.lower()}' in lowered or 'refs/pull/' in lowered):
+    if (_turn_remote_host(remote) == 'github.com'
+            and lowered.startswith('fetch ')
+            and (f'/{branch.lower()}' in lowered
+                 or 'refs/pull/' in lowered)):
         return 'reviewer'
     return None
 
@@ -2922,10 +2923,16 @@ def _turn_approval_form(line: str) -> bool:
         return True
     if tail == ', confirming the standing approval at this head.':
         return True
-    return re.fullmatch(
+    nit_tail = (r'(?:,|\.|\s+with)\s+one\s+(?:non-blocking\s+)?nit'
+                r'(?:\s+below)?[.!]?')
+    if re.fullmatch(nit_tail, tail):
+        return True
+    head_tail = (
         r'\s+(?:at|on)\s+(?:exact\s+)?(?:rebased\s+)?(?:head\s+)?'
         r'[0-9a-f]{7,40}(?:\s+against\s+base\s+[0-9a-f]{7,40})?'
-        r'[.,;:!)]*', tail) is not None
+        r'[.,;:!)]*')
+    return (re.fullmatch(head_tail, tail) is not None
+            or re.fullmatch(head_tail + nit_tail, tail) is not None)
 
 
 def _turn_changes_form(line: str) -> bool:
@@ -3095,7 +3102,7 @@ def _cached_turn_pr(pair_key: tuple[str, str], heads: tuple[str, ...],
                     now: float) -> dict | None:
     """Resolve an exact merged receipt or a fresh mutable observation."""
     data = _read_turn_cache(pair_key)
-    if data is None:
+    if data is None or data.get('version') != _TURN_CACHE_VERSION:
         return None
     if len(heads) == 1:
         receipt = data.get('merged_receipt')
@@ -3127,9 +3134,10 @@ def _save_turn_pr(pair_key: tuple[str, str], heads: tuple[str, ...],
     """Persist one mutable result or one immutable merged receipt."""
     bounded = _bounded_turn_pr(result)
     old = _read_turn_cache(pair_key) or {}
-    data: dict = {'version': 1, 'pair': list(pair_key)}
+    data: dict = {'version': _TURN_CACHE_VERSION, 'pair': list(pair_key)}
     old_receipt = old.get('merged_receipt')
-    if (len(heads) == 1 and isinstance(old_receipt, dict)
+    if (old.get('version') == _TURN_CACHE_VERSION
+            and len(heads) == 1 and isinstance(old_receipt, dict)
             and old_receipt.get('head_sha') == heads[0]
             and old_receipt.get('state') == 'merged'):
         data['merged_receipt'] = old_receipt
@@ -3193,11 +3201,25 @@ def _run_turn_pr_cli(cli: str, repo_path: Path, args: list[str],
     return parsed if isinstance(parsed, (list, dict)) else None
 
 
+def _turn_has_merge_timestamp(value: object) -> bool:
+    """Accept a real merge time while rejecting Forgejo's year-one zero."""
+    if not value:
+        return False
+    try:
+        return datetime.fromisoformat(str(value)).year > 1
+    except (TypeError, ValueError):
+        return False
+
+
 def _turn_pr_state(pr: dict) -> str:
     """Normalize GitHub/Forgejo state fields."""
-    if pr.get('mergedAt') or pr.get('merged_at') or pr.get('merged'):
+    if pr.get('merged') is True:
         return 'merged'
     state = str(pr.get('state') or '').lower()
+    merged_at = pr.get('mergedAt') or pr.get('merged_at')
+    if (pr.get('merged') is not False
+            and _turn_has_merge_timestamp(merged_at)):
+        return 'merged'
     return state if state in ('open', 'closed', 'merged') else 'unknown'
 
 
@@ -3225,6 +3247,8 @@ def _lookup_turn_pr(repo_path: Path, pair_key: tuple[str, str],
     """Resolve live PR state conservatively for one remote/branch group."""
     cli = _turn_cli_for_remote(pair_key[0])
     fields = 'number,title,state,headRefOid,updatedAt,mergedAt'
+    if cli == 'fj':
+        fields += ',merged'
     open_prs = _run_turn_pr_cli(
         cli, repo_path,
         ['list', '--head', pair_key[1], '--state', 'open', '--limit', '2',
@@ -3239,12 +3263,17 @@ def _lookup_turn_pr(repo_path: Path, pair_key: tuple[str, str],
         if not number:
             return {'state': 'unknown', 'reason': 'invalid open PR',
                     '_cacheable': False}
+        view_fields = 'number,title,state,headRefOid,mergedAt,comments'
+        view_jq = ('{number,title,state,headRefOid,mergedAt,'
+                   'comments:(.comments[-1:] // [])}')
+        if cli == 'fj':
+            view_fields += ',merged'
+            view_jq = ('{number,title,state,headRefOid,mergedAt,merged,'
+                       'comments:(.comments[-1:] // [])}')
         viewed = _run_turn_pr_cli(
             cli, repo_path,
-            ['view', str(number), '--json',
-             'number,title,state,headRefOid,mergedAt,comments', '--jq',
-             '{number,title,state,headRefOid,mergedAt,'
-             'comments:(.comments[-1:] // [])}'], deadline)
+            ['view', str(number), '--json', view_fields, '--jq', view_jq],
+            deadline)
         if not isinstance(viewed, dict):
             return {'state': 'unknown', 'reason': 'lookup failed',
                     '_cacheable': False}
@@ -3261,9 +3290,12 @@ def _lookup_turn_pr(repo_path: Path, pair_key: tuple[str, str],
 
     if len(heads) != 1:
         return {'state': 'unknown', 'reason': 'mixed local HEADs'}
-    terminal_args = [
-        'list', '--head', pair_key[1], '--state', 'all', '--limit',
-        str(_TURN_TERMINAL_LIMIT), '--json', fields]
+    terminal_args = ['list']
+    if cli == 'gh':
+        terminal_args += ['--head', pair_key[1]]
+    terminal_args += [
+        '--state', 'all', '--limit', str(_TURN_TERMINAL_LIMIT),
+        '--json', fields]
     if cli == 'gh':
         terminal_args += ['--search', 'sort:updated-desc']
     terminal = _run_turn_pr_cli(
@@ -3271,16 +3303,18 @@ def _lookup_turn_pr(repo_path: Path, pair_key: tuple[str, str],
     if not isinstance(terminal, list):
         return {'state': 'unknown', 'reason': 'lookup failed',
                 '_cacheable': False}
-    if any(_turn_pr_state(pr) == 'open' for pr in terminal
-           if isinstance(pr, dict)):
-        return {'state': 'unknown', 'reason': 'PR changed during lookup',
-                '_cacheable': False}
-    for pr in terminal:
-        if not isinstance(pr, dict) or pr.get('headRefOid') != heads[0]:
-            continue
+    matching = [pr for pr in terminal
+                if isinstance(pr, dict) and pr.get('headRefOid') == heads[0]]
+    if cli == 'fj' and len(matching) > 1:
+        return {'state': 'unknown', 'reason': 'multiple PRs at local HEAD'}
+    for pr in matching:
         state = _turn_pr_state(pr)
+        if state == 'open':
+            return {'state': 'unknown', 'reason': 'PR changed during lookup',
+                    '_cacheable': False}
         if state not in ('closed', 'merged'):
-            continue
+            return {'state': 'unknown', 'reason': 'invalid terminal PR',
+                    '_cacheable': False}
         return {
             'state': state,
             'number': pr.get('number') or 0,
@@ -3413,8 +3447,7 @@ def _decide_turn(windows: list[_TurnWindow], pr: dict, now: float) -> dict:
             'reason': state,
         }
 
-    questions = [window for window in windows
-                 if getattr(window, 'question', False)]
+    questions = [window for window in windows if window.question]
     if questions:
         for window in questions:
             suffixes[window.window_id] = '?'

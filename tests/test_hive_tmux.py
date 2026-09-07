@@ -523,6 +523,10 @@ class TestTurnCommentClassifier:
         ('Reviewed the PR diff in `tmux/tmux.conf`. No blocking findings.',
          'approve'),
         ('No blocking issues.', 'approve'),
+        ('## Review — approve, one non-blocking nit', 'approve'),
+        ('Approved. One non-blocking nit below.', 'approve'),
+        ('LGTM with one nit', 'approve'),
+        ('Approved on exact head `abcdef1`, one non-blocking nit.', 'approve'),
         ('Changes still requested on exact head `abcdef1`',
          'changes requested'),
         ('## Re-review — no new delta', 'no new delta'),
@@ -556,6 +560,12 @@ class TestTurnCommentClassifier:
         'Reviewed conditionally; no blocking findings.',
         'Approved pending CI',
         'Review at abcdef1 — approved, but changes requested on docs',
+        'Approved, but do not merge',
+        'LGTM — hold the merge',
+        'approved (sarcasm)',
+        'Approved / LGTM on exact rebased head abcdef1, but see the nit below',
+        'Approved, one blocking nit',
+        'Approved, one nit but do not merge',
     ])
     def test_mutation_negatives_never_direct_a_turn(self, line):
         assert hive._classify_turn_comment(line) == 'unrecognized'
@@ -701,13 +711,13 @@ class TestTurnRoles:
                 tmp_path, 'git@github.com:acme/widget', 'feat/thing', 'main') \
                 == expected
 
-    def test_forgejo_fetched_shape_stays_unknown_until_proved(self, tmp_path):
+    def test_forgejo_fetched_shape_derives_reviewer(self, tmp_path):
         with patch.object(
                 hive, '_git_out',
                 return_value='branch: Created from origin/feat/thing'):
             assert hive._derive_turn_role(
                 tmp_path, 'ssh://forgejo/acme/widget', 'feat/thing', 'main') \
-                is None
+                == 'reviewer'
 
     @pytest.mark.parametrize(('remote', 'cli'), [
         ('git@github.com:acme/widget', 'gh'),
@@ -887,6 +897,24 @@ class TestTurnPrivateCache:
                 key, heads, {'state': 'merged', 'head_sha': heads[0]}, 80)
             assert hive._cached_turn_pr(key, heads, 100000)['state'] == 'merged'
 
+    def test_version_one_receipt_is_invalidated_before_forgejo_recheck(
+            self, tmp_path):
+        key = ('ssh://git@forgejo.home/acme/widget', 'feat/thing')
+        heads = ('a' * 40,)
+        with patch.object(hive, '_TURN_STATE_DIR', tmp_path / 'turn'):
+            path = hive._turn_cache_path(key)
+            hive._write_private_json(path, {
+                'version': 1, 'pair': list(key),
+                'merged_receipt': {
+                    'state': 'merged', 'head_sha': heads[0], 'number': 9}})
+            assert hive._cached_turn_pr(key, heads, 20) is None
+            hive._save_turn_pr(
+                key, heads, {'state': 'closed', 'head_sha': heads[0]}, 20)
+            assert hive._cached_turn_pr(key, heads, 21)['state'] == 'closed'
+            refreshed = json.loads(path.read_text())
+            assert refreshed['version'] == hive._TURN_CACHE_VERSION == 2
+            assert 'merged_receipt' not in refreshed
+
     def test_reopened_pr_replaces_closed_observation_at_same_head(self,
                                                                   tmp_path):
         key = ('git@github.com:acme/widget', 'feat/thing')
@@ -942,6 +970,24 @@ class TestTurnPrivateCache:
 
 
 class TestTurnPrLookup:
+    @pytest.mark.parametrize(('pr', 'expected'), [
+        ({'state': 'OPEN', 'merged': False,
+          'mergedAt': '0001-01-01T00:00:00Z'}, 'open'),
+        ({'state': 'CLOSED', 'merged': False,
+          'mergedAt': '0001-01-01T00:00:00Z'}, 'closed'),
+        ({'state': 'OPEN',
+          'mergedAt': '0001-01-01T00:00:00+00:00'}, 'open'),
+        ({'state': 'MERGED', 'merged': True,
+          'mergedAt': '0001-01-01T00:00:00Z'}, 'merged'),
+        ({'state': 'OPEN', 'mergedAt': None}, 'open'),
+        ({'state': 'MERGED',
+          'mergedAt': '2026-09-07T00:00:00Z'}, 'merged'),
+        ({'state': 'OPEN', 'mergedAt': 'not-a-time'}, 'open'),
+    ])
+    def test_pr_state_normalizes_real_github_and_forgejo_shapes(
+            self, pr, expected):
+        assert hive._turn_pr_state(pr) == expected
+
     def test_cli_timeout_and_oversized_json_fail_closed(self, tmp_path):
         with patch.object(
                 hive.subprocess, 'run',
@@ -968,6 +1014,65 @@ class TestTurnPrLookup:
                 ('a' * 40, 'b' * 40), time.monotonic() + 5)
         assert result['state'] == 'open'
         assert result['comment']['classification'] == 'completion'
+
+    def test_forgejo_zero_merge_time_open_pr_remains_open(self, tmp_path):
+        zero = '0001-01-01T00:00:00Z'
+        responses = [
+            [{'number': 1088, 'state': 'OPEN', 'merged': False,
+              'mergedAt': zero}],
+            {'number': 1088, 'state': 'OPEN', 'merged': False,
+             'mergedAt': zero, 'headRefOid': 'b' * 40, 'comments': []},
+        ]
+        with patch.object(
+                hive, '_run_turn_pr_cli', side_effect=responses) as run:
+            result = hive._lookup_turn_pr(
+                tmp_path, ('ssh://git@forgejo.home/infra/home-dc',
+                           'adr-0111-digitalstorm-node'),
+                ('a' * 40, 'b' * 40), time.monotonic() + 5)
+        assert result['state'] == 'open'
+        assert all(any('merged' in arg for arg in call.args[2])
+                   for call in run.call_args_list)
+
+    @pytest.mark.parametrize(('terminal', 'expected'), [
+        ({'number': 7, 'state': 'MERGED', 'merged': True,
+          'mergedAt': '2026-09-07T00:00:00Z',
+          'headRefName': 'refs/pull/7/head', 'headRefOid': 'wanted'},
+         'merged'),
+        ({'number': 9, 'state': 'CLOSED', 'merged': False,
+          'mergedAt': '0001-01-01T00:00:00Z',
+          'headRefName': 'refs/pull/9/head', 'headRefOid': 'wanted'},
+         'closed'),
+    ])
+    def test_forgejo_terminal_lookup_matches_sha_after_branch_deletion(
+            self, tmp_path, terminal, expected):
+        unrelated_open = {
+            'number': 1088, 'state': 'OPEN', 'merged': False,
+            'mergedAt': '0001-01-01T00:00:00Z', 'headRefOid': 'elsewhere'}
+        with patch.object(
+                hive, '_run_turn_pr_cli',
+                side_effect=[[], [unrelated_open, terminal]]) as run:
+            result = hive._lookup_turn_pr(
+                tmp_path, ('ssh://git@forgejo.home/acme/widget',
+                           'feat/deleted'),
+                ('wanted',), time.monotonic() + 5)
+        assert result['state'] == expected
+        terminal_args = run.call_args_list[1].args[2]
+        assert '--head' not in terminal_args
+        assert any('merged' in arg for arg in terminal_args)
+
+    def test_forgejo_multiple_prs_at_same_sha_is_unknown(self, tmp_path):
+        matches = [
+            {'number': number, 'state': 'MERGED', 'merged': True,
+             'headRefOid': 'wanted'}
+            for number in (7, 8)]
+        with patch.object(
+                hive, '_run_turn_pr_cli', side_effect=[[], matches]):
+            result = hive._lookup_turn_pr(
+                tmp_path, ('ssh://git@forgejo.home/acme/widget',
+                           'feat/deleted'),
+                ('wanted',), time.monotonic() + 5)
+        assert result == {
+            'state': 'unknown', 'reason': 'multiple PRs at local HEAD'}
 
     def test_multiple_open_prs_are_unknown(self, tmp_path):
         with patch.object(hive, '_run_turn_pr_cli', return_value=[{}, {}]):
@@ -1058,6 +1163,16 @@ class TestTurnBatonRule:
         assert decision['target'] == target
         assert decision['suffixes'][target] == glyph
         assert decision['verb'] == verb
+
+    def test_named_question_flag_defaults_off_and_outranks_comments(self):
+        windows = self._pair()
+        assert all(window.question is False for window in windows)
+        windows[0].question = True
+        decision = hive._decide_turn(
+            windows, {'state': 'open',
+                      'comment': {'classification': 'completion'}}, 100)
+        assert decision['target'] == '@1'
+        assert decision['suffixes'] == {'@1': '?', '@2': ''}
 
     @pytest.mark.parametrize('state', ['closed', 'merged'])
     def test_terminal_state_outranks_shape_and_comments(self, state):
