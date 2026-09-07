@@ -155,6 +155,10 @@ _pm_update() {
 }
 
 # _pm_install PKG — one package per call, so one failure stays one failure.
+# NEEDRESTART_SUSPEND: Ubuntu's needrestart hook would otherwise run its
+# full "scanning processes / kernel / microcode" report after every one of
+# these calls.  Nothing installed here is a service, so there is nothing for
+# it to find; the host's normal upgrades still run it.
 _pm_install() {
   if (( ! PRIV_OK )); then
     echo "  (no root or sudo: package manager skipped)"
@@ -162,7 +166,7 @@ _pm_install() {
   fi
   case "$FAMILY" in
     dnf) _priv dnf -y -q install "$1" ;;
-    apt) _priv env DEBIAN_FRONTEND=noninteractive \
+    apt) _priv env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 \
            apt-get -qq -y -o Dpkg::Use-Pty=0 install --no-install-recommends "$1" ;;
   esac
 }
