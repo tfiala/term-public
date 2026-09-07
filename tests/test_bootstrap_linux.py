@@ -96,6 +96,8 @@ for f in $FAKE_APT_FAIL; do
   fi
 done
 [ "$sub" = install ] || exit 0
+# needrestart's apt hook runs after every dpkg invocation unless suspended.
+if [ -z "${NEEDRESTART_SUSPEND:-}" ]; then mkdir -p "$FAKE_STATE"; : > "$FAKE_STATE/needrestart-ran"; fi
 for f in $FAKE_APT_NOOP; do [ "$f" = "$pkg" ] && exit 0; done
 stub() { printf '#!/bin/sh\nif [ "$1" = --version ]; then echo "0.74.3 (fake)"; fi\n' > "$FAKE_BIN/$1"; chmod 755 "$FAKE_BIN/$1"; }
 case "$pkg" in
@@ -285,6 +287,15 @@ class TestStatic:
         assert re.search(r"^_pm_update \|\| echo \"warning: package index refresh failed",
                          self.code, re.MULTILINE)
 
+    def test_apt_installs_suspend_needrestart(self):
+        """Ubuntu's needrestart hook prints a ~12-line scan after every dpkg
+        run; one package per call would repeat it per tool.  Only the
+        installs are affected — `apt-get update` never triggers the hook."""
+        assert re.search(
+            r'apt\) _priv env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 \\\n\s+apt-get -qq -y',
+            self.code)
+        assert "NEEDRESTART_SUSPEND" not in self.code[self.code.index("_pm_update() {"):self.code.index("_pm_install() {")]
+
     def test_one_package_per_install_call(self):
         """`_pm_install` takes exactly one argument, so one unavailable
         package cannot abort a transaction that carries the others."""
@@ -394,7 +405,7 @@ class TestDryRunPlans:
         assert "+ env DEBIAN_FRONTEND=noninteractive apt-get -qq update" in r.stdout
         for pkg in APT_PLAN:
             assert re.search(
-                rf"^\+ env DEBIAN_FRONTEND=noninteractive apt-get -qq -y .*install --no-install-recommends {re.escape(pkg)}$",
+                rf"^\+ env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 apt-get -qq -y .*install --no-install-recommends {re.escape(pkg)}$",
                 r.stdout, re.MULTILINE), pkg
         assert "dnf" not in r.stdout
         assert "==> EPEL" not in r.stdout
@@ -559,6 +570,14 @@ class TestRecovery:
         assert "bash-completion (apt" not in r.stdout
         # Everything the fake packages did produce is still reported installed.
         assert "git (apt: git)" in r.stdout
+
+    def test_needrestart_is_suspended_for_every_install(self, fake_system):
+        """The environment reaches apt-get itself, through sudo and env: the
+        fake records any install that ran without NEEDRESTART_SUSPEND."""
+        r = _real_run(fake_system, UBUNTU)
+        assert r.returncode == 0, r.stderr + r.stdout
+        assert sum(1 for l in r.log if l.startswith("apt-get") and " install " in l) >= 10
+        assert not (fake_system["state"] / "needrestart-ran").exists()
 
     def test_healthy_package_only_installs_pass_the_recheck(self, fake_system):
         """The other side of the same check: packages that do produce their

@@ -143,7 +143,9 @@ What the bootstrap does, and the order it does it in:
   next run rather than skipped as present.
 - **Never a distribution upgrade.** The script installs a tool set; it does
   not run `dnf upgrade` or `apt-get upgrade`, and a failed package-index
-  refresh is a warning, not a stop. A RHEL host whose subscription has
+  refresh is a warning, not a stop. On Ubuntu the `needrestart` post-install
+  scan is suspended for these installs (nothing here is a service), so the
+  one-package-per-call loop does not print its report seven times. A RHEL host whose subscription has
   lapsed still gets everything EPEL and its enabled repos provide (fzf,
   ripgrep, fd, bat, gh live in EPEL, which the script enables when
   missing), and the upstream fallback covers the rest — on RHEL 9 that is
