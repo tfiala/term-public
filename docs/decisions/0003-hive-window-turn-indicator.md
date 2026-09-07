@@ -201,15 +201,18 @@ Resolution proceeds in this order:
 3. Otherwise query the remote for at most two open PRs whose head ref is the
    branch. Exactly one is the group's open PR; two results means two or more
    and is unknown ("multiple open PRs"). If none exists and the group has one
-   shared local HEAD, inspect one count-bounded page (at most 30) of recent PRs
-   and match that HEAD to the PR head SHA. GitHub keeps the deleted head name,
-   so its terminal page remains filtered by branch. Forgejo rewrites a deleted
-   head to `refs/pull/<N>/head`, so its terminal page is repository-wide and
-   the exact head SHA is the predicate; more than one Forgejo PR at that SHA is
-   unknown rather than guessed. A merged match writes an immutable receipt; a
-   closed-unmerged match is only a mutable 60 s cache entry. With no match, a
-   short page proves none; a full page is unknown ("terminal history
-   truncated") because an older match may exist.
+   shared local HEAD, inspect one count-bounded page (at most 30) and match that
+   HEAD to the PR head SHA. GitHub keeps the deleted head name, so its terminal
+   page remains branch-filtered and ordered by update time. Forgejo rewrites a
+   deleted head to `refs/pull/<N>/head`, so its terminal page is repository-wide
+   and ordered by descending PR number; the exact head SHA is the predicate,
+   and more than one Forgejo PR at that SHA is unknown rather than guessed. A
+   recently merged old-numbered Forgejo PR can therefore fall outside the page
+   and resolve to `unknown`/"terminal history truncated" instead of `↩`; that
+   is the deliberate fail-closed bound. A merged match writes an immutable
+   receipt; a closed-unmerged match is only a mutable 60 s cache entry. With no
+   match, a short page proves none; a full page is unknown because an older
+   match may exist.
 4. A failed lookup, a producer-deadline cutoff, or mixed local HEADs after no
    open PR resolves to unknown. No stale mutable entry is a verdict.
 
@@ -691,6 +694,12 @@ None.
   agent windows in the current `term-public` session from one TTY-restricted
   process snapshot in 8.4 ms. Process arguments were reduced in memory to an
   agent kind and were not printed or stored.
+- The post-fix Forgejo producer check on 2026-09-07 resolved an open PR and
+  emitted the correct implementer handoff in 0.22 s. It exercised the singleton
+  rule because the reviewer checkout had already returned to the default
+  branch; a post-fix live two-window pair was therefore not observed. The pair
+  state machine remains covered by its two-window fixtures, and the earlier
+  live pass observed the two windows grouping on the same pair key.
 - The identity and storage facts in **Context** were read from
   `scripts/hive.py`: `_normalize_origin_url` (remote dedup),
   `_label_cache_key` (workspace path hash), `_default_branch` (reads
