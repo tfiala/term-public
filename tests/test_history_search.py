@@ -27,11 +27,14 @@ BOOTSTRAP = REPO_ROOT / "setup" / "bootstrap-macos.sh"
 FZF_KEYBINDING_PATHS = [
     "/opt/homebrew/opt/fzf/shell/key-bindings.bash",
     "/usr/local/opt/fzf/shell/key-bindings.bash",
-    "/usr/share/doc/fzf/examples/key-bindings.bash",
+    "/usr/share/fzf/shell/key-bindings.bash",           # RHEL/Fedora (EPEL)
+    "/usr/share/doc/fzf/examples/key-bindings.bash",    # Debian/Ubuntu
+    "$HOME/.fzf/shell/key-bindings.bash",               # upstream layout; bootstrap-linux fallback
 ]
 
 INSTALLED_FZF_KEYBINDINGS = next(
-    (p for p in FZF_KEYBINDING_PATHS if Path(p).is_file()), None)
+    (p for p in (os.path.expandvars(c) for c in FZF_KEYBINDING_PATHS)
+     if Path(p).is_file()), None)
 
 
 def _pty_session(home, keystrokes, timeout=15):
@@ -119,7 +122,8 @@ class TestFzfKeybindings:
         text = BASHRC.read_text()
         m = re.search(r"for _tp_fzf in \\\n(.*?); do", text, re.S)
         assert m, "bashrc no longer has the _tp_fzf candidate loop"
-        assert re.findall(r"(/\S+)", m.group(1)) == FZF_KEYBINDING_PATHS
+        candidates = [tok.strip('"') for tok in m.group(1).replace("\\\n", " ").split()]
+        assert candidates == FZF_KEYBINDING_PATHS
 
     def test_source_is_guarded_and_first_match_wins(self):
         text = BASHRC.read_text()

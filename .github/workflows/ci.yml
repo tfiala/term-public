@@ -21,3 +21,30 @@ jobs:
           pip install -r requirements-dev.txt
       - name: Run tests
         run: pytest
+
+  # The Linux bootstrap is exercised for real: package installs, the
+  # upstream-release fallbacks (starship on both, eza where the distribution
+  # lacks it), setup.sh's terminfo install, and a login shell through the
+  # linked config.  Ubuntu runs natively; the RHEL 9 family runs in an
+  # AlmaLinux 9 container as root (no sudo present, the script handles both).
+  bootstrap-ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Dry run
+        run: setup/bootstrap-linux.sh --dry-run
+      - name: Bootstrap
+        run: setup/bootstrap-linux.sh
+      - name: Link config
+        run: ./setup.sh
+      - name: Smoke test
+        run: tests/smoke/bootstrap-linux.sh
+
+  bootstrap-rhel9:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Bootstrap, link, and smoke test in an AlmaLinux 9 container
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo almalinux:9 bash -c \
+            'setup/bootstrap-linux.sh --dry-run && setup/bootstrap-linux.sh && ./setup.sh && tests/smoke/bootstrap-linux.sh'

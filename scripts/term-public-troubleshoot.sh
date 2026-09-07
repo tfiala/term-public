@@ -11,19 +11,36 @@ readlink ~/.inputrc 2>/dev/null || echo "~/.inputrc not symlink"
 readlink "${XDG_CONFIG_HOME:-$HOME/.config}/starship.toml" 2>/dev/null \
   || echo "starship.toml not symlink"
 
+case "$OSTYPE" in
+  darwin*) bootstrap=setup/bootstrap-macos.sh ;;
+  *) bootstrap=setup/bootstrap-linux.sh ;;
+esac
+
 echo '--- login shell registration ---'
-for b in /opt/homebrew/bin/bash /usr/local/bin/bash; do
-  if [[ -x "$b" ]]; then
-    echo "$b: $("$b" --version | head -1)"
-    grep -qx "$b" /etc/shells && echo "$b in /etc/shells" \
-      || echo "$b NOT in /etc/shells (run setup/bootstrap-macos.sh)"
-  fi
-done
-dscl . -read "/Users/$USER" UserShell 2>/dev/null || true
+case "$OSTYPE" in
+  darwin*)
+    for b in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+      if [[ -x "$b" ]]; then
+        echo "$b: $("$b" --version | head -1)"
+        grep -qx "$b" /etc/shells && echo "$b in /etc/shells" \
+          || echo "$b NOT in /etc/shells (run $bootstrap)"
+      fi
+    done
+    dscl . -read "/Users/$USER" UserShell 2>/dev/null || true
+    ;;
+  *)
+    for b in /usr/bin/bash /usr/local/bin/bash; do
+      [[ -x "$b" ]] && echo "$b: $("$b" --version | head -1)"
+    done
+    echo "login shell: $(getent passwd "${USER:-$(id -un)}" | cut -d: -f7)"
+    infocmp xterm-ghostty >/dev/null 2>&1 && echo "xterm-ghostty terminfo: ok" \
+      || echo "xterm-ghostty terminfo: missing (run ./setup.sh)"
+    ;;
+esac
 
 echo '--- prompt deps ---'
 command -v bash
-command -v starship || echo "starship missing (run setup/bootstrap-macos.sh)"
+command -v starship || echo "starship missing (run $bootstrap)"
 command -v git
 command -v python3
 command -v ghostty || true

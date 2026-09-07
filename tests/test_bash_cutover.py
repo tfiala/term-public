@@ -21,11 +21,14 @@ STARSHIP_TOML = REPO_ROOT / "starship" / "starship.toml"
 BOOTSTRAP = REPO_ROOT / "setup" / "bootstrap-macos.sh"
 HIVE_PY = REPO_ROOT / "scripts" / "hive.py"
 
-HOMEBREW_BASH_PATHS = {"/opt/homebrew/bin/bash", "/usr/local/bin/bash"}
+# Every bash 5 tmux may pin: the Linux system bash (a path macOS does not
+# have) and the two Homebrew prefixes.  macOS /bin/bash 3.2 is never one.
+BASH5_PATHS = {"/usr/bin/bash", "/opt/homebrew/bin/bash", "/usr/local/bin/bash"}
 
 
 class TestTmuxDefaultShell:
-    """tmux panes must run Homebrew bash, never /bin/bash 3.2."""
+    """tmux panes must run bash 5 (Homebrew on macOS, the system bash on
+    Linux), never macOS /bin/bash 3.2."""
 
     def _default_shell_lines(self):
         text = TMUX_CONF.read_text()
@@ -44,12 +47,19 @@ class TestTmuxDefaultShell:
             assert m, f"default-shell must stay guarded by if-shell: {line!r}"
             assert m.group(1) == m.group(2), f"guard/target mismatch: {line!r}"
             seen.add(m.group(2))
-        assert seen == HOMEBREW_BASH_PATHS
+        assert seen == BASH5_PATHS
 
     def test_native_prefix_wins(self):
         """/opt/homebrew must come last so it wins when both exist."""
         lines = self._default_shell_lines()
         assert "/opt/homebrew/bin/bash" in lines[-1]
+
+    def test_linux_system_bash_comes_first(self):
+        """/usr/bin/bash is the Linux baseline; a hand-built
+        /usr/local/bin/bash (later line) overrides it."""
+        lines = self._default_shell_lines()
+        assert "/usr/bin/bash" in lines[0]
+        assert "/usr/local/bin/bash" in lines[1]
 
     def test_never_system_bash(self):
         text = TMUX_CONF.read_text()
@@ -302,21 +312,109 @@ class TestHistory:
         assert "FROM_BAK_PC" in r.stdout
 
 
+def _install_fake_home(tmp_path):
+    """Real bash config linked into a fake home, with a counting env.local
+    so duplicate initialization is observable."""
+    repo = tmp_path / "repo"
+    (repo / "bash").mkdir(parents=True)
+    (repo / "local").mkdir()
+    (repo / "bash" / "bashrc").write_text(BASHRC.read_text())
+    (repo / "bash" / "bash_profile").write_text(BASH_PROFILE.read_text())
+    (repo / "local" / "env.local").write_text(
+        "export ENV_LOCAL_COUNT=$(( ${ENV_LOCAL_COUNT:-0} + 1 ))\n")
+    (tmp_path / ".bashrc").symlink_to(repo / "bash" / "bashrc")
+    (tmp_path / ".bash_profile").symlink_to(repo / "bash" / "bash_profile")
+
+
+def _run_norc(snippet, home):
+    return subprocess.run(
+        ["bash", "--norc", "-c", snippet],
+        capture_output=True,
+        text=True,
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+             "HOME": str(home), "TERM": "xterm-256color"},
+        timeout=15,
+    )
+
+
+# Ubuntu's stock ~/.profile: re-sources ~/.bashrc under bash and puts the
+# user's bin directories on PATH.  The marker export is added for the tests.
+UBUNTU_STOCK_PROFILE = """\
+if [ -n "$BASH_VERSION" ]; then
+    if [ -f "$HOME/.bashrc" ]; then
+        . "$HOME/.bashrc"
+    fi
+fi
+if [ -d "$HOME/.local/bin" ] ; then
+    PATH="$HOME/.local/bin:$PATH"
+fi
+export FROM_PROFILE=1
+"""
+
+
+class TestProfileFallback:
+    """bash reads the first of ~/.bash_profile, ~/.bash_login, ~/.profile.
+    Linking ~/.bash_profile shadows a ~/.profile that was the account's
+    login file (Ubuntu's default shape); bash_profile restores exactly
+    bash's own rule."""
+
+    def test_profile_sourced_when_it_was_the_login_file(self, tmp_path):
+        _install_fake_home(tmp_path)
+        (tmp_path / ".local" / "bin").mkdir(parents=True)
+        (tmp_path / ".profile").write_text(UBUNTU_STOCK_PROFILE)
+        r = _run_norc(
+            'source "$HOME/.bash_profile"; '
+            'echo "COUNT=$ENV_LOCAL_COUNT PROFILE=${FROM_PROFILE:-unset}"; '
+            'echo "PATH=$PATH"',
+            tmp_path,
+        )
+        assert r.returncode == 0, r.stderr
+        # The stock profile's `. ~/.bashrc` is absorbed: one init, not two.
+        assert "COUNT=1 PROFILE=1" in r.stdout
+        assert f"{tmp_path}/.local/bin" in r.stdout
+
+    def test_profile_ignored_when_a_prior_bash_profile_existed(self, tmp_path):
+        """bash never read ~/.profile on this account; neither do we."""
+        _install_fake_home(tmp_path)
+        (tmp_path / ".bash_profile.bak").write_text("export FROM_BAK=1\n")
+        (tmp_path / ".profile").write_text("export FROM_PROFILE=1\n")
+        r = _run_norc(
+            'source "$HOME/.bash_profile"; '
+            'echo "BAK=${FROM_BAK:-unset} PROFILE=${FROM_PROFILE:-unset}"',
+            tmp_path,
+        )
+        assert r.returncode == 0, r.stderr
+        assert "BAK=1 PROFILE=unset" in r.stdout
+
+    def test_profile_ignored_when_bash_login_exists(self, tmp_path):
+        _install_fake_home(tmp_path)
+        (tmp_path / ".bash_login").write_text("export FROM_LOGIN=1\n")
+        (tmp_path / ".profile").write_text("export FROM_PROFILE=1\n")
+        r = _run_norc(
+            'source "$HOME/.bash_profile"; echo "PROFILE=${FROM_PROFILE:-unset}"',
+            tmp_path,
+        )
+        assert r.returncode == 0, r.stderr
+        assert "PROFILE=unset" in r.stdout
+
+    def test_guards_cleared_after_profile(self, tmp_path):
+        _install_fake_home(tmp_path)
+        (tmp_path / ".profile").write_text(UBUNTU_STOCK_PROFILE)
+        r = _run_norc(
+            'source "$HOME/.bash_profile"; '
+            'echo "RC=${_TERM_PUBLIC_BASHRC_ACTIVE:-unset} '
+            'PROFILE=${_TERM_PUBLIC_PROFILE_ACTIVE:-unset}"',
+            tmp_path,
+        )
+        assert r.returncode == 0, r.stderr
+        assert "RC=unset PROFILE=unset" in r.stdout
+
+
 class TestStartupReentry:
     """Re-entry guards suppress duplicate init but permit manual reloads."""
 
     def _install_fake_home(self, tmp_path):
-        """Real bash config linked into a fake home, with a counting
-        env.local so duplicate initialization is observable."""
-        repo = tmp_path / "repo"
-        (repo / "bash").mkdir(parents=True)
-        (repo / "local").mkdir()
-        (repo / "bash" / "bashrc").write_text(BASHRC.read_text())
-        (repo / "bash" / "bash_profile").write_text(BASH_PROFILE.read_text())
-        (repo / "local" / "env.local").write_text(
-            "export ENV_LOCAL_COUNT=$(( ${ENV_LOCAL_COUNT:-0} + 1 ))\n")
-        (tmp_path / ".bashrc").symlink_to(repo / "bash" / "bashrc")
-        (tmp_path / ".bash_profile").symlink_to(repo / "bash" / "bash_profile")
+        _install_fake_home(tmp_path)
 
     def _run(self, snippet, home):
         return subprocess.run(

@@ -104,11 +104,14 @@ _term_public_history_sync() {
 }
 PROMPT_COMMAND="_term_public_history_sync${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 
-# --- Completion (Homebrew bash-completion@2) ----------------------------------
+# --- Completion (bash-completion 2.x) -----------------------------------------
+# Homebrew prefixes first, then the distribution paths (RHEL and Debian both
+# ship the profile.d hook; the bare script is the last resort).
 for _tp_bc in \
     /opt/homebrew/etc/profile.d/bash_completion.sh \
     /usr/local/etc/profile.d/bash_completion.sh \
-    /etc/profile.d/bash_completion.sh; do
+    /etc/profile.d/bash_completion.sh \
+    /usr/share/bash-completion/bash_completion; do
   if [[ -r "$_tp_bc" ]]; then
     source "$_tp_bc"
     break
@@ -143,10 +146,15 @@ for _tp_map in vi-insert vi-command; do
 done
 unset _tp_map
 
+# Homebrew prefixes, then the RHEL/Fedora (EPEL) package path, the Debian
+# and Ubuntu package path, and the ~/.fzf layout upstream's installer and
+# setup/bootstrap-linux.sh's release fallback both use.
 for _tp_fzf in \
     /opt/homebrew/opt/fzf/shell/key-bindings.bash \
     /usr/local/opt/fzf/shell/key-bindings.bash \
-    /usr/share/doc/fzf/examples/key-bindings.bash; do
+    /usr/share/fzf/shell/key-bindings.bash \
+    /usr/share/doc/fzf/examples/key-bindings.bash \
+    "$HOME/.fzf/shell/key-bindings.bash"; do
   if [[ -r "$_tp_fzf" ]]; then
     source "$_tp_fzf"
     break
@@ -197,8 +205,13 @@ fi
 if command -v starship >/dev/null 2>&1; then
   eval "$(starship init bash)"
 else
+  case "$OSTYPE" in
+    darwin*) _tp_bootstrap=bootstrap-macos.sh ;;
+    *) _tp_bootstrap=bootstrap-linux.sh ;;
+  esac
   printf 'term-public: missing starship; run %s\n' \
-    "$TERM_PUBLIC_ROOT/setup/bootstrap-macos.sh" >&2
+    "$TERM_PUBLIC_ROOT/setup/$_tp_bootstrap" >&2
+  unset _tp_bootstrap
   PS1='\w \$ '
 fi
 

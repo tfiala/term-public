@@ -372,7 +372,9 @@ remove_stale_link "$HOME/.zshrc" "zsh/zshrc"
 remove_stale_link "$HOME/.p10k.zsh" "p10k.zsh"
 
 # Install Ghostty terminfo into ~/.terminfo so shells and other programs
-# can find xterm-ghostty without TERMINFO being set.
+# can find xterm-ghostty without TERMINFO being set.  The app bundle is the
+# source on macOS; elsewhere (a Linux host reached over SSH from a Ghostty
+# window) the vendored ghostty/xterm-ghostty.terminfo is.
 if command -v infocmp >/dev/null 2>&1 && command -v tic >/dev/null 2>&1; then
   if ! TERMINFO= infocmp xterm-ghostty >/dev/null 2>&1; then
     _ghostty_ti="/Applications/Ghostty.app/Contents/Resources/terminfo"
@@ -381,6 +383,8 @@ if command -v infocmp >/dev/null 2>&1 && command -v tic >/dev/null 2>&1; then
           | TERMINFO= tic -x - 2>/dev/null; then
         echo "Installed xterm-ghostty terminfo to ~/.terminfo"
       fi
+    elif TERMINFO= tic -x "$ROOT_DIR/ghostty/xterm-ghostty.terminfo" 2>/dev/null; then
+      echo "Installed xterm-ghostty terminfo to ~/.terminfo (from ghostty/xterm-ghostty.terminfo)"
     fi
   fi
 fi
