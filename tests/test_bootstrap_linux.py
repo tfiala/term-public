@@ -52,27 +52,18 @@ DRY_RUN_TOOLS = ("bash", "uname", "id", "basename", "grep", "cut", "head", "cat"
 REAL_MODE_TOOLS = DRY_RUN_TOOLS + (
     "env", "awk", "mkdir", "rm", "mktemp", "find", "tar", "gzip", "install", "ln", "chmod")
 
-# Packages the plan must request when the sandbox PATH hides every tool.
-# bash-completion is absent here on purpose: the script detects it by file,
-# not by command, so its line depends on the host (see
-# test_bash_completion_follows_the_host_file).
+# Packages the plan must request when the sandbox PATH hides every tool and
+# TERM_PUBLIC_SYSROOT points the file probes at an empty sandbox.
 DNF_PLAN = ("tmux", "git", "jq", "fzf", "ripgrep", "fd-find", "bat", "eza",
-            "gh", "starship", "python3")
+            "gh", "starship", "python3", "bash-completion")
 APT_PLAN = ("git", "tmux", "fzf", "ripgrep", "fd-find", "bat", "eza", "gh",
-            "starship", "ncurses-term", "python3")
-BASH_COMPLETION_FILE = Path("/usr/share/bash-completion/bash_completion")
+            "starship", "ncurses-term", "python3", "bash-completion")
+BASH_COMPLETION_FILE = "usr/share/bash-completion/bash_completion"  # under the sysroot
 UPSTREAM_FALLBACKS = {
     "starship": "starship/starship", "ripgrep": "BurntSushi/ripgrep",
     "fd": "sharkdp/fd", "bat": "sharkdp/bat", "eza": "eza-community/eza",
     "gh": "cli/cli", "jq": "jqlang/jq", "fzf": "junegunn/fzf",
 }
-# System locations where a distribution package puts fzf's bindings.  A
-# host that has one cannot exercise the "binary without bindings" paths.
-SYSTEM_FZF_BINDINGS = (
-    Path("/usr/share/fzf/shell/key-bindings.bash"),
-    Path("/usr/share/doc/fzf/examples/key-bindings.bash"),
-)
-
 MACHINE = {"arm64": "aarch64"}.get(platform.machine(), platform.machine())
 STARSHIP_TARGET = {"x86_64": "x86_64-unknown-linux-gnu",
                    "aarch64": "aarch64-unknown-linux-musl"}.get(MACHINE)
@@ -83,8 +74,11 @@ STUB = '#!/bin/sh\nif [ "$1" = --version ]; then echo "%s (fake)"; fi\n'
 FAKE_SUDO = '#!/bin/sh\nexec "$@"\n'
 
 # Logs every call; fails for the subcommands or subcommand:package tokens in
-# $FAKE_APT_FAIL; a successful `install PKG` drops a stub command named for
-# the package's binary into $FAKE_BIN, the way the real package would.
+# $FAKE_APT_FAIL; succeeds while producing nothing for the packages in
+# $FAKE_APT_NOOP (a broken package); otherwise a successful `install PKG`
+# produces what the real package would: a stub command in $FAKE_BIN, the
+# bash-completion script under the sysroot, or a terminfo marker the stub
+# infocmp honours.
 FAKE_APT_GET = r'''#!/bin/sh
 echo "apt-get $*" >> "$FAKE_LOG"
 sub=""; pkg=""
@@ -101,19 +95,21 @@ for f in $FAKE_APT_FAIL; do
     exit 100
   fi
 done
-if [ "$sub" = install ]; then
-  case "$pkg" in
-    ripgrep) cmd=rg ;;
-    fd-find) cmd=fd ;;
-    ncurses-bin) cmd=tic ;;
-    bash-completion|ncurses-term) cmd="" ;;
-    *) cmd="$pkg" ;;
-  esac
-  if [ -n "$cmd" ]; then
-    printf '#!/bin/sh\nif [ "$1" = --version ]; then echo "0.74.3 (fake)"; fi\n' > "$FAKE_BIN/$cmd"
-    chmod 755 "$FAKE_BIN/$cmd"
-  fi
-fi
+[ "$sub" = install ] || exit 0
+for f in $FAKE_APT_NOOP; do [ "$f" = "$pkg" ] && exit 0; done
+stub() { printf '#!/bin/sh\nif [ "$1" = --version ]; then echo "0.74.3 (fake)"; fi\n' > "$FAKE_BIN/$1"; chmod 755 "$FAKE_BIN/$1"; }
+case "$pkg" in
+  ripgrep) stub rg ;;
+  fd-find) stub fd ;;
+  ncurses-bin)
+    stub tic
+    printf '#!/bin/sh\n[ -e "$FAKE_STATE/terminfo-$1" ]\n' > "$FAKE_BIN/infocmp"; chmod 755 "$FAKE_BIN/infocmp" ;;
+  ncurses-term) mkdir -p "$FAKE_STATE"; : > "$FAKE_STATE/terminfo-tmux-256color" ;;
+  bash-completion)
+    mkdir -p "$TERM_PUBLIC_SYSROOT/usr/share/bash-completion"
+    : > "$TERM_PUBLIC_SYSROOT/usr/share/bash-completion/bash_completion" ;;
+  *) stub "$pkg" ;;
+esac
 exit 0
 '''
 
@@ -182,10 +178,16 @@ def _make_sandbox(tmp_path, tools, *, sudo):
         _write_exec(bindir / "sudo", FAKE_SUDO)
     home = tmp_path / "home"
     home.mkdir()
+    # The script's absolute system-path probes are pointed at this empty
+    # sysroot, so a host package (bash-completion, fzf's bindings) can never
+    # satisfy a check the test expects to fail.
+    sysroot = tmp_path / "sysroot"
+    sysroot.mkdir()
     # Upstream binaries go to a temp --bin-dir: the script prepends BIN_DIR
     # to PATH for its own presence checks, so a real system directory there
     # would let host binaries leak into the plan.
-    return {"bin": bindir, "home": home, "tmp": tmp_path, "bin_out": tmp_path / "bin-out"}
+    return {"bin": bindir, "home": home, "tmp": tmp_path, "sysroot": sysroot,
+            "bin_out": tmp_path / "bin-out", "state": tmp_path / "state"}
 
 
 @pytest.fixture
@@ -220,6 +222,8 @@ def _env(sb, os_release, **extra):
         "SHELL": "/bin/bash",
         "TMPDIR": str(sb["tmp"]),
         "TERM_PUBLIC_OS_RELEASE": str(osr),
+        "TERM_PUBLIC_SYSROOT": str(sb["sysroot"]),
+        "FAKE_STATE": str(sb["state"]),
     }
     env.update(extra)
     return env
@@ -235,13 +239,13 @@ def _run(sb, os_release, *args, bin_dir=True, **extra):
     )
 
 
-def _real_run(sb, os_release, *args, apt_fail="", curl_fail="", bin_dir=True):
+def _real_run(sb, os_release, *args, apt_fail="", apt_noop="", curl_fail="", bin_dir=True):
     """A real-mode run against the fake system.  The call log is truncated
     first so each run's assertions see only its own calls."""
     sb["log"].write_text("")
     r = _run(sb, os_release, *args, bin_dir=bin_dir,
              FAKE_LOG=str(sb["log"]), FAKE_BIN=str(sb["bin"]),
-             FAKE_APT_FAIL=apt_fail, FAKE_CURL_FAIL=curl_fail)
+             FAKE_APT_FAIL=apt_fail, FAKE_APT_NOOP=apt_noop, FAKE_CURL_FAIL=curl_fail)
     r.log = sb["log"].read_text().splitlines()
     return r
 
@@ -316,11 +320,19 @@ class TestStatic:
         as 'bindings present' is one bash/bashrc will actually source."""
         m = re.search(r"FZF_BINDINGS_PATHS=\(\n(.*?)\n\)", self.code, re.S)
         assert m, "FZF_BINDINGS_PATHS array missing"
-        bootstrap_paths = [tok.strip().strip('"') for tok in m.group(1).splitlines()]
+        bootstrap_paths = [tok.strip().strip('"').replace("$SYSROOT", "")
+                           for tok in m.group(1).splitlines()]
         assert bootstrap_paths, "FZF_BINDINGS_PATHS is empty"
         bashrc_text = BASHRC.read_text()
         for p in bootstrap_paths:
             assert p in bashrc_text, f"{p} accepted by bootstrap but not probed by bashrc"
+
+    def test_every_tool_is_rechecked_after_package_manager_success(self):
+        """No `manual == -` short-circuit before the post-install check."""
+        body = self.code[self.code.index("_tool() {"):]
+        body = body[:body.index("\n}\n")]
+        assert '[[ "$manual" == - ]] || _present' not in body
+        assert "still not detected" in body
 
 
 class TestDryRunPlans:
@@ -387,20 +399,21 @@ class TestDryRunPlans:
         assert "dnf" not in r.stdout
         assert "==> EPEL" not in r.stdout
 
-    @pytest.mark.parametrize("os_release,install_line", [
-        (RHEL, "+ dnf -y -q install bash-completion\n"),
-        (UBUNTU, "install --no-install-recommends bash-completion\n"),
-    ])
-    def test_bash_completion_follows_the_host_file(self, sandbox, os_release, install_line):
+    def test_file_probe_reads_the_package_script(self, sandbox):
         """bash-completion has no command to probe, so presence is the
-        package's script on disk — which the sandbox PATH cannot hide."""
-        r = _run(sandbox, os_release, "--dry-run")
+        package's script on disk (under the sysroot in tests)."""
+        script = sandbox["sysroot"] / BASH_COMPLETION_FILE
+        script.parent.mkdir(parents=True)
+        script.touch()
+        r = _run(sandbox, RHEL, "--dry-run")
         assert r.returncode == 0, r.stderr
-        if BASH_COMPLETION_FILE.is_file():
-            assert install_line not in r.stdout
-            assert re.search(r"^  already present: .*\bbash-completion\b", r.stdout, re.MULTILINE)
-        else:
-            assert install_line in r.stdout
+        assert "+ dnf -y -q install bash-completion\n" not in r.stdout
+        assert re.search(r"^  already present: .*\bbash-completion\b", r.stdout, re.MULTILINE)
+
+    def test_dash_prefixed_bin_dir_is_still_expressible(self, sandbox):
+        r = _run(sandbox, RHEL, "--dry-run", "--bin-dir", "./-odd", bin_dir=False)
+        assert r.returncode == 0, r.stderr
+        assert "+ install -m 0755 <tmp>/starship ./-odd/starship\n" in r.stdout
 
     def test_debian_takes_the_apt_path(self, sandbox):
         r = _run(sandbox, DEBIAN, "--dry-run")
@@ -417,6 +430,8 @@ class TestDryRunPlans:
         _run(sandbox, UBUNTU, "--dry-run")
         _run(sandbox, RHEL, "--dry-run")
         assert list(sandbox["home"].iterdir()) == []
+        assert list(sandbox["sysroot"].iterdir()) == []
+        assert not sandbox["bin_out"].exists()
 
     def test_dry_run_without_sudo_plans_the_unprivileged_mode(self, sandbox_nosudo):
         """No sudo on PATH: the plan skips the package manager, sends the
@@ -442,7 +457,7 @@ class TestDryRunPlans:
         r = _run(sandbox, RHEL, "--frobnicate")
         assert r.returncode == 2
         assert "unknown argument" in r.stderr
-        r = _run(sandbox, RHEL, "--bin-dir")
+        r = _run(sandbox, RHEL, "--bin-dir", bin_dir=False)
         assert r.returncode == 2
 
 
@@ -486,8 +501,6 @@ class TestRecovery:
             assert _is_exec(fake_system["bin_out"] / binary), binary
         assert "Bootstrap complete" in r.stdout
 
-    @pytest.mark.skipif(any(p.is_file() for p in SYSTEM_FZF_BINDINGS),
-                        reason="a system fzf package's bindings would satisfy the check")
     def test_fzf_partial_install_is_repaired_on_rerun(self, fake_system):
         """The review reproduction: a bare fzf binary with no shell bindings
         (an interrupted earlier run, or a hand-installed binary) must not be
@@ -521,8 +534,6 @@ class TestRecovery:
         assert not any("fzf" in l for l in r3.log)
         assert re.search(r"^  already present: .*\bfzf\b", r3.stdout, re.MULTILINE)
 
-    @pytest.mark.skipif(any(p.is_file() for p in SYSTEM_FZF_BINDINGS),
-                        reason="a system fzf package's bindings would satisfy the check")
     def test_package_manager_success_that_leaves_fzf_incomplete_is_repaired(self, fake_system):
         """apt 'installs' fzf but ships no bindings (or reports an existing
         bare binary as installed): the post-install check catches it and the
@@ -534,6 +545,48 @@ class TestRecovery:
         assert (fake_system["home"] / ".fzf" / "shell" / "key-bindings.bash").is_file()
         assert not any("fzf-" in l and l.endswith(".tar.gz") for l in r.log), \
             "the binary apt installed must be kept, only the bindings fetched"
+
+    def test_package_only_false_success_is_reported(self, fake_system):
+        """A package that reports success without producing the tool (a
+        broken package, a wrong package name) must land in NOT installed,
+        never be reported as installed, and fail the run."""
+        r = _real_run(fake_system, UBUNTU, apt_noop="ncurses-term bash-completion")
+        assert r.returncode == 1
+        assert "apt reported ncurses-term installed but tmux-terminfo is still not detected" in r.stderr
+        assert "apt reported bash-completion installed but bash-completion is still not detected" in r.stderr
+        assert re.search(r"^NOT installed: tmux-terminfo bash-completion$", r.stderr, re.MULTILINE)
+        assert "tmux-terminfo (apt" not in r.stdout
+        assert "bash-completion (apt" not in r.stdout
+        # Everything the fake packages did produce is still reported installed.
+        assert "git (apt: git)" in r.stdout
+
+    def test_healthy_package_only_installs_pass_the_recheck(self, fake_system):
+        """The other side of the same check: packages that do produce their
+        artifact are recognised, so the re-check adds no false failures."""
+        r = _real_run(fake_system, UBUNTU)
+        assert r.returncode == 0, r.stderr + r.stdout
+        for line in ("tmux-terminfo (apt: ncurses-term)", "bash-completion (apt: bash-completion)",
+                     "ncurses (apt: ncurses-bin)"):
+            assert line in r.stdout, line
+
+    @pytest.mark.parametrize("argv", [
+        ["--bin-dir", "--dry-run"],
+        ["--dry-run", "--bin-dir", "-n"],
+        ["--bin-dir"],
+        ["--bin-dir="],
+        ["--bin-dir=--dry-run"],
+    ])
+    def test_bin_dir_cannot_swallow_a_flag(self, fake_system, argv):
+        """`--bin-dir --dry-run` must be an argument error, not a real run
+        into a directory called --dry-run: nothing privileged or networked
+        may run and nothing may be written."""
+        r = _real_run(fake_system, UBUNTU, *argv, bin_dir=False)
+        assert r.returncode == 2
+        assert "--bin-dir needs a directory operand" in r.stderr
+        assert r.log == []
+        assert list(fake_system["home"].iterdir()) == []
+        assert not fake_system["bin_out"].exists()
+        assert not (fake_system["tmp"] / "--dry-run").exists()
 
     def test_without_root_or_sudo_upstream_releases_go_to_home_bin(self, tmp_path):
         """The documented unprivileged mode: no package-manager calls at

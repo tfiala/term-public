@@ -54,9 +54,20 @@ while (( $# > 0 )); do
   case "$1" in
     --dry-run|-n) DRY_RUN=1 ;;
     --bin-dir)
-      [[ $# -ge 2 ]] || { echo "bootstrap-linux: --bin-dir needs a directory" >&2; exit 2; }
+      # A missing, empty or option-looking operand is an error, never a
+      # directory: otherwise `--bin-dir --dry-run` would swallow the safety
+      # flag and enter real mode.  Spell a dash-prefixed directory ./-name.
+      if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
+        echo "bootstrap-linux: --bin-dir needs a directory operand (got '${2-}')" >&2
+        exit 2
+      fi
       BIN_DIR="$2"; shift ;;
-    --bin-dir=*) BIN_DIR="${1#--bin-dir=}" ;;
+    --bin-dir=*)
+      BIN_DIR="${1#--bin-dir=}"
+      if [[ -z "$BIN_DIR" || "$BIN_DIR" == -* ]]; then
+        echo "bootstrap-linux: --bin-dir needs a directory operand (got '$BIN_DIR')" >&2
+        exit 2
+      fi ;;
     -h|--help) usage; exit 0 ;;
     *) echo "bootstrap-linux: unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -88,6 +99,9 @@ esac
 
 ARCH="$(uname -m)"
 case "$ARCH" in arm64) ARCH=aarch64 ;; esac   # macOS spelling, for dry runs
+# TERM_PUBLIC_SYSROOT prefixes the absolute system paths this script probes
+# (the tests point it at a sandbox); empty on a real host.
+SYSROOT="${TERM_PUBLIC_SYSROOT:-}"
 USER_NAME="${USER:-$(id -un)}"
 
 # Privilege: root, sudo, or neither.  Neither is a supported mode — the
@@ -346,8 +360,8 @@ _manual_jq() {
 
 # The Linux locations bash/bashrc probes, in the same order.
 FZF_BINDINGS_PATHS=(
-  /usr/share/fzf/shell/key-bindings.bash
-  /usr/share/doc/fzf/examples/key-bindings.bash
+  "$SYSROOT/usr/share/fzf/shell/key-bindings.bash"
+  "$SYSROOT/usr/share/doc/fzf/examples/key-bindings.bash"
   "$HOME/.fzf/shell/key-bindings.bash"
 )
 
@@ -399,7 +413,7 @@ MISSING=()
 # _have SPEC — a command name, file:PATH, terminfo:NAME, or fn:FUNCTION.
 _have() {
   case "$1" in
-    file:*) [[ -e "${1#file:}" ]] ;;
+    file:*) [[ -e "$SYSROOT${1#file:}" ]] ;;
     terminfo:*) command -v infocmp >/dev/null 2>&1 \
                   && TERMINFO= infocmp "${1#terminfo:}" >/dev/null 2>&1 ;;
     fn:*) "${1#fn:}" ;;
@@ -421,7 +435,9 @@ _present() {  # SPECS — any one present means the tool is complete
 #   MANUAL_FN   "-" when there is no upstream release fallback
 # Order is the contract: package manager first; the upstream release only
 # when the package manager could not deliver, or reported success but the
-# tool is still incomplete (the repair path).
+# tool is still incomplete (the repair path).  Every tool is re-checked
+# after a package-manager success, fallback or not: a package that reports
+# success without producing the tool lands in MISSING, never in INSTALLED.
 _tool() {
   local name="$1" specs="$2" dnf_pkg="$3" apt_pkg="$4" manual="$5" upstream="${6:-}"
   local pkg=-
@@ -444,11 +460,15 @@ _tool() {
         fi
         return 0
       fi
-      if [[ "$manual" == - ]] || _present "$specs"; then
+      if _present "$specs"; then
         INSTALLED+=("$name ($FAMILY: $pkg)")
         return 0
       fi
-      echo "  $FAMILY reported $pkg installed but $name is still incomplete; repairing from the upstream release" >&2
+      if [[ "$manual" != - ]]; then
+        echo "  $FAMILY reported $pkg installed but $name is still incomplete; repairing from the upstream release" >&2
+      else
+        echo "  $FAMILY reported $pkg installed but $name is still not detected" >&2
+      fi
     elif (( PRIV_OK )); then
       echo "  $FAMILY could not install $pkg" >&2
     fi
