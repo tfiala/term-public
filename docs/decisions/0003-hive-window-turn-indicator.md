@@ -239,7 +239,7 @@ Inputs:
 
 1. **Declared:** `@hive_turn_role_declared`, set only by `hive tmux role
    implementer|reviewer`, which writes **the role and the pair key it was
-   declared for** as one value (`reviewer <remote>#<branch>`). On every tick
+   declared for** as one value (`reviewer <remote>#<branch>`). On every refresh
    the producer compares the stored key with the window's current key; a
    mismatch means the declaration belongs to a branch this window has left,
    so it is ignored and cleared. The producer also clears it when the
@@ -248,7 +248,7 @@ Inputs:
    process — can tell "declared for this pair" from "stale declaration
    carried onto a new branch" without any memory of the previous tick.
 2. **Derived from the branch reflog** in the window's checkout, read fresh
-   on every tick with `git reflog show --format=%gs refs/heads/<branch>` and
+   on every refresh with `git reflog show --format=%gs refs/heads/<branch>` and
    taking the oldest entry:
    - `branch: Created from HEAD` or `branch: Created from <default-branch>`
      → implementer (the branch was born here);
@@ -257,12 +257,13 @@ Inputs:
      fetched here);
    - anything else, or no reflog → unknown.
 
-Outputs, rewritten on every tick: `@hive_turn_role` (the effective role:
+Outputs, recomputed on every refresh and rewritten only when changed:
+`@hive_turn_role` (the effective role:
 `implementer`, `reviewer`, or `unknown`) and `@hive_turn_role_source`
 (`declared`, `reflog`, or `none`). A valid declaration wins; otherwise the
 derived value is used; otherwise unknown. Because the derived value is never
 stored as an input, it persists exactly as long as its evidence does: if the
-reflog expires or becomes unreadable, the next tick reports unknown. A
+reflog expires or becomes unreadable, the next refresh reports unknown. A
 declared role persists until its binding fails or its lifecycle clears it,
 and the popup can always name the source truthfully.
 
@@ -273,8 +274,8 @@ actual determinant, silently.
 ### Liveness
 
 The refresh producer samples `window_activity` for every hive window on each
-tick. A window is **active** when its last output is younger than 30 s (two
-ticks at the 15 s status-interval), otherwise **quiet**, with
+run. A window is **active** when its last output is younger than 30 s,
+otherwise **quiet**, with
 *quiet-since* equal to `window_activity`. This is the only liveness input in
 version 1: both agents repaint the pane while they work (Claude Code's
 progress line; Codex's title spinner is itself pane output), so output
@@ -400,21 +401,27 @@ Cheapest first, and they stack:
   goes here; `✓` approved, waiting on the merge; `?` asked a question; `↩`
   PR done, put this checkout back; nothing otherwise. One character, same
   budget as ADR-0002.
-- **Pair line in status-right** from the producer's stdout: `5⇄6 #634 ▶6`.
+- **Pair line in status-right** from the producer's cached session option:
+  `5⇄6 #634 ▶6`.
 - **Pairs popup** on a new backtick binding (`hive tmux pairs`): one row per
   group with the windows and their roles (and role source), the shape when
   it is not a pair, PR number and title, the last handoff (which window,
   which kind, how long ago), the next window, and the verb to type there
   (`re-review`, `address review feedback`, `merge pr`, `put back`).
   Singleton, malformed, ineligible, and unknown windows get a row each, with
-  the pane title as the summary and the reason no glyph is shown.
+  the pane title as the summary and the reason no glyph is shown. Popup
+  bindings pass `#{client_name}` and `#{pane_id}` through to tmux's
+  `-c target-client` and `-t target-pane`; a server can have several attached
+  hive clients, and a background launcher has no reliable implicit display
+  context.
 
 ### Refresh producer
 
-A new `hive tmux turn-refresh <session>` runs from the existing periodic
-slot: the `#(…)` in `status-right`, which tmux re-evaluates every
-`status-interval` for each attached client. One process per tick per
-session, bounded in time, and it does the whole session's work:
+A new `hive tmux turn-refresh <session>` runs at session creation and config
+reload, after a role declaration changes, and from the backtick+`p` and
+backtick+`R` bindings. `status-right` reads the resulting
+`@hive_turn_pair_line` option; it does not execute the producer. Each bounded
+refresh does the whole session's work:
 
 1. list every hive window with `pane_current_path`, `pane_pid`, `pane_tty`,
    `pane_current_command`, and `window_activity`; take one in-memory process
@@ -430,26 +437,24 @@ session, bounded in time, and it does the whole session's work:
    waiting: every key without a result is unknown on this tick, no expired
    mutable value becomes a verdict, and the process proceeds to step 6
    regardless. N simultaneous outages therefore cost one deadline, not N
-   timeouts, and the 75 s freshness bound holds for every key that did
-   answer;
+   timeouts;
 4. apply the declared-role binding and lifecycle (ignore and clear a
    declaration whose stored key differs from the window's key; clear on
    merged/closed);
 5. evaluate roles, liveness, and the baton rule for every group;
-6. write `@hive_turn_suffix`, `@hive_turn_role`, `@hive_turn_role_source`,
-   and `@hive_turn_target` on **every** eligible window with `tmux
-   set-option -w`, whether or not it is selected, and clear them on windows
-   that became ineligible;
-7. print the pair line for status-right.
+6. sample `@hive_turn_suffix`, `@hive_turn_role`, `@hive_turn_role_source`,
+   and `@hive_turn_target` with the window inventory, then write only changed
+   values with `tmux set-option -w`; compare and clear ineligible windows the
+   same way so stale glyphs can never latch without making a steady-state tick
+   redraw every attached client;
+7. update `@hive_turn_pair_line` only when it changed, and print it for a
+   direct invocation.
 
-Because step 6 touches every window on every tick, both windows of a pair
-change together, and a handoff posted while the operator is in another
-window is picked up without any window-selection event. Worst-case staleness
-after a comment or reopen is one status-interval plus the mutable cache TTL:
-75 s. The manual backtick+R refresh also busts every mutable PR entry (never
-an immutable merged receipt), for the operator who wants the answer now.
-`#(…)` runs only while a client is attached, which is exactly when the label
-can be seen.
+Because step 6 evaluates every window in one snapshot, both windows of a pair
+change together. The popup refreshes while opening; backtick+R refreshes
+without opening it and also busts every mutable PR entry (never an immutable
+merged receipt). External PR activity is intentionally on-demand: a safe
+periodic scheduler must not be inferred from `status-interval`.
 
 `label-window` stays what it is; it reads the options the producer wrote and
 does no PR work of its own, so the hook path keeps ADR-0002's cost profile.
@@ -525,7 +530,7 @@ cooperation, and it is already written by the commands the workflow uses. A
 declared input sits above it because the reflog can expire or be absent, and
 because an unusual pairing shape should be sayable in one command rather
 than mis-derived. The declaration carries its pair key because the producer
-is a new process every tick and has no other way to know what the
+is a new process every refresh and has no other way to know what the
 declaration was for. The input and the outputs are different options because
 a single option that is both would turn one derived tick into a permanent
 declaration. Adjacency is gone because a hint that decides in every
@@ -552,9 +557,10 @@ in a world-readable `/tmp`, and the existing convention there was written
 for files that hold nothing.
 
 The question override sits above the comment rules because when it exists
-it is strictly newer information than the handoff it follows. The producer
-rides the `status-right` slot because it is the only periodic thing the
-generated config already runs. The last-to-speak heuristic is kept, but
+it is strictly newer information than the handoff it follows. A live
+2026-09-07 correction removed the producer from `status-right`: tmux restarted
+the completed `#(…)` command roughly every one to two seconds despite the
+15-second status interval. The last-to-speak heuristic is kept, but
 confined to rows 7–8 and stated over `window_activity` so it is the same
 computation for both agents. Approval points at the implementer because the
 glyph marks where the operator's next keystrokes go, not who acted last.
@@ -618,15 +624,13 @@ additive because the mixed-vendor constraint is not going away.
   - a PR-state transition (completion → disposition) delivered through a
     fake lookup with **no window-selection event**, asserting that one tick
     moves `@hive_turn_suffix` on both windows.
-- The status-right slot gains a network dependency, bounded by the 60 s
-  cache, the per-lookup timeout, the parallel limit, the producer deadline,
-  and one lookup per distinct pair key per TTL rather than per window or per
-  tick. A pair shares a cache entry; two same-named branches on different
-  remotes do not.
+- An explicit refresh gains a network dependency, bounded by the 60 s cache,
+  per-lookup timeout, parallel limit, producer deadline, and one lookup per
+  distinct pair key per TTL rather than per window. A pair shares a cache
+  entry; two same-named branches on different remotes do not.
 - Reading a pane process tree plus the branch reflog, HEAD, and default branch
-  per window per tick is local work; it is in the cost class ADR-0002 accepted
-  for the label path, and it is measured before the change ships, the way that
-  ADR measured its scan.
+  per window is local work. Keeping it out of `status-right` prevents that
+  bounded operation from becoming a continuous process and redraw loop.
 - Reflogs expire (`gc.reflogExpire`, 90 days by default) and are absent in
   some clone shapes, so a long-lived branch can lose its derived role. The
   result is *unknown*, shown as such, and one `hive tmux role` command fixes
@@ -700,6 +704,17 @@ None.
   branch; a post-fix live two-window pair was therefore not observed. The pair
   state machine remains covered by its two-window fixtures, and the earlier
   live pass observed the two windows grouping on the same pair key.
+- The initial live hot-load on 2026-09-07 put the producer in four attached
+  sessions containing 29 windows. Each nominal tick unconditionally issued
+  116 tmux option writes; 985 turn-option commands accumulated in tmux's recent
+  command buffer while tmux reached 55–70% CPU and Ghostty reached 120–130%.
+  Disabling only the producer dropped both to single-digit CPU and the fans
+  spooled down.
+- A one-session canary after changing option writes to deltas completed a
+  cache-busted 10-window refresh in 0.55 s and a steady refresh in 0.28 s, but
+  `status-right` still launched 13 producers in 20 s. This disproved the
+  assumed `status-interval` scheduling boundary and is why the accepted
+  implementation is on-demand rather than periodic.
 - The identity and storage facts in **Context** were read from
   `scripts/hive.py`: `_normalize_origin_url` (remote dedup),
   `_label_cache_key` (workspace path hash), `_default_branch` (reads
@@ -721,16 +736,15 @@ None.
 - Should `▶` be suppressed on the currently active window? The glyph exists
   to be seen from elsewhere; on the window the operator is already typing in
   it is noise, but hiding it makes the label flicker on every switch.
-- Is one PR lookup per pair key per minute acceptable for GitHub-hosted
-  hives, where the API is rate-limited per account, or should GitHub repos
-  fall back to rows 7–8 until a hook-written file exists?
+- Is one PR lookup per pair key per explicit refresh acceptable for
+  GitHub-hosted hives, where the API is rate-limited per account?
 - Is 30 s the right active/quiet threshold? Two ticks absorbs a single slow
   redraw, but an agent that pauses between tool calls for longer than that
   will flicker to quiet and back. The number is a constant in one place and
   the fixtures pin it; it may need to move after a week of use.
-- Is a 6 s producer deadline right against a 15 s interval? It leaves nine
-  seconds for tmux calls and label work; a hive with many keys on a slow
-  network may want the interval raised instead of the deadline.
+- Should a future scheduler use one session-owned watcher or a tmux delayed
+  job, and how will it prove singleton ownership, attached-client lifecycle,
+  and bounded CPU before replacing on-demand refresh?
 - Should the negation guard admit a positive sentence-final form such as
   `no blocking findings.` when it follows a negation earlier on the line?
   Today it refuses; the corpus cost is one pre-discipline comment.
@@ -751,8 +765,8 @@ None.
   first-line grammar can be demoted to a fallback and its fixtures frozen.
 - Multi-reviewer groups become routine, and the pair shape needs to become
   a set with a rule of its own.
-- PR lookups in the status-right slot prove too slow or rate-limited in
-  practice, which would push the state into a hook-written file after all.
+- On-demand refresh proves too stale in practice and a separately reviewed
+  scheduler proves singleton ownership, lifecycle cleanup, and bounded CPU.
 
 ## Alternatives Considered
 

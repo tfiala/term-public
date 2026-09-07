@@ -2378,10 +2378,10 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
     lines += [
         'set status-left-length 20',
         '',
-        '# Status right (turn pair | compact branch [sync] | time).',
+        '# Status right (cached turn pair | compact branch [sync] | time).',
         'set status-right-length 60',
-        'set status-right " #(hive tmux turn-refresh '
-        '\\"#{session_name}\\")'
+        'set status-right "'
+        '#{?@hive_turn_pair_line, #{@hive_turn_pair_line},}'
         ' #(hive tmux status-context '
         '\\"#{pane_current_path}\\" \\"#{client_width}\\" '
         '\\"#{session_name}\\" \\"#{session_windows}\\")'
@@ -2409,6 +2409,7 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
         'if [ -n "$HIVE_NAME" ]; then'
         '  CONF="/tmp/hive-tmux/$HIVE_NAME.conf";'
         '  [ -f "$CONF" ] && tmux source-file "$CONF" &&'
+        '    hive tmux turn-refresh "#{session_name}" >/dev/null &&'
         '    hive tmux refresh-labels "#{session_name}" &&'
         '    tmux display-message "Reloaded: $CONF"'
         '    || tmux display-message "Reload failed: $CONF";'
@@ -2435,7 +2436,7 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
         '# backtick + a: run-dsl status popup (hive only)',
         'bind a run-shell -b \''
         'if [ -n "$HIVE_ROOT" ]; then'
-        '  hive tmux popup --cwd "#{pane_current_path}" hive tmux runs --hive-root "$HIVE_ROOT";'
+        '  hive tmux popup --client "#{client_name}" --pane "#{pane_id}" --cwd "#{pane_current_path}" hive tmux runs --hive-root "$HIVE_ROOT";'
         'else'
         '  tmux display-message "Not in a hive session";'
         'fi\'',
@@ -2443,7 +2444,7 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
         '# backtick + p: implementer/reviewer turn pairs (hive only)',
         'bind p run-shell -b \''
         'if [ -n "$HIVE_ROOT" ]; then'
-        '  hive tmux popup --cwd "#{pane_current_path}" hive tmux pairs "#{session_name}";'
+        '  hive tmux popup --client "#{client_name}" --pane "#{pane_id}" --cwd "#{pane_current_path}" hive tmux pairs "#{session_name}";'
         'else'
         '  tmux display-message "Not in a hive session";'
         'fi\'',
@@ -2452,21 +2453,21 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
         'bind g run-shell -b \''
         'if [ -n "$HIVE_ROOT" ]; then'
         '  tmux display-message "Hive: fetching status..." &&'
-        '  hive tmux popup --cwd "#{pane_current_path}" hive --color status --compact;'
+        '  hive tmux popup --client "#{client_name}" --pane "#{pane_id}" --cwd "#{pane_current_path}" hive --color status --compact;'
         'else'
         '  tmux display-message "Not in a hive session";'
         'fi\'',
         'bind G run-shell -b \''
         'if [ -n "$HIVE_ROOT" ]; then'
         '  tmux display-message "Hive: pulling repos..." &&'
-        '  hive tmux popup --cwd "#{pane_current_path}" hive --color pull --compact;'
+        '  hive tmux popup --client "#{client_name}" --pane "#{pane_id}" --cwd "#{pane_current_path}" hive --color pull --compact;'
         'else'
         '  tmux display-message "Not in a hive session";'
         'fi\'',
         'bind C-g run-shell -b \''
         'if [ -n "$HIVE_ROOT" ]; then'
         '  tmux display-message "Hive: pulling + pushing repos..." &&'
-        '  hive tmux popup --cwd "#{pane_current_path}" hive --color pull --compact --push;'
+        '  hive tmux popup --client "#{client_name}" --pane "#{pane_id}" --cwd "#{pane_current_path}" hive --color pull --compact --push;'
         'else'
         '  tmux display-message "Not in a hive session";'
         'fi\'',
@@ -2678,6 +2679,10 @@ class _TurnWindow:
     question: bool = False
     reason: str = ''
     clear_declaration: bool = False
+    current_suffix: str = ''
+    current_role: str = ''
+    current_role_source: str = ''
+    current_target: str = ''
 
     @property
     def pair_key(self) -> tuple[str, str] | None:
@@ -3332,6 +3337,8 @@ def _collect_turn_windows(session: str) -> list[_TurnWindow] | None:
         '#{window_id}', '#{window_index}', '#{pane_id}', '#{pane_pid}',
         '#{pane_tty}', '#{pane_current_path}', '#{pane_current_command}',
         '#{window_activity}', '#{@hive_turn_role_declared}', '#{pane_title}',
+        '#{@hive_turn_suffix}', '#{@hive_turn_role}',
+        '#{@hive_turn_role_source}', '#{@hive_turn_target}',
     ))
     try:
         result = subprocess.run(
@@ -3344,8 +3351,8 @@ def _collect_turn_windows(session: str) -> list[_TurnWindow] | None:
     windows = []
     try:
         for line in result.stdout.splitlines():
-            fields = line.split('\t', 9)
-            if len(fields) != 10:
+            fields = line.split('\t', 13)
+            if len(fields) != 14:
                 raise ValueError('short tmux row')
             windows.append(_TurnWindow(
                 window_id=fields[0],
@@ -3358,6 +3365,10 @@ def _collect_turn_windows(session: str) -> list[_TurnWindow] | None:
                 activity=float(fields[7] or 0),
                 declared=fields[8],
                 pane_title=fields[9][:80],
+                current_suffix=fields[10],
+                current_role=fields[11],
+                current_role_source=fields[12],
+                current_target=fields[13],
             ))
     except (TypeError, ValueError):
         return None
@@ -3611,21 +3622,25 @@ def _build_turn_session(session: str, now: float | None = None) -> dict | None:
 
 def _set_turn_window_options(window: _TurnWindow, suffix: str,
                              target: str) -> None:
-    """Rewrite all turn outputs for one window and clear stale declarations."""
+    """Write changed turn outputs and clear stale declarations."""
     role = window.role if window.eligible else 'unknown'
     source = window.role_source if window.eligible else 'none'
     options = (
-        ('@hive_turn_suffix', suffix),
-        ('@hive_turn_role', role),
-        ('@hive_turn_role_source', source),
-        ('@hive_turn_target', target),
+        ('@hive_turn_suffix', suffix, 'current_suffix'),
+        ('@hive_turn_role', role, 'current_role'),
+        ('@hive_turn_role_source', source, 'current_role_source'),
+        ('@hive_turn_target', target, 'current_target'),
     )
     if window.clear_declaration:
-        options += (('@hive_turn_role_declared', ''),)
-    for option, value in options:
-        subprocess.run(
+        options += (('@hive_turn_role_declared', '', 'declared'),)
+    for option, value, current_field in options:
+        if getattr(window, current_field) == value:
+            continue
+        result = subprocess.run(
             ['tmux', 'set-option', '-w', '-t', window.window_id,
              option, value], capture_output=True)
+        if result.returncode == 0:
+            setattr(window, current_field, value)
 
 
 def _apply_turn_session(snapshot: dict) -> None:
@@ -3673,6 +3688,19 @@ def _turn_pair_line(snapshot: dict) -> str:
     return ''
 
 
+def _set_turn_session_line(session: str, line: str) -> None:
+    """Update the cached status line only when its value changed."""
+    current = subprocess.run(
+        ['tmux', 'show-option', '-t', session, '-v', '@hive_turn_pair_line'],
+        capture_output=True, text=True)
+    current_line = current.stdout.rstrip('\n') if current.returncode == 0 else None
+    if current_line == line:
+        return
+    subprocess.run(
+        ['tmux', 'set-option', '-t', session, '@hive_turn_pair_line', line],
+        capture_output=True)
+
+
 def _tmux_turn_refresh(session: str, bust_cache: bool = False,
                        print_line: bool = True) -> bool:
     """Run one bounded session-wide turn producer tick."""
@@ -3682,8 +3710,9 @@ def _tmux_turn_refresh(session: str, bust_cache: bool = False,
     if snapshot is None:
         return False
     _apply_turn_session(snapshot)
+    line = _turn_pair_line(snapshot)
+    _set_turn_session_line(session, line)
     if print_line:
-        line = _turn_pair_line(snapshot)
         if line:
             sys.stdout.write(line)
     return True
@@ -3754,6 +3783,7 @@ def _tmux_pairs(session: str | None = None) -> bool:
     if snapshot is None:
         return False
     _apply_turn_session(snapshot)
+    _set_turn_session_line(session, _turn_pair_line(snapshot))
     print(f'Turn pairs in {_turn_bounded_text(session)}')
     print()
     grouped_ids = {
@@ -4269,7 +4299,10 @@ def cmd_tmux(args: argparse.Namespace) -> None:
         _tmux_git_sync(args.pane_path)
         return
     if action == 'popup':
-        _tmux_popup(getattr(args, 'cwd', None), args.command)
+        _tmux_popup(
+            getattr(args, 'cwd', None), args.command,
+            client=getattr(args, 'client', None),
+            pane=getattr(args, 'pane', None))
         return
     if action == 'runs':
         hive = _resolve_tmux_hive(getattr(args, 'hive_root', None))
@@ -4517,16 +4550,23 @@ def _tmux_git_sync(pane_path: str) -> None:
             pass
 
 
-def _tmux_popup(cwd: str | None, command: list[str]) -> None:
+def _tmux_popup(cwd: str | None, command: list[str],
+                client: str | None = None, pane: str | None = None) -> None:
     """Run a command and show its output in a dynamically-sized tmux popup.
 
     Captures the command's output to a temp file, sizes the popup to fit
     (clamped to 80% of the window), and uses `less -R` when the content
     overflows. Invoked by the backtick keybindings.
     """
+    target_args = []
+    if client:
+        target_args += ['-c', client]
+    if pane:
+        target_args += ['-t', pane]
     if not command:
         subprocess.run(
-            ['tmux', 'display-message', 'hive tmux popup: no command'],
+            ['tmux', 'display-message', *target_args,
+             'hive tmux popup: no command'],
             capture_output=True)
         return
 
@@ -4542,7 +4582,8 @@ def _tmux_popup(cwd: str | None, command: list[str]) -> None:
             out.write(f'hive tmux popup: {exc}\n')
 
     def _dim(fmt: str, default: int) -> int:
-        r = subprocess.run(['tmux', 'display-message', '-p', fmt],
+        r = subprocess.run(
+            ['tmux', 'display-message', '-p', *target_args, fmt],
                            capture_output=True, text=True)
         try:
             return int(r.stdout.strip())
@@ -4557,11 +4598,13 @@ def _tmux_popup(cwd: str | None, command: list[str]) -> None:
     max_h = max(5, win_h * 80 // 100)
     if pop_h > max_h:
         # Content overflows — page it with less so the popup can scroll.
-        subprocess.run(['tmux', 'display-popup', '-w', str(pop_w),
+        subprocess.run(['tmux', 'display-popup', *target_args,
+                        '-w', str(pop_w),
                         '-h', str(max_h), '-E',
                         f"less -R '{tmpfile}'; rm -f '{tmpfile}'"])
     else:
-        subprocess.run(['tmux', 'display-popup', '-w', str(pop_w),
+        subprocess.run(['tmux', 'display-popup', *target_args,
+                        '-w', str(pop_w),
                         '-h', str(pop_h),
                         f"cat '{tmpfile}'; rm -f '{tmpfile}'"])
 
@@ -4700,6 +4743,8 @@ def main():
     tmux_gitsync = tmux_sub.add_parser('git-sync')
     tmux_gitsync.add_argument('pane_path')
     tmux_popup = tmux_sub.add_parser('popup')
+    tmux_popup.add_argument('--client')
+    tmux_popup.add_argument('--pane')
     tmux_popup.add_argument('--cwd')
     tmux_popup.add_argument('command', nargs=argparse.REMAINDER)
     tmux_runs = tmux_sub.add_parser('runs')

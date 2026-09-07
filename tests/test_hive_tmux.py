@@ -149,9 +149,19 @@ class TestGenerateTmuxConfig:
         assert 'hive tmux --hive' in conf
         assert 'hive-ci-popup' in conf
 
+    def test_popup_bindings_target_originating_client(self, fake_hive):
+        conf = hive._generate_tmux_config(fake_hive, hive._SHELL_PALETTE[0])
+        popup_lines = [line for line in conf.splitlines()
+                       if 'hive tmux popup' in line]
+        assert len(popup_lines) == 5
+        assert all('--client "#{client_name}"' in line
+                   and '--pane "#{pane_id}"' in line for line in popup_lines)
+
     def test_status_right_is_bounded(self, fake_hive):
         conf = hive._generate_tmux_config(fake_hive, hive._SHELL_PALETTE[0])
         assert 'set status-right-length 60' in conf
+        assert '@hive_turn_pair_line' in conf
+        assert '#(hive tmux turn-refresh' not in conf
         assert 'rev-parse --abbrev-ref HEAD' not in conf
 
     def test_refresh_bindings_use_shell_safe_session_name(self, fake_hive):
@@ -159,6 +169,7 @@ class TestGenerateTmuxConfig:
         assert '#{session_id}' not in conf
         assert conf.count('refresh-labels "#{session_name}"') == 2
         assert 'bind r run-shell -b' in conf
+        assert 'turn-refresh "#{session_name}" >/dev/null' in conf
         assert 'turn-refresh "#{session_name}" --bust-cache' in conf
 
     def test_window_formats_compose_run_and_turn_suffixes(self):
@@ -1238,6 +1249,51 @@ class TestTurnBatonRule:
 
 
 class TestTurnProducerBoundary:
+    def test_collects_existing_turn_outputs_for_delta_writes(self):
+        row = '\t'.join((
+            '@1', '1', '%1', '10', 'ttys001', '/workspace', 'node', '100',
+            'reviewer binding', 'Codex', '▶', 'reviewer', 'declared',
+            '2:re-review'))
+        listed = subprocess.CompletedProcess(
+            [], 0, stdout=f'{row}\n', stderr='')
+        with patch.object(hive.subprocess, 'run', return_value=listed):
+            windows = hive._collect_turn_windows('hive-0')
+        assert windows is not None
+        assert len(windows) == 1
+        window = windows[0]
+        assert (window.current_suffix, window.current_role,
+                window.current_role_source, window.current_target) == (
+                    '▶', 'reviewer', 'declared', '2:re-review')
+
+    def test_unchanged_turn_outputs_do_not_mutate_tmux(self):
+        window = _turn_window(1, 'reviewer')
+        window.current_suffix = '▶'
+        window.current_role = 'reviewer'
+        window.current_role_source = window.role_source
+        window.current_target = '1:re-review'
+        with patch.object(hive.subprocess, 'run') as run:
+            hive._set_turn_window_options(window, '▶', '1:re-review')
+        run.assert_not_called()
+
+    def test_writes_only_changed_outputs_and_stale_declaration(self):
+        window = _turn_window(1, 'reviewer')
+        window.current_suffix = '▶'
+        window.current_role = 'reviewer'
+        window.current_role_source = window.role_source
+        window.current_target = '1:re-review'
+        window.declared = 'reviewer stale-binding'
+        window.clear_declaration = True
+        written = subprocess.CompletedProcess([], 0, stdout='', stderr='')
+        with patch.object(
+                hive.subprocess, 'run', return_value=written) as run:
+            hive._set_turn_window_options(window, '', '2:put back')
+        assert [entry.args[0][-2:] for entry in run.call_args_list] == [
+            ['@hive_turn_suffix', ''],
+            ['@hive_turn_target', '2:put back'],
+            ['@hive_turn_role_declared', ''],
+        ]
+        assert window.declared == ''
+
     def test_groups_same_branch_by_normalized_remote_and_handles_no_pr_pair(
             self, tmp_path):
         first = _turn_window(1, 'implementer', activity=10)
@@ -1329,9 +1385,32 @@ class TestTurnProducerBoundary:
                 'verb': 're-review', 'kind': 'completion', 'reason': ''}},
         }
         with patch.object(hive, '_build_turn_session', return_value=snapshot), \
-             patch.object(hive, '_set_turn_window_options') as write:
+             patch.object(hive, '_set_turn_window_options') as write, \
+             patch.object(hive, '_set_turn_session_line') as set_line:
             assert hive._tmux_turn_refresh('hive-0')
         assert write.call_count == 2
+        set_line.assert_called_once_with('hive-0', '1⇄2 #7 ▶2')
+
+    def test_unchanged_pair_line_does_not_mutate_tmux(self):
+        shown = subprocess.CompletedProcess(
+            [], 0, stdout='1⇄2 #7 ▶2\n', stderr='')
+        with patch.object(
+                hive.subprocess, 'run', return_value=shown) as run:
+            hive._set_turn_session_line('hive-0', '1⇄2 #7 ▶2')
+        run.assert_called_once_with(
+            ['tmux', 'show-option', '-t', 'hive-0', '-v',
+             '@hive_turn_pair_line'], capture_output=True, text=True)
+
+    def test_changed_pair_line_updates_session_option(self):
+        shown = subprocess.CompletedProcess(
+            [], 0, stdout='old\n', stderr='')
+        written = subprocess.CompletedProcess([], 0, stdout='', stderr='')
+        with patch.object(
+                hive.subprocess, 'run', side_effect=(shown, written)) as run:
+            hive._set_turn_session_line('hive-0', '1⇄2 #7 ▶2')
+        assert run.call_args_list[-1].args[0] == [
+            'tmux', 'set-option', '-t', 'hive-0',
+            '@hive_turn_pair_line', '1⇄2 #7 ▶2']
 
     def test_terminal_tick_clears_bound_declarations(self):
         first = _turn_window(1, 'implementer')
@@ -1371,8 +1450,10 @@ class TestTurnProducerBoundary:
                 'verb': 're-review', 'kind': 'completion', 'reason': ''}},
         }
         with patch.object(hive, '_build_turn_session', return_value=snapshot), \
-             patch.object(hive, '_apply_turn_session'):
+             patch.object(hive, '_apply_turn_session'), \
+             patch.object(hive, '_set_turn_session_line') as set_line:
             assert hive._tmux_pairs('hive-0')
+        set_line.assert_called_once_with('hive-0', '1⇄2 #7 ▶2')
         output = capsys.readouterr().out
         assert '\x1b' not in output and '\x07' not in output
         assert 'handoff 1:implementer completion (10s ago)' in output
@@ -1507,10 +1588,12 @@ class TestCmdTmuxDispatch:
 
     def test_popup_action_routes(self):
         args = self._args(tmux_action='popup', cwd='/x',
+                          client='/dev/ttys000', pane='%7',
                           command=['hive', 'status'])
         with patch.object(hive, '_tmux_popup') as fn:
             hive.cmd_tmux(args)
-        fn.assert_called_once_with('/x', ['hive', 'status'])
+        fn.assert_called_once_with(
+            '/x', ['hive', 'status'], client='/dev/ttys000', pane='%7')
 
     def test_exits_when_tmux_missing(self):
         args = self._args(tmux_action=None, hive=None, list_hives=False)
@@ -1531,6 +1614,51 @@ class TestCmdTmuxDispatch:
              patch.object(hive, '_resolve_tmux_hive', return_value=None):
             with pytest.raises(SystemExit):
                 hive.cmd_tmux(args)
+
+
+class TestTmuxPopup:
+    @pytest.mark.parametrize(('line_count', 'paged'), ((1, False), (100, True)))
+    def test_targets_originating_client_for_dimensions_and_popup(
+            self, tmp_path, line_count, paged):
+        tmpfile = tmp_path / 'popup-output'
+        fd = os.open(tmpfile, os.O_CREAT | os.O_RDWR)
+
+        def fake_run(args, **kwargs):
+            if args == ['hive', 'status']:
+                kwargs['stdout'].write('status output\n' * line_count)
+                return subprocess.CompletedProcess(args, 0)
+            if args[:3] == ['tmux', 'display-message', '-p']:
+                value = '120\n' if args[-1] == '#{window_width}' else '40\n'
+                return subprocess.CompletedProcess(
+                    args, 0, stdout=value, stderr='')
+            return subprocess.CompletedProcess(args, 0, stdout='', stderr='')
+
+        with patch('tempfile.mkstemp', return_value=(fd, str(tmpfile))), \
+             patch.object(hive.subprocess, 'run', side_effect=fake_run) as run:
+            hive._tmux_popup(
+                '/workspace', ['hive', 'status'],
+                client='/dev/ttys000', pane='%7')
+
+        calls = [entry.args[0] for entry in run.call_args_list]
+        dimension_calls = [args for args in calls
+                           if args[:3] == ['tmux', 'display-message', '-p']]
+        assert len(dimension_calls) == 2
+        assert all(args[3:7] == ['-c', '/dev/ttys000', '-t', '%7']
+                   for args in dimension_calls)
+        popup_calls = [args for args in calls
+                       if args[:2] == ['tmux', 'display-popup']]
+        assert len(popup_calls) == 1
+        assert popup_calls[0][2:6] == [
+            '-c', '/dev/ttys000', '-t', '%7']
+        assert ('-E' in popup_calls[0]) is paged
+
+    def test_no_command_message_targets_originating_client(self):
+        with patch.object(hive.subprocess, 'run') as run:
+            hive._tmux_popup(
+                None, [], client='/dev/ttys000', pane='%7')
+        run.assert_called_once_with(
+            ['tmux', 'display-message', '-c', '/dev/ttys000', '-t', '%7',
+             'hive tmux popup: no command'], capture_output=True)
 
 
 # --- Pane environment seeding ------------------------------------------------
