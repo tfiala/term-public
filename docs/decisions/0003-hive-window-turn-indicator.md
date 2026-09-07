@@ -48,19 +48,31 @@ only: `after-new-window`, `after-select-window`, and `after-select-pane`. A
 whole-session relabel happens on config reload and on the manual backtick+R
 binding. The one periodic producer is `status-right`, whose `#(hive tmux
 status-context …)` tmux re-evaluates every `status-interval` (this repo sets
-none, so tmux's default of 15 s applies) while a client is attached. Nothing
-observes a PR comment being posted: an agent that posts a handoff and goes
-quiet triggers none of the relabel hooks.
+none, so tmux's default of 15 s applies) while a client is attached. Each
+evaluation is a **new process**: nothing survives from one tick to the next
+except what is written to a tmux option or to disk. Nothing observes a PR
+comment being posted: an agent that posts a handoff and goes quiet triggers
+none of the relabel hooks.
 
-### What identity the hive already models
+### What identity and storage the hive already models
 
 A hive is multi-repository by construction, and branch names collide across
 repositories as a matter of course: two unrelated `fix/foo` branches in two
 repos of one hive are ordinary. `hive` already treats identity accordingly:
 `_normalize_origin_url` strips `.git`, trailing slashes, and userinfo so two
-spellings of one remote dedupe to one cache key, and `_label_cache_key`
-hashes the workspace path so same-named workspaces in different hives do not
-share a label cache. Anything this ADR keys must be at least that specific.
+spellings of one remote dedupe to one cache key; `_label_cache_key` hashes
+the workspace path so same-named workspaces in different hives do not share
+a label cache; and `_default_branch` reads `refs/remotes/origin/HEAD` to
+know which branch is the repo's default. Anything this ADR keys must be at
+least that specific.
+
+Storage is a different matter. `_TMUX_DIR` is `/tmp/hive-tmux`, created
+with `mkdir` defaults: the directory is mode `0755` and its files `0644`,
+readable by every local user. That is fine for generated tmux config and
+label caches, which hold nothing private. It is not fine for PR titles and
+comment text from private repositories, which is what this ADR needs to
+cache. The one place `hive` already writes user-private files is the popup
+path, which uses `tempfile.mkstemp` (mode `0600`).
 
 ### What the available sources actually expose
 
@@ -76,8 +88,9 @@ Measured on the two attached hive sessions on 2026-09-06, 14 panes:
   (`⠧ home-dc-6`). Six of the fourteen panes carried a Claude summary; two of
   the Codex panes were mid-spin. Only Codex supplies a working spinner in the
   title, so the title is a summary source, not a liveness source.
-- `pane_current_command` separates the two CLIs: Claude Code's process is
-  named by its version (`2.1.263`), Codex's is `node`. It identifies the
+- `pane_current_command` separates the two CLIs from each other and from a
+  plain shell: Claude Code's process is named by its version (`2.1.263`),
+  Codex's is `node`, and a bare window is `bash`. It identifies the
   program; it does not say whether the program is emitting output.
 - Once both checkouts track the same PR branch, `git branch --show-current`
   and the upstream are identical in both windows, and the PR record is the
@@ -99,14 +112,13 @@ Measured on the two attached hive sessions on 2026-09-06, 14 panes:
   2026-09-06): a first-line grammar of `approve`/`lgtm`, `changes
   requested`, `no new delta`, and `addressed in` recognized 65. The real
   forms include `Review disposition: LGTM at exact head …`, `Approved / LGTM
-  on exact rebased head …`, `Changes still requested on exact head …`,
-  `Reviewed locally. No blocking findings.`, `Both findings addressed in
-  …`, `Fixed in …`, `Pushed …`, and `Rebased onto current main …; new head
-  …`. The bounded grammar in this ADR recognizes 78 of the 87. The remaining
-  9 are 6 header-only comments from PRs #7–#11, written before the discipline
-  fixed its disposition wording, and 3 that are not handoffs at all (a
-  metadata-only PR-body refresh, a post-merge note, a progress note). None
-  is ambiguous.
+  on exact rebased head …`, `## Re-review: <sha> — approved`, `Changes still
+  requested on exact head …`, `Reviewed locally. No blocking findings.`,
+  `Both blockers addressed in …`, `Fixed in …`, `Pushed …`, and `Rebased
+  onto current main …; new head …`. A loose grammar that accepted `approve`
+  anywhere covered 78 of the 87 — and also accepted `Cannot approve this
+  yet`. The grammar in this ADR is anchored and guarded instead; its numbers
+  are in **Evidence**.
 
 Operator vocabulary is stable enough to classify: a review starts with
 "pull, checkout pr #X, review"; an implementation starts with "implement
@@ -119,30 +131,61 @@ agent-agnostic, with per-agent enrichment strictly additive. Every rule below
 is stated over facts the version-1 sources expose; anything they do not
 expose resolves to *unknown*, and unknown never renders a glyph.
 
-### Identity and pairing
+### Identity, eligibility, and pair shape
 
 The **pair key** of a window is `(remote, branch)`: the checkout's origin
-URL passed through `_normalize_origin_url`, and the current branch. Two
-windows in the same hive with equal pair keys form a pair. Windows with
-equal branch names on different remotes never pair and never share any
-cached state. A window with no partner is *unpaired* and still gets a turn
-state of its own.
+URL passed through `_normalize_origin_url`, and the current branch. Windows
+with equal branch names on different remotes never share a key, a group, or
+any cached state.
 
-A PR is an **attribute** of the pair, not a precondition for it. It is
+A window is **eligible** only if all three hold: its pane's current path is
+inside a git checkout with an origin; its branch is not that remote's
+default branch as read by `_default_branch`; and its pane runs an agent —
+`pane_current_command` is a Claude Code version string or `node`. A window
+put back on `main`, or a window that is just a shell, is ineligible and
+takes no part in any group, gets no glyph, and appears in the popup only
+under "not participating".
+
+A **group** is the set of eligible windows in one hive with equal pair keys.
+The baton table below applies to a group according to its **shape**, and
+only one shape is a pair:
+
+| Shape | Definition | What the table does |
+|---|---|---|
+| pair | exactly two windows whose resolved roles are exactly one implementer and one reviewer | every row applies |
+| singleton | one window | rows 1–2 apply; rows 3–5 apply only when the window's own role equals the row's target, else unknown ("next: reviewer — no window"); rows 7–8 resolve to **no glyph**, popup "unpaired, quiet since …" |
+| malformed | two windows with a duplicate role or any unknown role; or three or more windows | rows 1–2 apply per window; every other row resolves to **unknown**, and the popup names the shape ("implementer + implementer", "3 windows on <key>", "roles unknown") |
+
+The "third window joining" case named in **Context** is therefore not a
+pair; it is a malformed group, shown as such, until the operator declares
+roles or puts a window back.
+
+### PR resolution and closed receipts
+
+A PR is an **attribute** of a group, not a precondition for it. It is
 resolved per pair key, in this order:
 
 1. the open PR on that remote whose head ref is the branch;
-2. otherwise the most recently closed or merged PR on that remote with that
-   head ref, **closed within the last 7 days** (the lookup bound), **and
-   only while the checkout's current HEAD equals that PR's head SHA**;
-3. otherwise none.
+2. otherwise a **closed receipt** for `(pair key, HEAD)` held in the private
+   cache (below);
+3. otherwise, among the most recently updated closed or merged PRs with that
+   head ref — one page, at most 30, a **count** bound with no age
+   component — the one whose head SHA equals the checkout's current HEAD;
+   when found, a receipt is written;
+4. otherwise none.
 
-The SHA binding in (2) is what stops a reused branch from inheriting a dead
-PR's state: the moment the branch advances past the closed PR's head, the
-pair resolves to *none* and is treated as pre-PR until a new PR exists.
-Pre-PR pairs are ordinary — a reviewer may fetch a branch before the PR is
-opened — and they are exactly the pairs rows 7–8 of the baton table exist
-for.
+A receipt records the PR number, its state, and the head SHA it was observed
+at. It is authoritative for that `(pair key, HEAD)` regardless of age and
+regardless of later lookup failures, and it is invalidated by exactly two
+events: the pair key changes, or HEAD changes. The `↩` state therefore
+persists on an untouched checkout for as long as it stays untouched, and
+disappears the moment the branch advances past the closed PR's head. There
+is no time bound anywhere in this resolution; nothing changes state because
+a calendar moved.
+
+Pre-PR groups (resolution 4) are ordinary — a reviewer may fetch a branch
+before the PR is opened — and they are exactly the pairs rows 7–8 of the
+baton table exist for.
 
 ### Roles
 
@@ -152,12 +195,16 @@ would cause is the reason for the split.
 
 Inputs:
 
-1. **Declared:** `@hive_turn_role_declared`, set only by the operator with
-   `hive tmux role implementer|reviewer`. Lifecycle: the producer clears it
-   when the window's pair key changes (branch or remote) or when the pair's
-   PR resolves to merged or closed. A declaration therefore cannot outlive
-   the pairing it describes, and nothing but the operator (or a future
-   enricher acting as the operator) ever sets it.
+1. **Declared:** `@hive_turn_role_declared`, set only by `hive tmux role
+   implementer|reviewer`, which writes **the role and the pair key it was
+   declared for** as one value (`reviewer <remote>#<branch>`). On every tick
+   the producer compares the stored key with the window's current key; a
+   mismatch means the declaration belongs to a branch this window has left,
+   so it is ignored and cleared. The producer also clears it when the
+   group's PR resolves to merged or closed. Because the binding is stored in
+   the option itself, a fresh producer process — which is every producer
+   process — can tell "declared for this pair" from "stale declaration
+   carried onto a new branch" without any memory of the previous tick.
 2. **Derived from the branch reflog** in the window's checkout, read fresh
    on every tick with `git reflog show --format=%gs refs/heads/<branch>` and
    taking the oldest entry:
@@ -169,12 +216,12 @@ Inputs:
 
 Outputs, rewritten on every tick: `@hive_turn_role` (the effective role:
 `implementer`, `reviewer`, or `unknown`) and `@hive_turn_role_source`
-(`declared`, `reflog`, or `none`). The declared input wins when present;
-otherwise the derived value is used; otherwise unknown. Because the derived
-value is never stored as an input, it persists exactly as long as its
-evidence does: if the reflog expires or becomes unreadable, the next tick
-reports unknown, as the Consequences require. A declared role persists until
-its lifecycle clears it, and the popup can always name the source truthfully.
+(`declared`, `reflog`, or `none`). A valid declaration wins; otherwise the
+derived value is used; otherwise unknown. Because the derived value is never
+stored as an input, it persists exactly as long as its evidence does: if the
+reflog expires or becomes unreadable, the next tick reports unknown. A
+declared role persists until its binding fails or its lifecycle clears it,
+and the popup can always name the source truthfully.
 
 Adjacency (`N`, `N+1`) is **not** a source. It was proposed as a tie-break
 and removed: with no provenance in the other inputs it would have been the
@@ -189,20 +236,21 @@ ticks at the 15 s status-interval), otherwise **quiet**, with
 version 1: both agents repaint the pane while they work (Claude Code's
 progress line; Codex's title spinner is itself pane output), so output
 silence means the same thing for both, and no per-vendor signal is consulted.
-`pane_current_command` is used only to name the agent in the popup. A hung
-agent that keeps repainting reads as active; the popup shows "active for N
-min" so that case is at least visible.
+`pane_current_command` is used only for eligibility and to name the agent in
+the popup. A hung agent that keeps repainting reads as active; the popup
+shows "active for N min" so that case is at least visible.
 
 ### Baton rule
 
-Inputs per pair: the resolved PR (open, closed-and-bound, or none); the
-classification of the **latest** PR comment; the question flag per window;
-the liveness state per window. The rule is evaluated top to bottom and the
-**first match is the result**. Every input combination reaches a row.
+Inputs per group: its shape; the resolved PR (open, closed receipt, or
+none); the classification of the **latest** PR comment; the question flag
+per window; the liveness state per window. The rule is evaluated top to
+bottom and the **first match is the result**, subject to the shape table
+above. Every input combination reaches a row.
 
 | # | Condition | Result |
 |---|---|---|
-| 1 | PR resolved as merged or closed (so HEAD still equals its head SHA) | both windows: `↩` (put this checkout back). This is the next action there and outranks everything below. |
+| 1 | PR resolved as merged or closed (receipt bound to the current HEAD) | each window: `↩` (put this checkout back). This is the next action there and outranks everything below. |
 | 2 | An enricher reports a window's last output ended in a question | that window: `?`. Sits above the comment rules because the question is newer than any handoff it followed; without an enricher the flag is simply absent and this row never matches. |
 | 3 | latest comment is a disposition: *approve* | implementer: `✓` (the merge is typed there) |
 | 4 | latest comment is a disposition: *changes requested* or *no new delta* | implementer: `▶` |
@@ -214,55 +262,72 @@ the liveness state per window. The rule is evaluated top to bottom and the
 Two cross-cutting rules complete it:
 
 - **Target role has no window.** When a row names a role (rows 3–5) and the
-  pair has no window in that role — the window is unpaired, the partner was
-  closed, or the role resolved to unknown — the result is unknown: no glyph,
-  and the popup names the missing role ("next: reviewer — no window").
-- **Lookup failure.** A PR lookup that fails or exceeds its 3 s timeout
-  yields unknown for that pair on that tick: no glyph, and the popup reads
-  "unknown (lookup failed N s ago)". The previous tick's glyph is cleared,
-  not kept; a stale `▶` is a wrong pointer. This is the rule ADR-0002 drew
-  for run state: a failed observation is not a verdict.
+  group has no window in that role, the result is unknown: no glyph, and the
+  popup names the missing role.
+- **Lookup failure.** A PR lookup that fails, exceeds its own timeout, or is
+  cut off by the producer deadline yields unknown for that group on that
+  tick: no glyph, and the popup reads "unknown (lookup failed N s ago)". The
+  previous tick's glyph is cleared, not kept; a stale `▶` is a wrong pointer.
+  A closed receipt is not a lookup and is unaffected. This is the rule
+  ADR-0002 drew for run state: a failed observation is not a verdict.
 
 ### Comment classifier
 
 The classifier consumes the latest PR comment and returns exactly one of
 *approve*, *changes requested*, *no new delta*, *completion*, or
-*unrecognized*. It is bounded on purpose: it reads at most the first
-non-empty line and the last three non-empty lines, and it never scans the
-body for keywords.
+*unrecognized*. It reads at most the first non-empty line and the last three
+non-empty lines, never the body. It is **positively anchored** — every
+recognized form must start the line or follow a review heading — and
+**guarded**: a negation anywhere on the first line, or more than one family
+of keyword anywhere on it, refuses the whole line. The refusal is the safety
+property; `✓` is the one glyph that directs a merge, and it may not be
+earned by a sentence that merely contains the word.
 
 1. **Marker, when present, wins.** A line of the form `Handoff: approve`,
    `Handoff: changes-requested`, `Handoff: no-new-delta`, or
    `Handoff: addressed` among the last three non-empty lines is the
    classification. This is the durable, machine-readable convention the
-   review discipline may adopt; version 1 does not depend on it, and until
-   it is adopted the grammar below carries the load.
-2. **Otherwise the first non-empty line**, normalized (heading markers,
-   emphasis, and backticks stripped; lowercased), is matched:
-   - *completion* if a completion verb — `addressed`, `fixed`, `pushed`, or
-     the phrase `new head` — occurs within four words before a 7–40 digit
-     hex commit reference, or `addressed` occurs within 60 characters
-     before `push`;
-   - *approve* if `approve`, `approved`, `approval`, or `lgtm` occurs as a
-     word and is not negated (`not approved`, `unapproved`), or the line
-     says `no blocking findings`, `no blocking issues`, or `don't see any
-     blocking`;
-   - *changes requested* if `changes` is followed within two words by
-     `requested` (this admits `changes still requested`), or by
-     `request(ed|ing) changes`;
-   - *no new delta* if that phrase occurs.
-3. **Resolution:** completion if the completion pattern matched and no
-   disposition class did; the disposition if exactly one class matched and
-   completion did not; **unrecognized** in every other case, including a
-   line that matches both a disposition and completion, or two disposition
-   classes. Ambiguity is never resolved by precedence.
+   review discipline may adopt; version 1 does not depend on it.
+2. **Normalize the first non-empty line:** strip heading markers, emphasis,
+   and backticks; lowercase.
+3. **Negation guard.** If the line contains any of `not`, `cannot`, `can't`,
+   `isn't`, `aren't`, `won't`, `don't`, `never`, `withheld`, `blocked`, or
+   `pending` as a word, the result is unrecognized. No further matching.
+4. **Anchored forms.** In what follows `<sha>` is 7–40 hex digits, `<end>`
+   is end of line or one of space `. , ; : ! ) /`, and a *review heading*
+   is: up to three words, then `review` or `re-review`, optionally `at|on|of
+   <sha>`, optionally `disposition`, then any non-alphanumerics, optionally
+   `<sha>` and more non-alphanumerics.
+   - *approve:* `approve`/`approved`/`lgtm` at line start followed by
+     `<end>`; a review heading followed by one of those; `reviewed …`
+     ending in the sentence `no blocking findings|issues.`; or the whole
+     line `no blocking findings|issues.`
+   - *changes requested:* `changes` then at most two words then
+     `requested`, at line start or after a review heading.
+   - *no new delta:* that phrase at line start or after a review heading.
+   - *completion:* up to six words then `addressed in <sha><end>`;
+     `addressed` then up to six words then `in <sha><end>`; `fixed in
+     <sha><end>`; `pushed <sha><end>` at line start; `and pushed
+     <sha><end>`; `new head <sha>` followed by end, `, ; . )`, or `ci`; or
+     `addressed … in the latest push` within 80 characters.
+5. **Family guard.** Count the keyword families present anywhere on the
+   line: approval words (`approve(d)`, `lgtm`, `no blocking
+   findings|issues`), `changes … requested`, `no new delta`, and the
+   completion phrases (`addressed in`, `fixed in`, `pushed`). A completion
+   form is accepted only if no disposition family appears; a disposition
+   form is accepted only if it is the sole family present and no completion
+   phrase appears. Anything else is unrecognized. Ambiguity is never
+   resolved by precedence.
 
-The ordering in (3) is what keeps `Changes still requested on exact head
-<sha> (…)` a disposition despite its commit reference (no completion verb
-precedes the SHA), and `Addressed in <sha>` a completion despite anything
-the rest of the line says about the findings. A first line that names both
-— "addressed in <sha>; changes requested on the rest" — is unrecognized,
-and the popup shows it, rather than a glyph built from a coin toss.
+The guards are what refuse `Cannot approve this yet`, `Approval withheld
+pending the failing test`, `Not ready for approval`, `Approved with changes
+requested on <sha>`, `Pushed back on <sha>`, `LGTM-adjacent but blocked`,
+`Rebased; the new head <sha> is not ready`, and `No blocking findings?
+Several, actually.` — every one unrecognized, none a glyph. The anchors are
+what keep `Changes still requested on exact head <sha>` a disposition
+despite its commit reference, and `Both blockers addressed in <sha>` a
+completion. The cost of the guards on the real corpus is two comments,
+itemized in **Evidence**; both are refusals, which is the safe direction.
 
 ### Surfaces
 
@@ -275,57 +340,81 @@ Cheapest first, and they stack:
   budget as ADR-0002.
 - **Pair line in status-right** from the producer's stdout: `5⇄6 #634 ▶6`.
 - **Pairs popup** on a new backtick binding (`hive tmux pairs`): one row per
-  pair with the windows and their roles (and role source), PR number and
-  title, the last handoff (which window, which kind, how long ago), the next
-  window, and the verb to type there (`re-review`, `address review
-  feedback`, `merge pr`, `put back`). Unpaired and unknown windows get a row
-  each, with the pane title as the summary and the reason no glyph is shown.
+  group with the windows and their roles (and role source), the shape when
+  it is not a pair, PR number and title, the last handoff (which window,
+  which kind, how long ago), the next window, and the verb to type there
+  (`re-review`, `address review feedback`, `merge pr`, `put back`).
+  Singleton, malformed, ineligible, and unknown windows get a row each, with
+  the pane title as the summary and the reason no glyph is shown.
 
 ### Refresh producer
 
 A new `hive tmux turn-refresh <session>` runs from the existing periodic
 slot: the `#(…)` in `status-right`, which tmux re-evaluates every
 `status-interval` for each attached client. One process per tick per
-session, and it does the whole session's work:
+session, bounded in time, and it does the whole session's work:
 
-1. list every hive window with `pane_current_path` and `window_activity`;
+1. list every hive window with `pane_current_path`, `pane_current_command`,
+   and `window_activity`; drop ineligible windows;
 2. compute each window's pair key and, from the checkout, its HEAD and the
-   branch reflog (local, cheap); group windows into pairs by key;
-3. resolve the PR **once per distinct pair key**, from a cache keyed by the
-   pair key with a 60 s TTL and a 3 s lookup timeout, through the existing
-   `gh`/`fj` paths; the cache entry holds the PR number, state, head SHA,
-   and the latest comment;
-4. apply the declared-role lifecycle (clear `@hive_turn_role_declared` where
-   the pair key changed or the PR resolved as merged/closed);
-5. evaluate roles, liveness, and the baton rule for every pair and unpaired
-   window;
+   branch reflog (local, cheap); group windows by key and classify shape;
+3. resolve the PR **once per distinct pair key**: receipts and cache entries
+   from the private cache first (60 s TTL for open-PR entries; receipts do
+   not expire), then lookups through the existing `gh`/`fj` paths, run **in
+   parallel** across keys with at most 8 in flight, a 3 s timeout each, and
+   a **whole-producer deadline of 6 s** from process start. When the
+   deadline passes, the producer stops waiting: every key without a result
+   is unknown on this tick, its cache entry is left untouched, and the
+   process proceeds to step 6 regardless. N simultaneous outages therefore
+   cost one deadline, not N timeouts, and the 75 s freshness bound holds for
+   every key that did answer;
+4. apply the declared-role binding and lifecycle (ignore and clear a
+   declaration whose stored key differs from the window's key; clear on
+   merged/closed);
+5. evaluate roles, liveness, and the baton rule for every group;
 6. write `@hive_turn_suffix`, `@hive_turn_role`, `@hive_turn_role_source`,
-   and `@hive_turn_target` on **every** window with `tmux set-option -w`,
-   whether or not it is selected;
+   and `@hive_turn_target` on **every** eligible window with `tmux
+   set-option -w`, whether or not it is selected, and clear them on windows
+   that became ineligible;
 7. print the pair line for status-right.
 
 Because step 6 touches every window on every tick, both windows of a pair
 change together, and a handoff posted while the operator is in another
 window is picked up without any window-selection event. Worst-case staleness
 after a comment is one status-interval plus the cache TTL: 75 s. The manual
-backtick+R refresh also busts the PR cache, for the operator who wants the
-answer now. `#(…)` runs only while a client is attached, which is exactly
-when the label can be seen.
+backtick+R refresh also busts the open-PR cache (never receipts), for the
+operator who wants the answer now. `#(…)` runs only while a client is
+attached, which is exactly when the label can be seen.
 
 `label-window` stays what it is; it reads the options the producer wrote and
 does no PR work of its own, so the hook path keeps ADR-0002's cost profile.
+
+### Private cache
+
+The producer's cache and receipts live under
+`${XDG_STATE_HOME:-$HOME/.local/state}/hive/turn/`, **not** under
+`/tmp/hive-tmux`. The directory is created with mode `0700` and re-`chmod`ed
+to `0700` on every producer start, so a permissive umask cannot widen it.
+Each entry is one file per pair-key hash, created with `O_CREAT|O_EXCL` at
+mode `0600`, `fchmod`ed to `0600`, written in full, and moved into place
+with an atomic rename, the way run-dsl sidecars are written. An entry holds
+only the bounded fields the popup and the rule need: pair key, PR number,
+state, head SHA, latest comment id, its classification, its first line
+truncated to 80 characters, the PR title truncated to 80 characters,
+timestamps, and the receipt. The raw comment body is never written to disk.
 
 ### Data sources and enrichment
 
 Version 1 uses only tmux formats (`window_activity`, `pane_title`,
 `pane_current_command`, `pane_current_path`), `git` in the checkout (origin
-URL, branch, HEAD, the branch reflog), the declared-role input option, and
-the cached PR lookup. No hooks, no log parsing. Version 2 adds optional
-enrichers — a Claude Code `Stop` hook, a Codex log reader — that may set the
-question flag and improve the summary line. An enricher that is absent,
-stale, or failing degrades to version 1 behavior; it never produces a glyph
-on its own, and it may set a role only by writing `@hive_turn_role_declared`
-the way the operator would.
+URL, default branch, branch, HEAD, the branch reflog), the declared-role
+input option, and the cached PR lookup. No hooks, no log parsing. Version 2
+adds optional enrichers — a Claude Code `Stop` hook, a Codex log reader —
+that may set the question flag and improve the summary line. An enricher
+that is absent, stale, or failing degrades to version 1 behavior; it never
+produces a glyph on its own, and it may set a role only by writing
+`@hive_turn_role_declared` with the same key binding the operator's command
+writes.
 
 ## Rationale
 
@@ -338,101 +427,114 @@ comments that exist, and its residue is named.
 
 Identity is `(remote, branch)` because that is the least specific key that
 cannot collide inside a hive, and because `hive` already normalizes remotes
-for exactly this reason. Making the PR an attribute rather than a
-precondition is what lets the no-PR rows describe a real pair instead of an
-empty set, and binding a closed PR to its head SHA is what lets a branch be
-reused without dragging an old `↩` along.
+for exactly this reason. Eligibility exists because key equality is
+necessary for a pair but not sufficient: two idle windows on `main` share a
+key and are not a pair, and a shell is not an agent. The shape table exists
+because the baton table assumes one implementer and one reviewer, and a
+group that is not that shape must say so rather than pick two of its
+members. Making the PR an attribute rather than a precondition is what lets
+the no-PR rows describe a real pair instead of an empty set.
+
+Closed receipts exist because a time bound on a lookup is a time bound on
+the answer: the first draft's seven-day window turned a finished checkout
+into an apparent new baton on day eight with no branch, HEAD, or operator
+event. A receipt bound to `(pair key, HEAD)` changes only when the checkout
+changes, and the remaining lookup bound is a page count, which has no
+calendar in it.
 
 Roles come from the branch reflog because it is the one place the checkout
 itself records how the branch got there, it needs no network and no agent
 cooperation, and it is already written by the commands the workflow uses. A
 declared input sits above it because the reflog can expire or be absent, and
 because an unusual pairing shape should be sayable in one command rather
-than mis-derived. The input and the outputs are different options because a
-single option that is both would turn one derived tick into a permanent
-declaration — the popup would then be lying about the source, and an expired
-reflog would never become unknown. Adjacency is gone because a hint that
-decides in every undeclared case is not a hint.
+than mis-derived. The declaration carries its pair key because the producer
+is a new process every tick and has no other way to know what the
+declaration was for. The input and the outputs are different options because
+a single option that is both would turn one derived tick into a permanent
+declaration. Adjacency is gone because a hint that decides in every
+undeclared case is not a hint.
 
-The classifier is bounded to the first line and a trailing marker because
-the discipline already puts the verdict in the first line, and because
-scanning bodies for keywords is how "fixed" inside a findings list becomes a
-completion. Ambiguity resolves to unrecognized rather than by precedence for
-the same reason every other unknown does: a glyph is a pointer at the
-operator's next keystrokes, and a pointer built from a guess is worse than
-no pointer. The `Handoff:` marker is offered so that the discipline can make
-the grammar unnecessary over time, without version 1 waiting for it.
+The classifier is anchored and guarded rather than permissive because the
+78-of-87 grammar that preceded it was compatible with the corpus and unsafe
+outside it: it would have shown `✓` for "cannot approve this yet". Anchors
+say where a verdict may stand; the negation guard and the family guard say
+when a line is not allowed to be a verdict at all; and both err toward
+refusal, which costs a glyph and never directs a merge. A negation blacklist
+that grows as counterexamples are found was rejected in favor of a guard
+that refuses every negation, at a measured cost of one real approval in the
+corpus, from before the discipline fixed its wording.
+
+The producer has a deadline because a per-lookup timeout bounds one lookup
+and nothing else: ten keys and one outage would have run the slot past its
+own interval. Parallel lookups plus a whole-process deadline bound the tick
+no matter how many keys fail, and every key that fails is reported unknown
+rather than left with last tick's glyph. The cache is private because the
+data is: PR titles and comment lines from private repositories do not belong
+in a world-readable `/tmp`, and the existing convention there was written
+for files that hold nothing.
 
 The question override sits above the comment rules because when it exists
-it is strictly newer information than the handoff it follows. Putting it
-below them, as the first draft did, made it unreachable whenever a PR
-comment existed — which is every case after the first handoff.
-
-The producer rides the `status-right` slot because it is the only periodic
-thing the generated config already runs, and because a producer that updates
-every window on every tick is the simplest way to guarantee both sides of a
-pair change together. A cache TTL by itself schedules nothing; the tick is
-what turns a TTL into a refresh.
-
-The last-to-speak heuristic is kept, but confined to the case where nothing
-better exists (rows 7–8), and stated over `window_activity` so it is the same
-computation for both agents. Its failure modes are precisely the states the
-PR encodes (an approval) or an enricher can see (a question), so the ordering
-is what turns the heuristic from "usually right" into "right unless the
-world is silent".
-
-Approval points at the implementer for the same reason everything else does:
-the glyph marks where the operator's next keystrokes go, not who acted last.
-Putting `✓` on the reviewer would be a report; putting it on the implementer
-is a pointer.
-
-The label carries only actionable state, following ADR-0002. `▶`, `✓`, `?`,
-and `↩` each name a keystroke; a "working" glyph for interactive sessions
-would not, and the spinner Codex already paints into the title covers it for
-free.
-
-Enrichment is additive because the mixed-vendor constraint is not going away.
-A design whose correctness depended on a Claude hook would be wrong in every
-Codex window, and a hook that fires in one window of a pair but not the other
-is worse than none: it would make one side look authoritative.
+it is strictly newer information than the handoff it follows. The producer
+rides the `status-right` slot because it is the only periodic thing the
+generated config already runs. The last-to-speak heuristic is kept, but
+confined to rows 7–8 and stated over `window_activity` so it is the same
+computation for both agents. Approval points at the implementer because the
+glyph marks where the operator's next keystrokes go, not who acted last.
+The label carries only actionable state, following ADR-0002. Enrichment is
+additive because the mixed-vendor constraint is not going away.
 
 ## Consequences
 
-- `hive tmux` gains one input option (`@hive_turn_role_declared`), four
-  output options (`@hive_turn_suffix`, `@hive_turn_role`,
-  `@hive_turn_role_source`, `@hive_turn_target`), a second suffix in the
-  status format, the `role`, `turn-refresh`, and `pairs` subcommands, a
-  popup binding, and a cache-busting step in the backtick+R refresh.
+- `hive tmux` gains one input option (`@hive_turn_role_declared`, carrying
+  role and pair key), four output options (`@hive_turn_suffix`,
+  `@hive_turn_role`, `@hive_turn_role_source`, `@hive_turn_target`), a
+  second suffix in the status format, the `role`, `turn-refresh`, and
+  `pairs` subcommands, a popup binding, a cache-busting step in the
+  backtick+R refresh, and a private state directory.
 - `tests/test_hive_tmux.py` grows table-driven tests over:
-  - the baton rule, one fixture per row, plus an unrecognized latest
-    comment, a row whose target role has no window, a lookup failure, and a
-    lookup timeout;
-  - **successive ticks for roles:** derive a role from the reflog, remove
-    the reflog evidence, refresh, and require `unknown`/`none`; in parallel,
-    declare a role, remove the reflog evidence, refresh, and require the
-    declaration to stand; then change the branch and require it cleared;
-  - **identity:** two windows with equal branch names on different remotes
-    must neither pair nor share a cache entry; two windows on the same
-    remote and branch with no PR must pair and reach rows 7–8; a branch
-    whose PR closed must show `↩` while HEAD equals the PR head and resolve
-    to *none* once the branch advances;
+  - the baton rule, one fixture per row and per shape (pair, singleton,
+    duplicate-role, all-unknown, three windows), plus an unrecognized latest
+    comment, a row whose target role has no window, a lookup failure, a
+    lookup timeout, and a deadline cut-off;
+  - **eligibility:** two idle windows on the default branch and a shell
+    window, none of which may form a group or receive a glyph;
+  - **successive ticks for roles, across a producer-process restart:**
+    derive a role from the reflog, remove the reflog evidence, run the
+    producer again as a fresh process, and require `unknown`/`none`;
+    declare a role, remove the reflog evidence, run again, and require the
+    declaration to stand; change the branch, run again, and require the
+    declaration ignored and cleared because its stored key no longer
+    matches. In-memory state between calls is not permitted to pass these;
+  - **identity and receipts:** two windows with equal branch names on
+    different remotes must neither group nor share a cache entry; two
+    windows on the same remote and branch with no PR must pair and reach
+    rows 7–8; a branch whose PR closed must show `↩` while HEAD equals the
+    PR head, keep showing it after a clock advance of any size with HEAD
+    unchanged, keep showing it through a lookup failure, and resolve to
+    *none* once the branch advances;
   - **the classifier:** every recognized first-line form in the corpus as a
-    positive fixture, the 3 non-handoffs and the 6 pre-discipline headers as
-    negatives, `Changes still requested on exact head <sha>` as a
-    SHA-bearing disposition, a completion whose first line also mentions
-    "changes requested" as an ambiguity case resolving to unrecognized, and
-    the `Handoff:` marker overriding a contradicting first line;
+    positive fixture; the corpus residue as negatives; the eight mutation
+    negatives named above plus `Approved pending CI` and `Review at <sha> —
+    approved, but changes requested on docs`; `Changes still requested on
+    exact head <sha>` as a SHA-bearing disposition; and the `Handoff:`
+    marker overriding a contradicting first line;
+  - **the producer boundary:** N keys that all time out must yield N unknown
+    results within one deadline, with no window left carrying the previous
+    tick's glyph; the state directory must be `0700` and its files `0600`
+    under a `0000` umask and under a `0022` umask; an entry must never
+    contain the comment body;
   - a PR-state transition (completion → disposition) delivered through a
     fake lookup with **no window-selection event**, asserting that one tick
     moves `@hive_turn_suffix` on both windows.
 - The status-right slot gains a network dependency, bounded by the 60 s
-  cache, the 3 s timeout, and one lookup per distinct pair key per TTL
-  rather than per window or per tick. A pair shares a cache entry; two
-  same-named branches on different remotes do not.
-- Reading a branch reflog and HEAD per hive window per tick is a local
-  `git` call; it is in the cost class ADR-0002 accepted for the label path,
-  and it is measured before the change ships, the way that ADR measured its
-  scan.
+  cache, the per-lookup timeout, the parallel limit, the producer deadline,
+  and one lookup per distinct pair key per TTL rather than per window or per
+  tick. A pair shares a cache entry; two same-named branches on different
+  remotes do not.
+- Reading a branch reflog, HEAD, and the default branch per eligible window
+  per tick is local `git`; it is in the cost class ADR-0002 accepted for the
+  label path, and it is measured before the change ships, the way that ADR
+  measured its scan.
 - Reflogs expire (`gc.reflogExpire`, 90 days by default) and are absent in
   some clone shapes, so a long-lived branch can lose its derived role. The
   result is *unknown*, shown as such, and one `hive tmux role` command fixes
@@ -445,11 +547,13 @@ is worse than none: it would make one side look authoritative.
 - Row 2 does not fire until an enricher exists, so in version 1 a question
   left by the last speaker still reads as a handoff. This is the current
   behavior, so it is a known gap rather than a regression.
-- Comment classification is by a bounded grammar seeded from the corpus. If
-  the review discipline changes its wording, the fixtures fail first; the
-  `Handoff:` marker is the path to making the grammar a fallback.
-- The 6 pre-discipline header comments stay unrecognized. They belong to
-  closed PRs and cannot be the latest comment of a live pair.
+- Comment classification is by a bounded, anchored grammar seeded from the
+  corpus. If the review discipline changes its wording, the fixtures fail
+  first; the `Handoff:` marker is the path to making the grammar a fallback.
+- The guards refuse two real comments in the corpus: one pre-discipline
+  approval phrased with a negation ("I don't see any blocking issues") and
+  one completion whose first line mentions "approved-review nits". Both are
+  on closed PRs; both would have shown no glyph, not a wrong one.
 
 ## Infra Impact
 
@@ -465,12 +569,22 @@ None.
   `branch.<name>.remote`/`.merge` set to the tracking upstream.
 - The comment corpus is this repository's 87 PR comments across PRs #7–#38,
   read through the API on 2026-09-06. The initial four-phrase grammar
-  recognized 65; the bounded grammar in this ADR recognizes 78 (30
-  completion, 23 approve, 25 changes requested, 0 no new delta), with 0
-  ambiguous and 9 unrecognized, itemized in **Context**.
-- The identity facts in **Context** were read from `scripts/hive.py`:
-  `_normalize_origin_url` (remote dedup) and `_label_cache_key` (workspace
-  path hash).
+  recognized 65. A loose grammar (approval words anywhere, completion verb
+  within four words of a SHA) recognized 78 but accepted every mutation
+  negative listed in the classifier section. The anchored, guarded grammar
+  in this ADR recognizes **75** (29 completion, 21 approve, 25 changes
+  requested, 0 no new delta), with 0 ambiguous and 12 unrecognized: 6
+  header-only comments from PRs #7, #10, and #11 (written before the
+  discipline fixed its wording), 4 comments that are not handoffs (a
+  metadata-only PR-body refresh, a post-merge note, two progress notes), and
+  the 2 guard refusals itemized in **Consequences**. All 14 mutation
+  negatives are unrecognized; all 18 positive fixtures, including a marker
+  case, are recognized.
+- The identity and storage facts in **Context** were read from
+  `scripts/hive.py`: `_normalize_origin_url` (remote dedup),
+  `_label_cache_key` (workspace path hash), `_default_branch` (reads
+  `refs/remotes/origin/HEAD`), `_TMUX_DIR = Path('/tmp/hive-tmux')` with
+  default-mode `mkdir` calls, and the popup's `tempfile.mkstemp`.
 - The scheduling facts in **Context** were read from the tmux config
   generator in `scripts/hive.py`: the three `set-hook … label-window` lines,
   the `status-right` `#(hive tmux status-context …)` slot, the reload and
@@ -494,15 +608,18 @@ None.
   redraw, but an agent that pauses between tool calls for longer than that
   will flicker to quiet and back. The number is a constant in one place and
   the fixtures pin it; it may need to move after a week of use.
-- Is 7 days the right bound for resolving a closed PR? It only matters for
-  the `↩` state, which the SHA binding already limits; the bound exists to
-  keep the lookup cheap, not to define staleness.
+- Is a 6 s producer deadline right against a 15 s interval? It leaves nine
+  seconds for tmux calls and label work; a hive with many keys on a slow
+  network may want the interval raised instead of the deadline.
+- Should the negation guard admit a positive sentence-final form such as
+  `no blocking findings.` when it follows a negation earlier on the line?
+  Today it refuses; the corpus cost is one pre-discipline comment.
 - Should the review discipline adopt the `Handoff:` marker now, so the
   grammar is a fallback from day one, or after the grammar has shown which
   real comments it misreads?
 - Where does version 2 enricher state live, and who clears it when a window
-  is reused for a different PR? The `@hive_turn_role_declared` lifecycle is
-  the model; the question is whether the question flag follows it.
+  is reused for a different PR? The `@hive_turn_role_declared` binding is
+  the model; the question is whether the question flag carries a key too.
 
 ## Revisit Triggers
 
@@ -512,7 +629,8 @@ None.
   comment author sufficient for the role.
 - The review discipline adopts the `Handoff:` marker, at which point the
   first-line grammar can be demoted to a fallback and its fixtures frozen.
-- Multi-reviewer pairs become routine, and the pair model needs to be a set.
+- Multi-reviewer groups become routine, and the pair shape needs to become
+  a set with a rule of its own.
 - PR lookups in the status-right slot prove too slow or rate-limited in
   practice, which would push the state into a hook-written file after all.
 
@@ -535,23 +653,43 @@ None.
   role.** Rejected after review: the first derived tick would be read back
   as a declaration on the next, the role would never return to unknown when
   its evidence expired, and the popup could not name its source.
+- **A declaration without its pair key.** Rejected after review: every
+  producer tick is a new process, so a bare `reviewer` cannot be told apart
+  from a `reviewer` declared for a branch the window has since left.
 - **Pair and cache by bare branch name.** Rejected after review: a hive is
-  multi-repository and branch names collide across repositories; two
-  unrelated `fix/foo` branches would pair with each other and share one PR
-  record. `(remote, branch)` is the key `hive` already uses for everything
-  else it dedupes.
+  multi-repository and branch names collide across repositories.
+  `(remote, branch)` is the key `hive` already uses for everything else it
+  dedupes.
+- **Every equal-key group is a pair.** Rejected after review: it would pair
+  two idle windows on `main`, and it leaves three windows, duplicate roles,
+  and unknown roles undefined. Eligibility and the shape table replace it.
 - **Pairing only on an open PR.** Rejected: it made the no-PR rows
   unreachable for a two-window pair, and a reviewer can fetch a branch
   before the PR exists.
+- **A seven-day bound on resolving a closed PR.** Rejected after review: it
+  turned an untouched, finished checkout into an apparent new baton on day
+  eight. Receipts bound to `(pair key, HEAD)` and a count-bounded page
+  replace it; no state changes because time passed.
 - **A broad substring classifier over the whole comment body.** Rejected:
   "fixed" inside a findings list would turn a rejection into a completion,
-  and the corpus shows the verdict already lives on the first line. The
-  bounded grammar reads one line and one trailer and resolves ambiguity to
-  unrecognized instead of by precedence.
+  and the corpus shows the verdict already lives on the first line.
+- **A permissive first-line grammar with a negation blacklist.** Rejected
+  after review: it covered 78 of 87 and also accepted `Cannot approve this
+  yet`. Positive anchors plus an unconditional negation guard and a family
+  guard replace it, at a measured cost of two refusals in the corpus.
 - **Require a machine-readable marker from day one.** Rejected as a
   precondition: it would make the indicator blind to every comment already
   in the corpus and to any agent that has not adopted the convention. The
   marker is offered as an override that wins when present.
+- **Sequential lookups with a per-lookup timeout only.** Rejected after
+  review: N failures cost N timeouts and can overrun the status interval,
+  leaving later windows stale. Parallel lookups under a whole-producer
+  deadline replace it.
+- **Cache under `/tmp/hive-tmux` like the label cache.** Rejected after
+  review: that directory is `0755`/`0644` by convention and would expose
+  private-repository titles and comment lines to other local users. A
+  `0700`/`0600` state directory with atomic writes and bounded fields
+  replaces it.
 - **Event-driven refresh from the relabel hooks.** Rejected as sufficient:
   the hooks fire on window creation and selection, not on PR activity, so
   the glyph would go stale at exactly the moment it matters — after the agent
