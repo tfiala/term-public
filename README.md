@@ -34,6 +34,8 @@ It avoids:
 - `setup.sh` config linker and Neovim config installer
 - `setup/bootstrap-macos.sh` package/bootstrap helper (macOS)
 - `setup/bootstrap-linux.sh` package/bootstrap helper (RHEL 9 family, Ubuntu)
+- `setup/ssh-agent.service` per-user agent for Linux releases that ship
+  no socket-activated one of their own
 - `ghostty/xterm-ghostty.terminfo` vendored terminfo source, compiled by
   `setup.sh` on hosts without the Ghostty app bundle
 - `tests/smoke/bootstrap-linux.sh` post-bootstrap check for a Linux host
@@ -216,21 +218,52 @@ Other differences from the macOS baseline:
   and defaults to night otherwise.
 - **ssh-agent.** macOS hands every login session an agent: launchd runs
   `com.openssh.ssh-agent` and injects `SSH_AUTH_SOCK`. Linux has no
-  equivalent for an sshd-spawned shell. Debian/Ubuntu's `openssh-client`
-  ships a socket-activated *user* agent (`ssh-agent.socket`, listening on
-  `$XDG_RUNTIME_DIR/openssh_agent`; Fedora/Arch use `ssh-agent.socket` as
-  the socket name too), but its `SSH_AUTH_SOCK` lives in the systemd user
-  manager's environment, which `sshd`'s children never inherit — so
-  `ssh -T git@github.com` and `git fetch` over SSH fail with
-  `Permission denied (publickey)` on a passphrase-protected key even though
-  an agent is listening. `bash/bashrc` adopts that socket when one is live
-  and nothing has set `SSH_AUTH_SOCK` already, above the interactive-only
-  cutoff so `ssh host 'git fetch'` gets it too. It never starts an agent:
-  an `ssh-agent` per shell orphans one agent per login that no later shell
-  can reach. If no socket is listening — the RHEL 9 family does not ship
-  these units — run `systemctl --user enable --now ssh-agent.socket`, or
-  provide an agent some other way. The agent starts empty; `ssh-add` once
-  per agent lifetime, or set `AddKeysToAgent yes` in `~/.ssh/config`.
+  equivalent for an sshd-spawned shell, and what the distribution provides
+  varies by release. Checked against the packages themselves:
+
+  | Release | `openssh-client` | user units shipped | socket path |
+  |---|---|---|---|
+  | Ubuntu 26.04 | 1:10.2p1 | `ssh-agent.service` + `.socket` | `$XDG_RUNTIME_DIR/openssh_agent` |
+  | Debian 13 | 1:10.0p1 | `ssh-agent.service` + `.socket` | `$XDG_RUNTIME_DIR/openssh_agent` |
+  | Fedora 41 | 9.9p1 | `ssh-agent.service` + `.socket` | `$XDG_RUNTIME_DIR/ssh-agent.socket` |
+  | Ubuntu 24.04 / 22.04 | 1:9.6p1 / 1:8.9p1 | `ssh-agent.service` only | — |
+  | Debian 12 | 1:9.2p1 | `ssh-agent.service` only | — |
+  | RHEL 9 family | — | none | — |
+
+  **Where a socket unit exists**, its `SSH_AUTH_SOCK` is set in the systemd
+  *user manager's* environment, which `sshd`'s children never inherit — so
+  the agent is listening and no shell can reach it, and `git fetch` over SSH
+  fails with `Permission denied (publickey)` on a passphrase-protected key.
+  `bash/bashrc` adopts the socket when the agent behind it answers, above the
+  interactive-only cutoff so `ssh host 'git fetch'` gets it too. It probes
+  reachability rather than trusting the inode: none of these units set
+  `RemoveOnStop=`, whose systemd default is off, so a stopped unit leaves a
+  socket node that `[[ -S ]]` accepts and `connect()` refuses.
+
+  It never starts an agent — an `ssh-agent` per shell orphans one agent per
+  login that no later shell can reach.
+
+  **Where no socket unit is shipped** — Ubuntu 24.04 and older, Debian 12 and
+  older, the RHEL 9 family — there is nothing to adopt and the block is a
+  no-op. `systemctl --user enable --now ssh-agent.socket` fails there, and
+  the `ssh-agent.service` those releases do ship is not a substitute: it has
+  no `[Install]` section, and on Debian/Ubuntu it is gated behind
+  `ConditionPathExists=/etc/X11/Xsession.options`, so it never starts on a
+  headless host. Install the unit this repo ships instead:
+
+  ```bash
+  mkdir -p ~/.config/systemd/user
+  cp setup/ssh-agent.service ~/.config/systemd/user/
+  systemctl --user daemon-reload
+  systemctl --user enable --now ssh-agent.service
+  loginctl enable-linger "$USER"   # optional: keep the agent across logins
+  ```
+
+  It binds `$XDG_RUNTIME_DIR/openssh_agent` — the path `bash/bashrc` probes
+  first — so the shell adopts it exactly as it would a distribution agent.
+
+  Either way the agent starts empty: `ssh-add` once per agent lifetime, or
+  set `AddKeysToAgent yes` in `~/.ssh/config`.
 
 CI runs the bootstrap for real on every push: natively on `ubuntu-latest`
 and inside an `almalinux:9` container as root, each followed by `setup.sh`

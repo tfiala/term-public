@@ -71,29 +71,43 @@ fi
 # --- ssh-agent ----------------------------------------------------------------
 # macOS launchd runs an agent and injects SSH_AUTH_SOCK into every login
 # session, so a Mac shell finds one for free.  Linux has no equivalent for an
-# sshd-spawned shell: openssh-client ships a socket-activated *user* agent
-# (Debian/Ubuntu listen on $XDG_RUNTIME_DIR/openssh_agent, Fedora/Arch on
-# ssh-agent.socket), but its SSH_AUTH_SOCK lives in the systemd user manager's
+# sshd-spawned shell: where openssh-client ships a socket-activated *user*
+# agent (Debian/Ubuntu listen on $XDG_RUNTIME_DIR/openssh_agent, Fedora/Arch
+# on ssh-agent.socket), its SSH_AUTH_SOCK lives in the systemd user manager's
 # environment, which sshd's children never inherit.  Adopt that agent when one
-# is listening and nothing has set SSH_AUTH_SOCK already -- an inherited value
+# is reachable and nothing has set SSH_AUTH_SOCK already -- an inherited value
 # (a forwarded agent, or launchd's) always wins.
 #
+# Reachability, not just the inode.  `-S` proves only the node type, and none
+# of the shipped ssh-agent.socket units set RemoveOnStop=, whose systemd
+# default is off -- a stopped or failed unit leaves the node behind and
+# connecting to it gets ECONNREFUSED.  So ask the agent: `ssh-add -l` exits 2
+# only when it cannot connect (0 = has keys, 1 = reachable but empty).  A dead
+# candidate is skipped rather than ending the search, so a stale first path
+# cannot mask a live second one.
+#
 # Deliberately never start an agent: `eval $(ssh-agent)` here would orphan one
-# agent per login that no later shell can reach.  If no socket is listening,
-# `systemctl --user enable --now ssh-agent.socket` is the fix, not this file.
+# agent per login that no later shell can reach.  Where a distribution ships
+# no socket unit at all (Ubuntu <= 24.04, Debian <= 12), this block finds
+# nothing and does nothing -- see the README for the per-user unit that fills
+# the gap there.
 #
 # Placed above the interactive-only cutoff on purpose -- `ssh host 'git fetch'`
 # runs a non-interactive bash and is exactly the case that needs an agent.
-if [[ -z "${SSH_AUTH_SOCK:-}" && -n "${XDG_RUNTIME_DIR:-}" ]]; then
+if [[ -z "${SSH_AUTH_SOCK:-}" && -n "${XDG_RUNTIME_DIR:-}" ]] \
+    && command -v ssh-add >/dev/null 2>&1; then
   for _tp_agent_sock in \
       "$XDG_RUNTIME_DIR/openssh_agent" \
       "$XDG_RUNTIME_DIR/ssh-agent.socket"; do
-    if [[ -S "$_tp_agent_sock" ]]; then
+    [[ -S "$_tp_agent_sock" ]] || continue
+    SSH_AUTH_SOCK="$_tp_agent_sock" ssh-add -l >/dev/null 2>&1
+    _tp_agent_probe=$?
+    if (( _tp_agent_probe != 2 )); then
       export SSH_AUTH_SOCK="$_tp_agent_sock"
       break
     fi
   done
-  unset _tp_agent_sock
+  unset _tp_agent_sock _tp_agent_probe
 fi
 
 # Everything below is interactive-only chrome.

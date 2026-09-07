@@ -1,0 +1,29 @@
+# term-public per-user ssh-agent, for Linux hosts whose openssh-client ships
+# no socket-activated agent of its own -- Ubuntu 24.04 and older, Debian 12
+# and older, and the RHEL 9 family.  Install it with:
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp setup/ssh-agent.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ssh-agent.service
+#
+# It binds the same path bash/bashrc probes first, so the shell adopts it
+# exactly as it would a distribution-provided agent.
+#
+# Deliberately not socket-activated: whether ssh-agent accepts a listening
+# socket passed by systemd varies across the very releases this unit exists
+# to cover, and binding the path directly works on all of them.
+[Unit]
+Description=OpenSSH Agent (term-public)
+Documentation=man:ssh-agent(1)
+
+[Service]
+Type=simple
+Environment=SSH_ASKPASS_REQUIRE=force
+# An unclean stop leaves the socket node behind and ssh-agent will not bind
+# over one.  The leading "-" keeps a missing node from failing the start.
+ExecStartPre=-/bin/rm -f %t/openssh_agent
+ExecStart=/usr/bin/ssh-agent -D -a %t/openssh_agent
+
+[Install]
+WantedBy=default.target
