@@ -55,6 +55,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -2391,9 +2392,9 @@ def _generate_tmux_config(hive: Path, color: dict) -> str:
         'set automatic-rename off',
         'set allow-rename off',
         '',
-        '# Window label update hooks (session-scoped)',
+        '# Window label and user-paced turn update hooks (session-scoped)',
         'set-hook after-new-window   "run-shell -b \'hive tmux label-window \\"#{pane_current_path}\\" \\"#{window_id}\\"\'"',
-        'set-hook after-select-window "run-shell -b \'hive tmux label-window \\"#{pane_current_path}\\" \\"#{window_id}\\"\'"',
+        'set-hook after-select-window "run-shell -b \'hive tmux label-window \\"#{pane_current_path}\\" \\"#{window_id}\\"; hive tmux turn-refresh \\"#{session_name}\\" --if-idle >/dev/null\'"',
         'set-hook after-select-pane   "run-shell -b \'hive tmux label-window \\"#{pane_current_path}\\" \\"#{window_id}\\"\'"',
         '',
         '# Keybindings — tmux keybindings are global (not session-scoped), so',
@@ -3701,21 +3702,49 @@ def _set_turn_session_line(session: str, line: str) -> None:
         capture_output=True)
 
 
+def _acquire_turn_refresh_lock(session: str) -> int | None:
+    """Take the nonblocking per-session lock used by selection refreshes."""
+    if not _ensure_turn_state_dir():
+        return None
+    digest = hashlib.sha256(session.encode()).hexdigest()
+    path = _TURN_STATE_DIR / f'refresh-{digest}.lock'
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, 'O_NOFOLLOW'):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o600)
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        if 'fd' in locals():
+            os.close(fd)
+        return None
+    return fd
+
+
 def _tmux_turn_refresh(session: str, bust_cache: bool = False,
-                       print_line: bool = True) -> bool:
+                       print_line: bool = True,
+                       if_idle: bool = False) -> bool:
     """Run one bounded session-wide turn producer tick."""
-    if bust_cache:
-        _bust_turn_mutable_cache()
-    snapshot = _build_turn_session(session)
-    if snapshot is None:
-        return False
-    _apply_turn_session(snapshot)
-    line = _turn_pair_line(snapshot)
-    _set_turn_session_line(session, line)
-    if print_line:
-        if line:
-            sys.stdout.write(line)
-    return True
+    lock_fd = _acquire_turn_refresh_lock(session) if if_idle else None
+    if if_idle and lock_fd is None:
+        return True
+    try:
+        if bust_cache:
+            _bust_turn_mutable_cache()
+        snapshot = _build_turn_session(session)
+        if snapshot is None:
+            return False
+        _apply_turn_session(snapshot)
+        line = _turn_pair_line(snapshot)
+        _set_turn_session_line(session, line)
+        if print_line:
+            if line:
+                sys.stdout.write(line)
+        return True
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
 
 
 def _format_turn_duration(age: float) -> str:
@@ -4279,7 +4308,8 @@ def cmd_tmux(args: argparse.Namespace) -> None:
         return
     if action == 'turn-refresh':
         if not _tmux_turn_refresh(
-                args.session, bust_cache=getattr(args, 'bust_cache', False)):
+                args.session, bust_cache=getattr(args, 'bust_cache', False),
+                if_idle=getattr(args, 'if_idle', False)):
             sys.exit(1)
         return
     if action == 'pairs':
@@ -4730,6 +4760,7 @@ def main():
     tmux_turn = tmux_sub.add_parser('turn-refresh')
     tmux_turn.add_argument('session')
     tmux_turn.add_argument('--bust-cache', action='store_true')
+    tmux_turn.add_argument('--if-idle', action='store_true')
     tmux_pairs = tmux_sub.add_parser('pairs')
     tmux_pairs.add_argument('session', nargs='?')
     tmux_role = tmux_sub.add_parser('role')

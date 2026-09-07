@@ -315,7 +315,10 @@ Two cross-cutting rules complete it:
   previous tick's glyph is cleared, not kept; a stale `▶` is a wrong pointer.
   An immutable merged receipt is not a lookup and is unaffected; an expired
   closed observation is. This is the rule ADR-0002 drew for run state: a
-  failed observation is not a verdict.
+  failed observation is not a verdict. Between completed refreshes, however,
+  the glyph is explicitly the last observation and can name a window that has
+  since acted. Selecting a window, opening the pairs popup, or pressing
+  backtick+R refreshes it; only backtick+R bypasses the mutable PR cache.
 
 ### Comment classifier
 
@@ -418,8 +421,11 @@ Cheapest first, and they stack:
 ### Refresh producer
 
 A new `hive tmux turn-refresh <session>` runs at session creation and config
-reload, after a role declaration changes, and from the backtick+`p` and
-backtick+`R` bindings. `status-right` reads the resulting
+reload, after a role declaration changes, after a window is selected, and from
+the backtick+`p` and backtick+`R` bindings. Window-selection refreshes pass
+`--if-idle`: a nonblocking per-session file lock lets one refresh run while
+additional selection events exit successfully instead of stacking producers.
+`status-right` reads the resulting
 `@hive_turn_pair_line` option; it does not execute the producer. Each bounded
 refresh does the whole session's work:
 
@@ -453,11 +459,14 @@ refresh does the whole session's work:
 Because step 6 evaluates every window in one snapshot, both windows of a pair
 change together. The popup refreshes while opening; backtick+R refreshes
 without opening it and also busts every mutable PR entry (never an immutable
-merged receipt). External PR activity is intentionally on-demand: a safe
-periodic scheduler must not be inferred from `status-interval`.
+merged receipt). Window selection is user-paced and uses the ordinary 60-second
+PR cache, so most switches remain local. External PR activity is intentionally
+event-driven rather than periodic: a safe scheduler must not be inferred from
+`status-interval`.
 
 `label-window` stays what it is; it reads the options the producer wrote and
-does no PR work of its own, so the hook path keeps ADR-0002's cost profile.
+does no PR work of its own. The `after-select-window` hook runs it before the
+separate single-flight turn refresh; `after-select-pane` stays label-only.
 
 ### Private cache
 
@@ -713,8 +722,11 @@ None.
 - A one-session canary after changing option writes to deltas completed a
   cache-busted 10-window refresh in 0.55 s and a steady refresh in 0.28 s, but
   `status-right` still launched 13 producers in 20 s. This disproved the
-  assumed `status-interval` scheduling boundary and is why the accepted
-  implementation is on-demand rather than periodic.
+  assumed `status-interval` scheduling boundary. An isolated tmux 3.7c probe
+  subsequently measured 3 launches with one attached client and 9 with three
+  clients in about 20 seconds: each client evaluates `status-right`
+  independently. This client-count multiplier is why the accepted
+  implementation is event-driven rather than status-render-driven.
 - The identity and storage facts in **Context** were read from
   `scripts/hive.py`: `_normalize_origin_url` (remote dedup),
   `_label_cache_key` (workspace path hash), `_default_branch` (reads
