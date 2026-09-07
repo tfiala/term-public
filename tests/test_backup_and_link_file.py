@@ -383,6 +383,7 @@ def _scaffold_repo(tmp_path):
     (repo_root / "starship").mkdir()
     (repo_root / "scripts").mkdir()
     (repo_root / "tmux").mkdir()
+    (repo_root / "neovim").mkdir()
     (repo_root / "local").mkdir()
     (repo_root / "ghostty" / "config").write_text("ghostty = true\n")
     (repo_root / "bash" / "bash_profile").write_text("# bash_profile\n")
@@ -399,6 +400,16 @@ def _scaffold_repo(tmp_path):
         "# bashrc template\n")
     (repo_root / "ghostty" / "local.config.template").write_text(
         "# ghostty template\n")
+    real = Path(SETUP_SH).resolve().parent
+    (repo_root / "neovim" / "configs.bash").write_text(
+        (real / "neovim" / "configs.bash").read_text())
+
+    # Most setup tests exercise unrelated install semantics. Existing Neovim
+    # directories make those runs hermetic; dedicated tests below remove them
+    # and exercise real clones from local fixture repositories.
+    config_home = home / ".config"
+    for appname in ("nvim-astro5", "nvim-lazyvim", "nvim-nvchad"):
+        (config_home / appname).mkdir(parents=True)
 
     return repo_root, home
 
@@ -451,6 +462,144 @@ def test_setup_runs_with_system_bash(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert (home / ".bashrc").is_symlink()
+
+
+def _make_nvim_config_source(path, marker):
+    """Create a local main-branch repository suitable for git clone."""
+    subprocess.run(["git", "init", "-q", "-b", "main", str(path)], check=True)
+    (path / "init.lua").write_text(f"-- {marker}\n")
+    subprocess.run(["git", "-C", str(path), "add", "init.lua"], check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "-c", "user.name=Term Public Tests",
+         "-c", "user.email=term-public@example.invalid", "commit", "-qm",
+         "initial config"], check=True)
+
+
+class TestNeovimConfigInstall:
+    SPECS = (
+        ("va", "nvim-astro5", "https://github.com/tfiala/nvim-astro5.git",
+         "tfiala"),
+        ("vl", "nvim-lazyvim", "https://github.com/tfiala/nvim-config.git",
+         "tfiala"),
+        ("vn", "nvim-nvchad", "https://github.com/tfiala/nvim-nvchad.git",
+         "tfiala"),
+    )
+
+    def test_manifest_is_the_public_source_and_alias_contract(self):
+        manifest = Path(SETUP_SH).resolve().parent / "neovim" / "configs.bash"
+        result = subprocess.run(
+            ["bash", "-c",
+             'source "$1"; printf "%s\\n" "${TERM_PUBLIC_NVIM_CONFIG_SPECS[@]}"',
+             "term-public-test", str(manifest)],
+            capture_output=True, text=True)
+
+        assert result.returncode == 0, result.stderr
+        expected = ["|".join(spec) for spec in self.SPECS]
+        assert result.stdout.splitlines() == expected
+
+    def test_setup_clones_missing_configs_and_aliases_launch_them(self, tmp_path):
+        repo_root, home = _scaffold_repo(tmp_path)
+        _use_real_bash_config(repo_root)
+        local_specs = []
+        for alias, appname, _, _ in self.SPECS:
+            destination = home / ".config" / appname
+            destination.rmdir()
+            source = tmp_path / f"source-{appname}"
+            _make_nvim_config_source(source, appname)
+            local_specs.append(f'  "{alias}|{appname}|{source}|main"')
+        (repo_root / "neovim" / "configs.bash").write_text(
+            "TERM_PUBLIC_NVIM_CONFIG_SPECS=(\n" +
+            "\n".join(local_specs) + "\n)\n")
+
+        result = _run_setup(repo_root, home, bash_executable="/bin/bash")
+
+        assert result.returncode == 0, result.stderr
+        for _, appname, _, _ in self.SPECS:
+            destination = home / ".config" / appname
+            assert (destination / ".git").is_dir()
+            assert (destination / "init.lua").read_text() == f"-- {appname}\n"
+
+        nvim = home / "bin" / "nvim"
+        nvim.write_text(
+            "#!/usr/bin/env bash\n"
+            "printf '%s|%s\\n' \"${NVIM_APPNAME:-missing}\" \"$*\"\n")
+        nvim.chmod(0o755)
+        shell = subprocess.run(
+            ["bash", "--rcfile", str(home / ".bashrc"), "-ic",
+             "va astro; vl lazy; vn chad"],
+            capture_output=True, text=True,
+            env={**os.environ, "HOME": str(home),
+                 "XDG_CONFIG_HOME": str(home / ".config"),
+                 "TERM_PUBLIC_ROOT": str(repo_root),
+                 "TERM": "xterm-256color"})
+        assert shell.returncode == 0, shell.stderr
+        assert "nvim-astro5|astro" in shell.stdout
+        assert "nvim-lazyvim|lazy" in shell.stdout
+        assert "nvim-nvchad|chad" in shell.stdout
+
+    def test_clone_failure_does_not_block_primary_setup(self, tmp_path):
+        repo_root, home = _scaffold_repo(tmp_path)
+        missing = home / ".config" / "nvim-lazyvim"
+        missing.rmdir()
+        manifest = repo_root / "neovim" / "configs.bash"
+        manifest.write_text(
+            manifest.read_text().replace(
+                "https://github.com/tfiala/nvim-config.git",
+                str(tmp_path / "unreachable-nvim-config")))
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0, result.stderr
+        assert (home / ".bashrc").is_symlink()
+        assert (home / ".bash_profile").is_symlink()
+        assert (repo_root / "local" / "env.local").is_file()
+        assert not missing.exists()
+        assert "WARNING: could not install Neovim config: nvim-lazyvim" \
+            in result.stderr
+        assert "Linked config into place." in result.stdout
+
+    def test_setup_preserves_existing_config_directory(self, tmp_path):
+        repo_root, home = _scaffold_repo(tmp_path)
+        existing = home / ".config" / "nvim-lazyvim"
+        marker = existing / "local-change"
+        marker.write_text("keep me\n")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode == 0, result.stderr
+        assert marker.read_text() == "keep me\n"
+
+    def test_setup_rejects_non_directory_destination(self, tmp_path):
+        repo_root, home = _scaffold_repo(tmp_path)
+        collision = home / ".config" / "nvim-lazyvim"
+        collision.rmdir()
+        collision.write_text("not a config directory\n")
+
+        result = _run_setup(repo_root, home)
+
+        assert result.returncode != 0
+        assert "Neovim config destination is not a directory" in result.stderr
+        assert "Linked config into place." not in result.stdout
+
+    def test_missing_manifest_is_silent_in_interactive_shell(self, tmp_path):
+        repo_root, home = _scaffold_repo(tmp_path)
+        _use_real_bash_config(repo_root)
+        (repo_root / "neovim" / "configs.bash").unlink()
+        nvim = home / "bin" / "nvim"
+        nvim.parent.mkdir(exist_ok=True)
+        nvim.write_text("#!/usr/bin/env bash\n")
+        nvim.chmod(0o755)
+
+        shell = subprocess.run(
+            ["bash", "--rcfile", str(repo_root / "bash" / "bashrc"),
+             "-ic", "command true"],
+            capture_output=True, text=True,
+            env={**os.environ, "HOME": str(home),
+                 "TERM_PUBLIC_ROOT": str(repo_root),
+                 "TERM": "xterm-256color"})
+
+        assert shell.returncode == 0
+        assert "neovim/configs.bash" not in shell.stderr
 
 
 def _make_prior_checkout(path, origin="https://github.com/example/term-public.git"):
