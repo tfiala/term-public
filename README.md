@@ -121,7 +121,7 @@ RHEL 9 family (RHEL, Rocky, AlmaLinux, CentOS Stream; Fedora takes the same
 
 ```bash
 setup/bootstrap-linux.sh --dry-run   # print the plan: every privileged/network command, nothing changed
-setup/bootstrap-linux.sh             # install (sudo, or run as root)
+setup/bootstrap-linux.sh             # install (sudo, or run as root; without either see below)
 ./setup.sh                           # link config, install the xterm-ghostty terminfo
 tests/smoke/bootstrap-linux.sh       # optional: prove it took
 ```
@@ -129,22 +129,35 @@ tests/smoke/bootstrap-linux.sh       # optional: prove it took
 What the bootstrap does, and the order it does it in:
 
 - **Package manager first, upstream release second — per tool.** Each tool
-  is skipped if already present, then requested from `dnf`/`apt` one
-  package per call, and only if that fails is it installed from the
-  project's own GitHub release binary (starship, ripgrep, fd, bat, eza, gh,
-  jq, fzf have one; tmux, git, bash-completion, python3 do not and are
-  reported instead). Release binaries go to `/usr/local/bin` (or `~/bin`
-  without root), are fetched over HTTPS, and are checked against the
-  project's per-asset `.sha256` where one is published. Nothing is piped
-  from `curl` into a shell.
+  is skipped if already complete, then requested from `dnf`/`apt` one
+  package per call, and only if that fails — or reports success while the
+  tool is still incomplete — is it installed from the project's own GitHub
+  release (starship, ripgrep, fd, bat, eza, gh, jq, fzf have one; tmux,
+  git, bash-completion, python3 do not and are reported instead). Release
+  binaries go to `/usr/local/bin` (`--bin-dir` overrides), are fetched over
+  HTTPS, and are checked against the project's per-asset `.sha256` where
+  one is published. Nothing is piped from `curl` into a shell. fzf is two
+  artifacts, the binary and the shell bindings `bash/bashrc` sources; each
+  is checked and repaired on its own, at the installed binary's version, so
+  an interrupted run or a hand-installed bare binary is completed on the
+  next run rather than skipped as present.
 - **Never a distribution upgrade.** The script installs a tool set; it does
-  not run `dnf upgrade` or `apt-get upgrade`. A RHEL host whose
-  subscription has lapsed still gets everything EPEL and its enabled repos
-  provide (fzf, ripgrep, fd, bat, gh live in EPEL, which the script enables
-  when missing), and the upstream fallback covers the rest — on RHEL 9 that
-  is starship and eza, which no enabled repo carries. One unreachable repo
-  or missing package never aborts the run; the summary lists anything it
-  could not install and exits non-zero in that case.
+  not run `dnf upgrade` or `apt-get upgrade`, and a failed package-index
+  refresh is a warning, not a stop. A RHEL host whose subscription has
+  lapsed still gets everything EPEL and its enabled repos provide (fzf,
+  ripgrep, fd, bat, gh live in EPEL, which the script enables when
+  missing), and the upstream fallback covers the rest — on RHEL 9 that is
+  starship and eza, which no enabled repo carries. One unreachable repo or
+  missing package never aborts the run; the summary lists anything it could
+  not install and exits non-zero in that case.
+- **Without root or sudo** the package-manager steps are skipped, the
+  upstream releases go to `~/bin` (first on PATH via `bash/bashrc`), and the
+  tools that only a package can provide are reported. Enough for a working
+  prompt on a box you do not administer.
+- **`--dry-run`** prints each privileged command and, for every upstream
+  fallback, the concrete download, verification and install commands it
+  would run, with `<latest>` standing in for a release version that is
+  resolved over the network at run time.
 - **Login shell.** Linux already ships bash 5.x, so nothing is installed
   or registered in `/etc/shells`; `chsh -s /bin/bash` runs only when the
   account's login shell is something else (it prompts for your password).

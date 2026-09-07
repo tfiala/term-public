@@ -9,8 +9,8 @@
 #   1. installs the prompt and tool stack (starship, tmux, fzf, ripgrep, fd,
 #      bat, eza, gh, jq, git, bash-completion, python3 for hive), trying the
 #      distribution's package manager FIRST for every tool and, only where
-#      that fails, an upstream release binary from the project's GitHub
-#      releases;
+#      that fails or leaves the tool incomplete, an upstream release from the
+#      project's GitHub releases;
 #   2. makes sure the login shell is bash (chsh only when it is not);
 #   3. reports what it could not install.
 #
@@ -19,10 +19,17 @@
 #     whose subscription lapsed or whose base repos are unreachable still gets
 #     everything its reachable repos provide, and the upstream fallback covers
 #     the rest;
-#   - one package per package-manager call, so one unavailable package (or one
-#     unreachable repo) does not abort the rest;
-#   - --dry-run prints every privileged and network command (prefixed "+")
-#     instead of running it, changes nothing, and needs neither root nor sudo.
+#   - a failed package-index refresh is advisory, and one package per
+#     package-manager call, so one unreachable repo or unavailable package
+#     never aborts the rest;
+#   - every tool is re-checked after the package manager reports success, so
+#     a partial install (fzf's binary without its shell bindings, say) is
+#     repaired on the next run instead of being skipped as present;
+#   - without root or sudo the package-manager steps are skipped and the
+#     upstream releases go to ~/bin (which bash/bashrc puts first on PATH);
+#   - --dry-run prints every privileged and network command (prefixed "+",
+#     release versions shown as <latest>) instead of running it, changes
+#     nothing, and needs neither root nor sudo.
 #
 # Ghostty itself is not installed: a Linux host is set up as the SSH target of
 # a Ghostty terminal.  ./setup.sh installs the xterm-ghostty terminfo so those
@@ -31,21 +38,29 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-usage: setup/bootstrap-linux.sh [--dry-run]
+usage: setup/bootstrap-linux.sh [--dry-run] [--bin-dir DIR]
 
 Installs the term-public shell stack on RHEL-family or Ubuntu/Debian hosts.
   --dry-run, -n   print the privileged and network commands instead of running them
+  --bin-dir DIR   where upstream release binaries go
+                  (default /usr/local/bin with root or sudo, else ~/bin)
   -h, --help      show this help
 USAGE
 }
 
 DRY_RUN=0
-for arg in "$@"; do
-  case "$arg" in
+BIN_DIR=""
+while (( $# > 0 )); do
+  case "$1" in
     --dry-run|-n) DRY_RUN=1 ;;
+    --bin-dir)
+      [[ $# -ge 2 ]] || { echo "bootstrap-linux: --bin-dir needs a directory" >&2; exit 2; }
+      BIN_DIR="$2"; shift ;;
+    --bin-dir=*) BIN_DIR="${1#--bin-dir=}" ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "bootstrap-linux: unknown argument: $arg" >&2; usage >&2; exit 2 ;;
+    *) echo "bootstrap-linux: unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
+  shift
 done
 
 # --- Host facts ---------------------------------------------------------------
@@ -72,34 +87,32 @@ case " $OS_ID $OS_ID_LIKE " in
 esac
 
 ARCH="$(uname -m)"
+case "$ARCH" in arm64) ARCH=aarch64 ;; esac   # macOS spelling, for dry runs
 USER_NAME="${USER:-$(id -un)}"
 
+# Privilege: root, sudo, or neither.  Neither is a supported mode — the
+# package-manager steps are skipped and upstream releases go to ~/bin.
 if (( EUID == 0 )); then
-  SUDO=""
+  SUDO="" PRIV_OK=1
 elif command -v sudo >/dev/null 2>&1; then
-  SUDO="sudo"
+  SUDO="sudo" PRIV_OK=1
 else
-  SUDO=""
-  if (( ! DRY_RUN )); then
-    echo "bootstrap-linux: run as root, or install sudo first." >&2
-    exit 1
-  fi
+  SUDO="" PRIV_OK=0
 fi
 
-if (( ! DRY_RUN )); then
+if (( PRIV_OK && ! DRY_RUN )); then
   case "$FAMILY" in
     dnf) command -v dnf >/dev/null 2>&1 || { echo "bootstrap-linux: dnf not found." >&2; exit 1; } ;;
     apt) command -v apt-get >/dev/null 2>&1 || { echo "bootstrap-linux: apt-get not found." >&2; exit 1; } ;;
   esac
 fi
 
-# Upstream release binaries go system-wide when we can, otherwise into the
-# ~/bin that bash/bashrc already puts first on PATH.
-if (( EUID == 0 )) || [[ -n "$SUDO" ]]; then
-  BIN_DIR=/usr/local/bin
-else
-  BIN_DIR="$HOME/bin"
+if [[ -z "$BIN_DIR" ]]; then
+  if (( PRIV_OK )); then BIN_DIR=/usr/local/bin; else BIN_DIR="$HOME/bin"; fi
 fi
+# Binaries this run installs must be visible to its own presence checks
+# (and to `fzf --version`), whether or not the caller's PATH has BIN_DIR yet.
+export PATH="$BIN_DIR:$PATH"
 
 # _priv CMD...
 # Run a privileged command; under --dry-run print it instead.
@@ -117,8 +130,10 @@ _priv() {
 
 # --- Package manager ----------------------------------------------------------
 # Metadata refresh only.  Never `dnf upgrade` / `apt-get upgrade` here: this
-# script installs a tool set, it does not maintain the host.
+# script installs a tool set, it does not maintain the host.  The caller
+# treats a failure as advisory.
 _pm_update() {
+  (( PRIV_OK )) || return 0
   case "$FAMILY" in
     apt) _priv env DEBIAN_FRONTEND=noninteractive apt-get -qq update ;;
     dnf) : ;;  # dnf refreshes per-repo metadata on each install as needed
@@ -127,6 +142,10 @@ _pm_update() {
 
 # _pm_install PKG — one package per call, so one failure stays one failure.
 _pm_install() {
+  if (( ! PRIV_OK )); then
+    echo "  (no root or sudo: package manager skipped)"
+    return 1
+  fi
   case "$FAMILY" in
     dnf) _priv dnf -y -q install "$1" ;;
     apt) _priv env DEBIAN_FRONTEND=noninteractive \
@@ -138,6 +157,7 @@ _pm_install() {
 # carries them natively.
 _ensure_epel() {
   [[ "$FAMILY" == dnf && "$OS_ID" != fedora ]] || return 0
+  (( PRIV_OK )) || return 0
   if command -v rpm >/dev/null 2>&1 && rpm -q epel-release >/dev/null 2>&1; then
     return 0
   fi
@@ -150,12 +170,18 @@ _ensure_epel() {
 }
 
 # --- Upstream release fallbacks -----------------------------------------------
-# Used only for a tool the package manager could not install.  Everything is
-# fetched over HTTPS from the project's own GitHub release; where the project
-# publishes a per-asset .sha256 (starship, ripgrep) the download is checked
-# against it.
+# Used only for a tool the package manager could not install or left
+# incomplete.  Everything is fetched over HTTPS from the project's own GitHub
+# release; where the project publishes a per-asset .sha256 (starship,
+# ripgrep) the download is checked against it.  Under --dry-run each step
+# prints the command it would run; release versions that would be resolved
+# over the network appear as <latest>.
 
 _fetch() {  # URL DEST
+  if (( DRY_RUN )); then
+    printf '+ curl -fsSL -o %s %s\n' "$2" "$1"
+    return 0
+  fi
   curl -fsSL --retry 3 --connect-timeout 20 -o "$2" "$1"
 }
 
@@ -163,6 +189,10 @@ _fetch() {  # URL DEST
 # mismatch is.
 _verify_if_published() {  # URL FILE
   local expected
+  if (( DRY_RUN )); then
+    printf '+ curl -fsSL -o %s.sha256 %s.sha256  (verify with sha256sum -c if published)\n' "$2" "$1"
+    return 0
+  fi
   if _fetch "$1.sha256" "$2.sha256" 2>/dev/null; then
     expected="$(awk 'NR == 1 { print $1 }' "$2.sha256")"
     printf '%s  %s\n' "$expected" "$2" | sha256sum -c --quiet - >/dev/null
@@ -173,6 +203,10 @@ _verify_if_published() {  # URL FILE
 # without a leading v.  No API call, so no rate limit.
 _latest_version() {
   local url
+  if (( DRY_RUN )); then
+    printf '%s\n' '<latest>'
+    return 0
+  fi
   url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' --retry 3 --connect-timeout 20 \
            "https://github.com/$1/releases/latest")" || return 1
   url="${url##*/}"
@@ -180,10 +214,15 @@ _latest_version() {
 }
 
 _install_bin() {  # SRC NAME
-  if [[ "$BIN_DIR" == "$HOME"/* ]]; then
-    mkdir -p "$BIN_DIR" && install -m 0755 "$1" "$BIN_DIR/$2"
+  if (( DRY_RUN )); then
+    printf '+ install -m 0755 %s %s\n' "$1" "$BIN_DIR/$2"
+    return 0
+  fi
+  mkdir -p "$BIN_DIR" 2>/dev/null || true
+  if [[ -d "$BIN_DIR" && -w "$BIN_DIR" ]]; then
+    install -m 0755 "$1" "$BIN_DIR/$2"
   else
-    _priv install -m 0755 "$1" "$BIN_DIR/$2"
+    _priv mkdir -p "$BIN_DIR" && _priv install -m 0755 "$1" "$BIN_DIR/$2"
   fi
 }
 
@@ -192,6 +231,13 @@ _install_bin() {  # SRC NAME
 # install BINARY (found by name anywhere in the archive) into BIN_DIR.
 _release_tarball_bin() {
   local url="$1" bin="$2" tmp found=""
+  if (( DRY_RUN )); then
+    _fetch "$url" "<tmp>/asset.tar.gz"
+    _verify_if_published "$url" "<tmp>/asset.tar.gz"
+    printf '+ tar -xzf <tmp>/asset.tar.gz -C <tmp>\n'
+    _install_bin "<tmp>/$bin" "$bin"
+    return 0
+  fi
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/term-public-bootstrap.XXXXXX")"
   if _fetch "$url" "$tmp/asset.tar.gz" \
       && _verify_if_published "$url" "$tmp/asset.tar.gz" \
@@ -209,6 +255,12 @@ _release_tarball_bin() {
 # _release_file_bin URL BINARY — a bare-binary release asset (jq).
 _release_file_bin() {
   local url="$1" bin="$2" tmp
+  if (( DRY_RUN )); then
+    _fetch "$url" "<tmp>/$bin"
+    _verify_if_published "$url" "<tmp>/$bin"
+    _install_bin "<tmp>/$bin" "$bin"
+    return 0
+  fi
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/term-public-bootstrap.XXXXXX")"
   if _fetch "$url" "$tmp/$bin" \
       && _verify_if_published "$url" "$tmp/$bin" \
@@ -220,12 +272,17 @@ _release_file_bin() {
   return 1
 }
 
+_no_release_for_arch() {
+  echo "  no upstream release for $ARCH" >&2
+  return 1
+}
+
 _manual_starship() {
   local t
   case "$ARCH" in
     x86_64) t=x86_64-unknown-linux-gnu ;;
     aarch64) t=aarch64-unknown-linux-musl ;;
-    *) return 1 ;;
+    *) _no_release_for_arch; return 1 ;;
   esac
   _release_tarball_bin \
     "https://github.com/starship/starship/releases/latest/download/starship-${t}.tar.gz" starship
@@ -233,7 +290,7 @@ _manual_starship() {
 
 _manual_ripgrep() {
   local v
-  case "$ARCH" in x86_64|aarch64) ;; *) return 1 ;; esac
+  case "$ARCH" in x86_64|aarch64) ;; *) _no_release_for_arch; return 1 ;; esac
   v="$(_latest_version BurntSushi/ripgrep)" || return 1
   _release_tarball_bin \
     "https://github.com/BurntSushi/ripgrep/releases/download/${v}/ripgrep-${v}-${ARCH}-unknown-linux-musl.tar.gz" rg
@@ -241,7 +298,7 @@ _manual_ripgrep() {
 
 _manual_fd() {
   local v
-  case "$ARCH" in x86_64|aarch64) ;; *) return 1 ;; esac
+  case "$ARCH" in x86_64|aarch64) ;; *) _no_release_for_arch; return 1 ;; esac
   v="$(_latest_version sharkdp/fd)" || return 1
   _release_tarball_bin \
     "https://github.com/sharkdp/fd/releases/download/v${v}/fd-v${v}-${ARCH}-unknown-linux-musl.tar.gz" fd
@@ -249,7 +306,7 @@ _manual_fd() {
 
 _manual_bat() {
   local v
-  case "$ARCH" in x86_64|aarch64) ;; *) return 1 ;; esac
+  case "$ARCH" in x86_64|aarch64) ;; *) _no_release_for_arch; return 1 ;; esac
   v="$(_latest_version sharkdp/bat)" || return 1
   _release_tarball_bin \
     "https://github.com/sharkdp/bat/releases/download/v${v}/bat-v${v}-${ARCH}-unknown-linux-musl.tar.gz" bat
@@ -260,7 +317,7 @@ _manual_eza() {
   case "$ARCH" in
     x86_64) t=x86_64-unknown-linux-musl ;;
     aarch64) t=aarch64-unknown-linux-gnu ;;
-    *) return 1 ;;
+    *) _no_release_for_arch; return 1 ;;
   esac
   _release_tarball_bin \
     "https://github.com/eza-community/eza/releases/latest/download/eza_${t}.tar.gz" eza
@@ -268,7 +325,7 @@ _manual_eza() {
 
 _manual_gh() {
   local v t
-  case "$ARCH" in x86_64) t=amd64 ;; aarch64) t=arm64 ;; *) return 1 ;; esac
+  case "$ARCH" in x86_64) t=amd64 ;; aarch64) t=arm64 ;; *) _no_release_for_arch; return 1 ;; esac
   v="$(_latest_version cli/cli)" || return 1
   _release_tarball_bin \
     "https://github.com/cli/cli/releases/download/v${v}/gh_${v}_linux_${t}.tar.gz" gh
@@ -276,24 +333,62 @@ _manual_gh() {
 
 _manual_jq() {
   local t
-  case "$ARCH" in x86_64) t=amd64 ;; aarch64) t=arm64 ;; *) return 1 ;; esac
+  case "$ARCH" in x86_64) t=amd64 ;; aarch64) t=arm64 ;; *) _no_release_for_arch; return 1 ;; esac
   _release_file_bin "https://github.com/jqlang/jq/releases/latest/download/jq-linux-${t}" jq
+}
+
+# fzf is two artifacts: the binary, and the shell bindings bash/bashrc
+# sources for Ctrl-R / Ctrl-T / Alt-C.  Both distribution packages ship the
+# bindings; a release tarball carries only the binary.  Each is checked and
+# repaired independently, so a bare binary (from an earlier interrupted run,
+# or installed by hand) gets its bindings on the next run instead of being
+# skipped as present.
+
+# The Linux locations bash/bashrc probes, in the same order.
+FZF_BINDINGS_PATHS=(
+  /usr/share/fzf/shell/key-bindings.bash
+  /usr/share/doc/fzf/examples/key-bindings.bash
+  "$HOME/.fzf/shell/key-bindings.bash"
+)
+
+_fzf_bindings_present() {
+  local p
+  for p in "${FZF_BINDINGS_PATHS[@]}"; do
+    [[ -r "$p" ]] && return 0
+  done
+  return 1
+}
+
+_fzf_complete() {
+  command -v fzf >/dev/null 2>&1 && _fzf_bindings_present
+}
+
+# Fetch the shell files at the tag matching the installed binary, at the
+# path upstream's own installer uses (and bash/bashrc probes).
+_fzf_shell_files() {
+  local v=""
+  if (( ! DRY_RUN )) && command -v fzf >/dev/null 2>&1; then
+    v="$(fzf --version 2>/dev/null | awk '{ print $1 }')"
+  fi
+  [[ -n "$v" ]] || v="$(_latest_version junegunn/fzf)" || return 1
+  (( DRY_RUN )) || mkdir -p "$HOME/.fzf/shell"
+  _fetch "https://raw.githubusercontent.com/junegunn/fzf/v${v}/shell/key-bindings.bash" \
+    "$HOME/.fzf/shell/key-bindings.bash" \
+  && _fetch "https://raw.githubusercontent.com/junegunn/fzf/v${v}/shell/completion.bash" \
+    "$HOME/.fzf/shell/completion.bash"
 }
 
 _manual_fzf() {
   local v t
-  case "$ARCH" in x86_64) t=amd64 ;; aarch64) t=arm64 ;; *) return 1 ;; esac
-  v="$(_latest_version junegunn/fzf)" || return 1
-  _release_tarball_bin \
-    "https://github.com/junegunn/fzf/releases/download/v${v}/fzf-${v}-linux_${t}.tar.gz" fzf || return 1
-  # The tarball carries only the binary.  The Ctrl-R / Ctrl-T / Alt-C
-  # bindings bash/bashrc sources come from the repo at the same tag, at the
-  # path upstream's own installer uses.
-  mkdir -p "$HOME/.fzf/shell"
-  _fetch "https://raw.githubusercontent.com/junegunn/fzf/v${v}/shell/key-bindings.bash" \
-    "$HOME/.fzf/shell/key-bindings.bash"
-  _fetch "https://raw.githubusercontent.com/junegunn/fzf/v${v}/shell/completion.bash" \
-    "$HOME/.fzf/shell/completion.bash"
+  if (( DRY_RUN )) || ! command -v fzf >/dev/null 2>&1; then
+    case "$ARCH" in x86_64) t=amd64 ;; aarch64) t=arm64 ;; *) _no_release_for_arch; return 1 ;; esac
+    v="$(_latest_version junegunn/fzf)" || return 1
+    _release_tarball_bin \
+      "https://github.com/junegunn/fzf/releases/download/v${v}/fzf-${v}-linux_${t}.tar.gz" fzf || return 1
+  fi
+  if (( DRY_RUN )) || ! _fzf_bindings_present; then
+    _fzf_shell_files
+  fi
 }
 
 # --- Tool driver --------------------------------------------------------------
@@ -301,31 +396,39 @@ PRESENT=()
 INSTALLED=()
 MISSING=()
 
-# _have SPEC — a command name, file:PATH, or terminfo:NAME.
+# _have SPEC — a command name, file:PATH, terminfo:NAME, or fn:FUNCTION.
 _have() {
   case "$1" in
     file:*) [[ -e "${1#file:}" ]] ;;
     terminfo:*) command -v infocmp >/dev/null 2>&1 \
                   && TERMINFO= infocmp "${1#terminfo:}" >/dev/null 2>&1 ;;
+    fn:*) "${1#fn:}" ;;
     *) command -v "$1" >/dev/null 2>&1 ;;
   esac
 }
 
+_present() {  # SPECS — any one present means the tool is complete
+  local spec
+  for spec in $1; do
+    if _have "$spec"; then return 0; fi
+  done
+  return 1
+}
+
 # _tool NAME HAVE_SPECS DNF_PKG APT_PKG MANUAL_FN [UPSTREAM]
-#   HAVE_SPECS  space-separated; any one present means the tool is installed
+#   HAVE_SPECS  space-separated; any one present means the tool is complete
 #   DNF_PKG / APT_PKG  "-" when that family does not package it
 #   MANUAL_FN   "-" when there is no upstream release fallback
-# Order is the contract: package manager first, upstream release only when
-# the package manager could not deliver.
+# Order is the contract: package manager first; the upstream release only
+# when the package manager could not deliver, or reported success but the
+# tool is still incomplete (the repair path).
 _tool() {
   local name="$1" specs="$2" dnf_pkg="$3" apt_pkg="$4" manual="$5" upstream="${6:-}"
-  local spec pkg=-
-  for spec in $specs; do
-    if _have "$spec"; then
-      PRESENT+=("$name")
-      return 0
-    fi
-  done
+  local pkg=-
+  if _present "$specs"; then
+    PRESENT+=("$name")
+    return 0
+  fi
   echo "==> $name"
   case "$FAMILY" in
     dnf) pkg="$dnf_pkg" ;;
@@ -333,26 +436,38 @@ _tool() {
   esac
   if [[ "$pkg" != - ]]; then
     if _pm_install "$pkg"; then
-      INSTALLED+=("$name ($FAMILY: $pkg)")
-      if (( DRY_RUN )) && [[ "$manual" != - ]]; then
-        echo "  (if $FAMILY cannot install it: upstream release from github.com/$upstream)"
+      if (( DRY_RUN )); then
+        INSTALLED+=("$name ($FAMILY: $pkg)")
+        if [[ "$manual" != - ]]; then
+          echo "  if $FAMILY cannot install it, the upstream release fallback (github.com/$upstream) would run:"
+          "$manual" || true
+        fi
+        return 0
       fi
-      return 0
+      if [[ "$manual" == - ]] || _present "$specs"; then
+        INSTALLED+=("$name ($FAMILY: $pkg)")
+        return 0
+      fi
+      echo "  $FAMILY reported $pkg installed but $name is still incomplete; repairing from the upstream release" >&2
+    elif (( PRIV_OK )); then
+      echo "  $FAMILY could not install $pkg" >&2
     fi
-    echo "  $FAMILY could not install $pkg" >&2
   fi
   if [[ "$manual" != - ]]; then
     if (( DRY_RUN )); then
-      echo "+ install $name from github.com/$upstream releases into $BIN_DIR"
-      INSTALLED+=("$name (upstream release)")
-      return 0
+      echo "  upstream release (github.com/$upstream) would run:"
+      if "$manual"; then
+        INSTALLED+=("$name (upstream release -> $BIN_DIR)")
+        return 0
+      fi
+    else
+      echo "  falling back to the upstream release (github.com/$upstream)"
+      if "$manual" && _present "$specs"; then
+        INSTALLED+=("$name (upstream release -> $BIN_DIR)")
+        return 0
+      fi
+      echo "  upstream release install failed for $name" >&2
     fi
-    echo "  falling back to the upstream release (github.com/$upstream)"
-    if "$manual"; then
-      INSTALLED+=("$name (upstream release -> $BIN_DIR)")
-      return 0
-    fi
-    echo "  upstream release install failed for $name" >&2
   fi
   MISSING+=("$name")
 }
@@ -442,13 +557,17 @@ _report_bash() {
 # --- Run ----------------------------------------------------------------------
 if (( DRY_RUN )); then
   echo "term-public Linux bootstrap (dry run): ${OS_PRETTY:-$OS_ID} / $FAMILY / $ARCH"
-  echo "Lines starting with '+' are the privileged or network commands a real run would execute."
+  echo "Lines starting with '+' are the privileged or network commands a real run would execute;"
+  echo "<latest> marks a release version resolved over the network at run time."
 else
   echo "term-public Linux bootstrap: ${OS_PRETTY:-$OS_ID} / $FAMILY / $ARCH"
 fi
+if (( ! PRIV_OK )); then
+  echo "No root or sudo: package-manager steps are skipped; upstream releases go to $BIN_DIR."
+fi
 _report_bash
 
-_pm_update
+_pm_update || echo "warning: package index refresh failed; continuing with the cached index and the upstream fallbacks" >&2
 _ensure_epel
 
 # NAME            HAVE                                            DNF             APT             MANUAL           UPSTREAM
@@ -461,7 +580,7 @@ _tool git         "git"                                           git           
 _tool python3     "python3"                                       python3         python3         -
 _tool tmux        "tmux"                                          tmux            tmux            -
 _tool jq          "jq"                                            jq              jq              _manual_jq       jqlang/jq
-_tool fzf         "fzf"                                           fzf             fzf             _manual_fzf      junegunn/fzf
+_tool fzf         "fn:_fzf_complete"                              fzf             fzf             _manual_fzf      junegunn/fzf
 _tool ripgrep     "rg"                                            ripgrep         ripgrep         _manual_ripgrep  BurntSushi/ripgrep
 _tool fd          "fd fdfind"                                     fd-find         fd-find         _manual_fd       sharkdp/fd
 _tool bat         "bat batcat"                                    bat             bat             _manual_bat      sharkdp/bat
@@ -489,8 +608,17 @@ echo "Ghostty is not installed on Linux by this script: this host is the SSH tar
 echo "of a Ghostty terminal, and ./setup.sh installs the xterm-ghostty terminfo."
 echo "Next: ./setup.sh"
 if (( ${#MISSING[@]} > 0 )); then
+  if (( DRY_RUN )); then
+    # A plan is not a failure: report what a real run would leave behind.
+    echo "A real run would end with NOT installed: ${MISSING[*]}"
+    exit 0
+  fi
   echo "NOT installed: ${MISSING[*]}" >&2
-  echo "  ($FAMILY had no reachable package and no upstream release fallback applied;" >&2
+  if (( PRIV_OK )); then
+    echo "  ($FAMILY had no reachable package and no upstream release fallback applied;" >&2
+  else
+    echo "  (no root or sudo for the package manager and no upstream release fallback applied;" >&2
+  fi
   echo "  install these by hand, then rerun this script — it skips what is present.)" >&2
   exit 1
 fi
