@@ -68,6 +68,34 @@ if [[ -f "$HOME/.bashrc.bak" ]]; then
   source "$HOME/.bashrc.bak"
 fi
 
+# --- ssh-agent ----------------------------------------------------------------
+# macOS launchd runs an agent and injects SSH_AUTH_SOCK into every login
+# session, so a Mac shell finds one for free.  Linux has no equivalent for an
+# sshd-spawned shell: openssh-client ships a socket-activated *user* agent
+# (Debian/Ubuntu listen on $XDG_RUNTIME_DIR/openssh_agent, Fedora/Arch on
+# ssh-agent.socket), but its SSH_AUTH_SOCK lives in the systemd user manager's
+# environment, which sshd's children never inherit.  Adopt that agent when one
+# is listening and nothing has set SSH_AUTH_SOCK already -- an inherited value
+# (a forwarded agent, or launchd's) always wins.
+#
+# Deliberately never start an agent: `eval $(ssh-agent)` here would orphan one
+# agent per login that no later shell can reach.  If no socket is listening,
+# `systemctl --user enable --now ssh-agent.socket` is the fix, not this file.
+#
+# Placed above the interactive-only cutoff on purpose -- `ssh host 'git fetch'`
+# runs a non-interactive bash and is exactly the case that needs an agent.
+if [[ -z "${SSH_AUTH_SOCK:-}" && -n "${XDG_RUNTIME_DIR:-}" ]]; then
+  for _tp_agent_sock in \
+      "$XDG_RUNTIME_DIR/openssh_agent" \
+      "$XDG_RUNTIME_DIR/ssh-agent.socket"; do
+    if [[ -S "$_tp_agent_sock" ]]; then
+      export SSH_AUTH_SOCK="$_tp_agent_sock"
+      break
+    fi
+  done
+  unset _tp_agent_sock
+fi
+
 # Everything below is interactive-only chrome.
 case $- in
   *i*) ;;

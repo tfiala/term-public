@@ -214,6 +214,23 @@ Other differences from the macOS baseline:
 - `term-theme` is macOS-only (it flips the system appearance). On Linux,
   `hive tmux` reads the mode from `~/.cache/term-theme/mode` if present
   and defaults to night otherwise.
+- **ssh-agent.** macOS hands every login session an agent: launchd runs
+  `com.openssh.ssh-agent` and injects `SSH_AUTH_SOCK`. Linux has no
+  equivalent for an sshd-spawned shell. Debian/Ubuntu's `openssh-client`
+  ships a socket-activated *user* agent (`ssh-agent.socket`, listening on
+  `$XDG_RUNTIME_DIR/openssh_agent`; Fedora/Arch use `ssh-agent.socket` as
+  the socket name too), but its `SSH_AUTH_SOCK` lives in the systemd user
+  manager's environment, which `sshd`'s children never inherit — so
+  `ssh -T git@github.com` and `git fetch` over SSH fail with
+  `Permission denied (publickey)` on a passphrase-protected key even though
+  an agent is listening. `bash/bashrc` adopts that socket when one is live
+  and nothing has set `SSH_AUTH_SOCK` already, above the interactive-only
+  cutoff so `ssh host 'git fetch'` gets it too. It never starts an agent:
+  an `ssh-agent` per shell orphans one agent per login that no later shell
+  can reach. If no socket is listening — the RHEL 9 family does not ship
+  these units — run `systemctl --user enable --now ssh-agent.socket`, or
+  provide an agent some other way. The agent starts empty; `ssh-add` once
+  per agent lifetime, or set `AddKeysToAgent yes` in `~/.ssh/config`.
 
 CI runs the bootstrap for real on every push: natively on `ubuntu-latest`
 and inside an `almalinux:9` container as root, each followed by `setup.sh`
