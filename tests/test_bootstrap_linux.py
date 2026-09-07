@@ -44,13 +44,15 @@ ARCH = 'ID=arch\n'
 # rpm, sudo, getent and every installed tool are deliberately absent.
 SANDBOX_TOOLS = ("bash", "uname", "id", "basename", "grep", "cut", "head", "cat")
 
-# The tools the script installs, with the command that proves each present.
-DNF_PLAN = {
-    "tmux": "tmux", "git": "git", "jq": "jq", "fzf": "fzf",
-    "ripgrep": "ripgrep", "fd-find": "fd-find", "bat": "bat", "eza": "eza",
-    "gh": "gh", "starship": "starship", "bash-completion": "bash-completion",
-    "python3": "python3",
-}
+# Packages the plan must request when the sandbox PATH hides every tool.
+# bash-completion is absent here on purpose: the script detects it by file,
+# not by command, so its line depends on the host (see
+# test_bash_completion_follows_the_host_file).
+DNF_PLAN = ("tmux", "git", "jq", "fzf", "ripgrep", "fd-find", "bat", "eza",
+            "gh", "starship", "python3")
+APT_PLAN = ("git", "tmux", "fzf", "ripgrep", "fd-find", "bat", "eza", "gh",
+            "starship", "ncurses-term", "python3")
+BASH_COMPLETION_FILE = Path("/usr/share/bash-completion/bash_completion")
 UPSTREAM_FALLBACKS = {
     "starship": "starship/starship", "ripgrep": "BurntSushi/ripgrep",
     "fd": "sharkdp/fd", "bat": "sharkdp/bat", "eza": "eza-community/eza",
@@ -153,7 +155,7 @@ class TestDryRunPlans:
         assert r.returncode == 0, r.stderr
         assert "dry run" in r.stdout
         assert "/ dnf / " in r.stdout
-        for pkg in DNF_PLAN.values():
+        for pkg in DNF_PLAN:
             assert f"+ dnf -y -q install {pkg}\n" in r.stdout, pkg
         # No rpm in the sandbox reads as "EPEL not enabled": on RHEL proper
         # it comes from fedoraproject.org, keyed on the major version.
@@ -180,14 +182,27 @@ class TestDryRunPlans:
         assert r.returncode == 0, r.stderr
         assert "/ apt / " in r.stdout
         assert "+ env DEBIAN_FRONTEND=noninteractive apt-get -qq update" in r.stdout
-        for pkg in ("bash-completion", "git", "tmux", "fzf", "ripgrep",
-                    "fd-find", "bat", "eza", "gh", "starship", "ncurses-term",
-                    "python3"):
+        for pkg in APT_PLAN:
             assert re.search(
                 rf"^\+ env DEBIAN_FRONTEND=noninteractive apt-get -qq -y .*install --no-install-recommends {re.escape(pkg)}$",
                 r.stdout, re.MULTILINE), pkg
         assert "dnf" not in r.stdout
         assert "epel" not in r.stdout.lower()
+
+    @pytest.mark.parametrize("os_release,install_line", [
+        (RHEL, "+ dnf -y -q install bash-completion\n"),
+        (UBUNTU, "install --no-install-recommends bash-completion\n"),
+    ])
+    def test_bash_completion_follows_the_host_file(self, sandbox, os_release, install_line):
+        """bash-completion has no command to probe, so presence is the
+        package's script on disk — which the sandbox PATH cannot hide."""
+        r = _run(sandbox, os_release, "--dry-run")
+        assert r.returncode == 0, r.stderr
+        if BASH_COMPLETION_FILE.is_file():
+            assert install_line not in r.stdout
+            assert re.search(r"^  already present: .*\bbash-completion\b", r.stdout, re.MULTILINE)
+        else:
+            assert install_line in r.stdout
 
     def test_debian_takes_the_apt_path(self, sandbox):
         r = _run(sandbox, DEBIAN, "--dry-run")
