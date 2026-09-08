@@ -68,6 +68,54 @@ if [[ -f "$HOME/.bashrc.bak" ]]; then
   source "$HOME/.bashrc.bak"
 fi
 
+# --- ssh-agent ----------------------------------------------------------------
+# macOS launchd runs an agent and injects SSH_AUTH_SOCK into every login
+# session, so a Mac shell finds one for free.  Linux has no equivalent for an
+# sshd-spawned shell: where openssh-client ships a socket-activated *user*
+# agent (Debian/Ubuntu listen on $XDG_RUNTIME_DIR/openssh_agent, Fedora/Arch
+# on ssh-agent.socket), its SSH_AUTH_SOCK lives in the systemd user manager's
+# environment, which sshd's children never inherit.  Adopt that agent when one
+# is reachable and nothing has set SSH_AUTH_SOCK already -- an inherited value
+# (a forwarded agent, or launchd's) always wins.
+#
+# Reachability, not just the inode.  `-S` proves only the node type.  The
+# Debian/Ubuntu and Fedora units omit RemoveOnStop=, whose systemd default is
+# off, so a stopped or failed unit can leave a node that `connect()` refuses
+# (Arch sets RemoveOnStop=yes).  Ask the agent through GNU timeout instead:
+# `ssh-add -l` exits 0 with keys, 1 when the reachable agent is empty, and 2
+# when it cannot connect.  The half-second bound keeps a listening but wedged
+# endpoint from hanging shell startup; every undocumented status fails closed.
+#
+# Deliberately never start an agent: `eval $(ssh-agent)` here would orphan one
+# agent per login that no later shell can reach.  Where a distribution ships
+# no socket unit at all (Ubuntu <= 24.04, Debian <= 12), this block finds
+# nothing and does nothing -- see the README for the per-user unit that fills
+# the gap there.
+#
+# Placed above the interactive-only cutoff on purpose -- `ssh host 'git fetch'`
+# runs a non-interactive bash and is exactly the case that needs an agent.
+if [[ -z "${SSH_AUTH_SOCK:-}" && -n "${XDG_RUNTIME_DIR:-}" ]] \
+    && command -v ssh-add >/dev/null 2>&1 \
+    && command -v timeout >/dev/null 2>&1; then
+  for _tp_agent_sock in \
+      "$XDG_RUNTIME_DIR/openssh_agent" \
+      "$XDG_RUNTIME_DIR/ssh-agent.socket" \
+      "$XDG_RUNTIME_DIR/term-public-ssh-agent/agent.sock"; do
+    [[ -S "$_tp_agent_sock" ]] || continue
+    if SSH_AUTH_SOCK="$_tp_agent_sock" \
+        timeout --kill-after=0.1s 0.5s ssh-add -l >/dev/null 2>&1; then
+      _tp_agent_probe=0
+    else
+      _tp_agent_probe=$?
+    fi
+    if (( _tp_agent_probe == 0 || _tp_agent_probe == 1 )); then
+      export SSH_AUTH_SOCK="$_tp_agent_sock"
+      break
+    fi
+  done
+  unset _tp_agent_sock _tp_agent_probe
+fi
+
 # Everything below is interactive-only chrome.
 case $- in
   *i*) ;;
