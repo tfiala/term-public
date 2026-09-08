@@ -78,13 +78,13 @@ fi
 # is reachable and nothing has set SSH_AUTH_SOCK already -- an inherited value
 # (a forwarded agent, or launchd's) always wins.
 #
-# Reachability, not just the inode.  `-S` proves only the node type, and none
-# of the shipped ssh-agent.socket units set RemoveOnStop=, whose systemd
-# default is off -- a stopped or failed unit leaves the node behind and
-# connecting to it gets ECONNREFUSED.  So ask the agent: `ssh-add -l` exits 2
-# only when it cannot connect (0 = has keys, 1 = reachable but empty).  A dead
-# candidate is skipped rather than ending the search, so a stale first path
-# cannot mask a live second one.
+# Reachability, not just the inode.  `-S` proves only the node type.  The
+# Debian/Ubuntu and Fedora units omit RemoveOnStop=, whose systemd default is
+# off, so a stopped or failed unit can leave a node that `connect()` refuses
+# (Arch sets RemoveOnStop=yes).  Ask the agent through GNU timeout instead:
+# `ssh-add -l` exits 0 with keys, 1 when the reachable agent is empty, and 2
+# when it cannot connect.  The half-second bound keeps a listening but wedged
+# endpoint from hanging shell startup; every undocumented status fails closed.
 #
 # Deliberately never start an agent: `eval $(ssh-agent)` here would orphan one
 # agent per login that no later shell can reach.  Where a distribution ships
@@ -95,14 +95,20 @@ fi
 # Placed above the interactive-only cutoff on purpose -- `ssh host 'git fetch'`
 # runs a non-interactive bash and is exactly the case that needs an agent.
 if [[ -z "${SSH_AUTH_SOCK:-}" && -n "${XDG_RUNTIME_DIR:-}" ]] \
-    && command -v ssh-add >/dev/null 2>&1; then
+    && command -v ssh-add >/dev/null 2>&1 \
+    && command -v timeout >/dev/null 2>&1; then
   for _tp_agent_sock in \
       "$XDG_RUNTIME_DIR/openssh_agent" \
-      "$XDG_RUNTIME_DIR/ssh-agent.socket"; do
+      "$XDG_RUNTIME_DIR/ssh-agent.socket" \
+      "$XDG_RUNTIME_DIR/term-public-ssh-agent/agent.sock"; do
     [[ -S "$_tp_agent_sock" ]] || continue
-    SSH_AUTH_SOCK="$_tp_agent_sock" ssh-add -l >/dev/null 2>&1
-    _tp_agent_probe=$?
-    if (( _tp_agent_probe != 2 )); then
+    if SSH_AUTH_SOCK="$_tp_agent_sock" \
+        timeout --kill-after=0.1s 0.5s ssh-add -l >/dev/null 2>&1; then
+      _tp_agent_probe=0
+    else
+      _tp_agent_probe=$?
+    fi
+    if (( _tp_agent_probe == 0 || _tp_agent_probe == 1 )); then
       export SSH_AUTH_SOCK="$_tp_agent_sock"
       break
     fi

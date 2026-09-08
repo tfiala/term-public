@@ -5,9 +5,9 @@ user agent exists but its SSH_AUTH_SOCK lives in the systemd user manager's
 environment, which an sshd-spawned shell never inherits -- so bashrc has to
 find the socket itself, and has to prove the agent behind it answers.
 
-The live cases run a real `ssh-agent`; nothing here fakes the protocol.  A
-socket that accepts connections but never replies would hang the probe rather
-than exercise it.
+The live cases run a real `ssh-agent`; nothing here fakes the protocol.  The
+negative cases prove that a socket which accepts but never replies is bounded,
+and that an undocumented probe status fails closed.
 """
 
 import os
@@ -24,8 +24,10 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+BASH = shutil.which("bash") or "bash"
 BASHRC = str(REPO_ROOT / "bash" / "bashrc")
-AGENT_UNIT = REPO_ROOT / "setup" / "ssh-agent.service"
+AGENT_UNIT = REPO_ROOT / "setup" / "term-public-ssh-agent.service"
+VENDOR_AGENT_SOCKET_PATHS = {"%t/openssh_agent", "%t/ssh-agent.socket"}
 
 pytestmark = pytest.mark.skipif(
     not shutil.which("ssh-agent") or not shutil.which("ssh-add"),
@@ -44,6 +46,35 @@ def runtime_dir():
         yield path
     finally:
         shutil.rmtree(path, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def bounded_command(runtime_dir, monkeypatch):
+    """Supply GNU-timeout semantics on macOS, where coreutils is not built in.
+
+    Supported Linux hosts exercise their real `timeout`; this shim keeps the
+    same behavioral tests portable to the macOS development baseline.
+    """
+    if shutil.which("timeout"):
+        return
+
+    bin_dir = runtime_dir / "timeout-bin"
+    bin_dir.mkdir()
+    timeout = bin_dir / "timeout"
+    timeout.write_text(
+        "#!/usr/bin/env python3\n"
+        "import subprocess, sys\n"
+        "args = sys.argv[1:]\n"
+        "assert args[0].startswith('--kill-after=')\n"
+        "seconds = float(args[1].removesuffix('s'))\n"
+        "try:\n"
+        "    result = subprocess.run(args[2:], timeout=seconds)\n"
+        "except subprocess.TimeoutExpired:\n"
+        "    raise SystemExit(124)\n"
+        "raise SystemExit(result.returncode)\n")
+    timeout.chmod(0o755)
+    monkeypatch.setenv(
+        "PATH", f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}")
 
 
 @pytest.fixture
@@ -77,9 +108,9 @@ def agents():
 def _stale_socket_node(path):
     """Leave a socket inode behind that nothing is listening on.
 
-    This is the shape a stopped ssh-agent.socket leaves: none of the shipped
-    units set RemoveOnStop=, and systemd's default is off.  `[[ -S ]]` still
-    passes; connecting gets ECONNREFUSED.
+    This is the shape a stopped Debian/Ubuntu or Fedora ssh-agent.socket can
+    leave because those units omit RemoveOnStop= and systemd's default is off.
+    (Arch sets it to yes.) `[[ -S ]]` still passes; connecting gets ECONNREFUSED.
     """
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.bind(str(path))
@@ -88,7 +119,15 @@ def _stale_socket_node(path):
     assert path.is_socket()
 
 
-def _source_bashrc(home, **env_overrides):
+def _nonresponsive_socket(path):
+    """Listen without answering the agent protocol."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(str(path))
+    sock.listen(1)
+    return sock
+
+
+def _source_bashrc(home, bash_options=(), **env_overrides):
     """Source the real bashrc non-interactively and report what it set.
 
     Non-interactive on purpose: `ssh host 'git fetch'` is the case that needs
@@ -105,11 +144,11 @@ def _source_bashrc(home, **env_overrides):
     }
     env.update(env_overrides)
     return subprocess.run(
-        ["bash", "--norc", "-c",
+        [BASH, "--norc", *bash_options, "-c",
          f'source "{BASHRC}"; '
          'echo "SOCK=${SSH_AUTH_SOCK-<unset>}"; '
          'echo "LEAK=${_tp_agent_sock+set}${_tp_agent_probe+set}"'],
-        capture_output=True, text=True, env=env)
+        capture_output=True, text=True, env=env, timeout=3)
 
 
 def _reported(result, key):
@@ -156,6 +195,33 @@ class TestSshAgentAdoption:
 
         assert _reported(result, "SOCK") == str(runtime_dir / "ssh-agent.socket")
 
+    def test_nonresponsive_socket_is_bounded_and_rejected(self, runtime_dir):
+        """A listening endpoint that never answers must not hang bashrc."""
+        sock = _nonresponsive_socket(runtime_dir / "openssh_agent")
+        started = time.monotonic()
+        try:
+            result = _source_bashrc(runtime_dir, XDG_RUNTIME_DIR=str(runtime_dir))
+        finally:
+            sock.close()
+
+        assert time.monotonic() - started < 1.5
+        assert _reported(result, "SOCK") == "<unset>"
+
+    def test_unexpected_probe_status_fails_closed(self, runtime_dir):
+        """Only documented live statuses 0 and 1 establish reachability."""
+        _stale_socket_node(runtime_dir / "openssh_agent")
+        bin_dir = runtime_dir / "failing-ssh-add"
+        bin_dir.mkdir()
+        ssh_add = bin_dir / "ssh-add"
+        ssh_add.write_text("#!/bin/sh\nexit 42\n")
+        ssh_add.chmod(0o755)
+
+        result = _source_bashrc(
+            runtime_dir, XDG_RUNTIME_DIR=str(runtime_dir),
+            PATH=f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}")
+
+        assert _reported(result, "SOCK") == "<unset>"
+
     def test_never_overrides_an_inherited_agent(self, runtime_dir, agents):
         """launchd's socket, or a forwarded agent, always wins."""
         agents(runtime_dir / "openssh_agent")
@@ -181,12 +247,41 @@ class TestSshAgentAdoption:
 
         assert _reported(result, "SOCK") == "<unset>"
 
+    def test_no_timeout_command_fails_closed(self, runtime_dir):
+        """A host without GNU timeout must never run an unbounded probe."""
+        _stale_socket_node(runtime_dir / "openssh_agent")
+        bin_dir = runtime_dir / "no-timeout-bin"
+        bin_dir.mkdir()
+        marker = runtime_dir / "ssh-add-was-run"
+        ssh_add = bin_dir / "ssh-add"
+        ssh_add.write_text(
+            "#!/bin/sh\n: > \"${SSH_ADD_MARKER:?}\"\nexit 0\n")
+        ssh_add.chmod(0o755)
+
+        result = _source_bashrc(
+            runtime_dir, XDG_RUNTIME_DIR=str(runtime_dir), PATH=str(bin_dir),
+            SSH_ADD_MARKER=str(marker))
+
+        assert not marker.exists()
+        assert _reported(result, "SOCK") == "<unset>"
+
     def test_leaves_no_loop_variables_behind(self, runtime_dir, agents):
         agents(runtime_dir / "openssh_agent")
 
         result = _source_bashrc(runtime_dir, XDG_RUNTIME_DIR=str(runtime_dir))
 
         assert _reported(result, "LEAK") == ""
+
+    def test_empty_agent_is_adopted_with_errexit(self, runtime_dir, agents):
+        """The expected status 1 must not trip a caller's `set -e`."""
+        agents(runtime_dir / "openssh_agent")
+
+        result = _source_bashrc(
+            runtime_dir, bash_options=("-e",),
+            XDG_RUNTIME_DIR=str(runtime_dir))
+
+        assert result.returncode == 0
+        assert _reported(result, "SOCK") == str(runtime_dir / "openssh_agent")
 
     def test_bashrc_never_starts_an_agent(self, runtime_dir):
         """A per-shell `ssh-agent` would orphan one agent per login.
@@ -232,17 +327,21 @@ def _unit_section(name):
     return entries
 
 
+def _unit_agent_socket_spec():
+    """The socket path expression the shipped unit's ExecStart binds."""
+    exec_starts = [v for k, v in _unit_section("Service") if k == "ExecStart"]
+    assert len(exec_starts) == 1, exec_starts
+    argv = exec_starts[0].split()
+    return argv[argv.index("-a") + 1]
+
+
 def _unit_agent_socket(runtime_dir):
-    """The socket path the shipped unit's ExecStart actually binds.
+    """Resolve the shipped unit's socket path for a test runtime directory.
 
     Resolved from the unit's own ExecStart rather than restated here, so the
     binding between the unit and bashrc is proven at both ends.
     """
-    exec_starts = [v for k, v in _unit_section("Service") if k == "ExecStart"]
-    assert len(exec_starts) == 1, exec_starts
-    argv = exec_starts[0].split()
-    path = argv[argv.index("-a") + 1]
-    return Path(path.replace("%t", str(runtime_dir)))
+    return Path(_unit_agent_socket_spec().replace("%t", str(runtime_dir)))
 
 
 class TestShippedAgentUnit:
@@ -250,25 +349,45 @@ class TestShippedAgentUnit:
 
     def test_bashrc_adopts_the_socket_the_unit_binds(self, runtime_dir, agents):
         """The unit and bashrc must agree on the path, proven end to end."""
-        agents(_unit_agent_socket(runtime_dir))
+        socket_path = _unit_agent_socket(runtime_dir)
+        socket_path.parent.mkdir()
+        agents(socket_path)
 
         result = _source_bashrc(runtime_dir, XDG_RUNTIME_DIR=str(runtime_dir))
 
         assert _reported(result, "SOCK") == str(_unit_agent_socket(runtime_dir))
 
+    def test_vendor_socket_wins_after_an_upgrade(self, runtime_dir, agents):
+        """A newly available distribution agent supersedes the fallback."""
+        fallback = _unit_agent_socket(runtime_dir)
+        fallback.parent.mkdir()
+        agents(fallback)
+        agents(runtime_dir / "openssh_agent")
+
+        result = _source_bashrc(runtime_dir, XDG_RUNTIME_DIR=str(runtime_dir))
+
+        assert _reported(result, "SOCK") == str(runtime_dir / "openssh_agent")
+
     def test_unit_clears_a_stale_socket_node_before_starting(self, runtime_dir):
         """ssh-agent will not bind over the node an unclean stop leaves."""
-        socket_path = str(_unit_agent_socket(runtime_dir)).replace(
-            str(runtime_dir), "%t")
         pre = [v for k, v in _unit_section("Service") if k == "ExecStartPre"]
 
-        assert any(socket_path in v and "rm" in v for v in pre), pre
-        assert all(v.startswith("-") for v in pre), \
-            "a missing socket node must not fail the start"
+        assert pre == [f"-/bin/rm -f {_unit_agent_socket_spec()}"]
 
     def test_unit_is_installable(self):
         """No [Install] section is exactly why the distro service is unusable."""
         assert ("WantedBy", "default.target") in _unit_section("Install")
+
+    def test_unit_identity_and_socket_cannot_shadow_the_vendor(self):
+        """An OS upgrade may add vendor ssh-agent.service and .socket units."""
+        runtime_dirs = [
+            v for k, v in _unit_section("Service") if k == "RuntimeDirectory"]
+
+        assert AGENT_UNIT.name == "term-public-ssh-agent.service"
+        assert _unit_agent_socket_spec() not in VENDOR_AGENT_SOCKET_PATHS
+        assert runtime_dirs == ["term-public-ssh-agent"]
+        assert _unit_agent_socket_spec().startswith(
+            f"%t/{runtime_dirs[0]}/")
 
     def test_unit_does_not_rely_on_socket_activation(self):
         """The releases this covers do not all support a passed-in socket."""

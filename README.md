@@ -34,7 +34,7 @@ It avoids:
 - `setup.sh` config linker and Neovim config installer
 - `setup/bootstrap-macos.sh` package/bootstrap helper (macOS)
 - `setup/bootstrap-linux.sh` package/bootstrap helper (RHEL 9 family, Ubuntu)
-- `setup/ssh-agent.service` per-user agent for Linux releases that ship
+- `setup/term-public-ssh-agent.service` per-user agent for Linux releases that ship
   no socket-activated one of their own
 - `ghostty/xterm-ghostty.terminfo` vendored terminfo source, compiled by
   `setup.sh` on hosts without the Ghostty app bundle
@@ -236,9 +236,12 @@ Other differences from the macOS baseline:
   fails with `Permission denied (publickey)` on a passphrase-protected key.
   `bash/bashrc` adopts the socket when the agent behind it answers, above the
   interactive-only cutoff so `ssh host 'git fetch'` gets it too. It probes
-  reachability rather than trusting the inode: none of these units set
-  `RemoveOnStop=`, whose systemd default is off, so a stopped unit leaves a
-  socket node that `[[ -S ]]` accepts and `connect()` refuses.
+  reachability rather than trusting the inode: Debian/Ubuntu and Fedora omit
+  `RemoveOnStop=`, whose systemd default is off, so a stopped unit can leave a
+  socket node that `[[ -S ]]` accepts and `connect()` refuses. Arch sets
+  `RemoveOnStop=yes`. The probe accepts only `ssh-add -l`'s documented live
+  statuses (0/1) and has a half-second timeout, so a listening but nonresponsive
+  endpoint cannot hang shell startup.
 
   It never starts an agent — an `ssh-agent` per shell orphans one agent per
   login that no later shell can reach.
@@ -253,14 +256,20 @@ Other differences from the macOS baseline:
 
   ```bash
   mkdir -p ~/.config/systemd/user
-  cp setup/ssh-agent.service ~/.config/systemd/user/
+  cp setup/term-public-ssh-agent.service ~/.config/systemd/user/
   systemctl --user daemon-reload
-  systemctl --user enable --now ssh-agent.service
+  systemctl --user enable --now term-public-ssh-agent.service
   loginctl enable-linger "$USER"   # optional: keep the agent across logins
   ```
 
-  It binds `$XDG_RUNTIME_DIR/openssh_agent` — the path `bash/bashrc` probes
-  first — so the shell adopts it exactly as it would a distribution agent.
+  The repo-specific unit and socket names cannot override or unlink the
+  distribution's `ssh-agent.service` / `.socket`. `bash/bashrc` checks both
+  vendor paths first, then this fallback's
+  `$XDG_RUNTIME_DIR/term-public-ssh-agent/agent.sock`.
+
+  After upgrading to a release that ships the socket unit, enable that unit,
+  open a new shell, and load the identities into the now-preferred distribution
+  agent before disabling and removing `term-public-ssh-agent.service`.
 
   Either way the agent starts empty: `ssh-add` once per agent lifetime, or
   set `AddKeysToAgent yes` in `~/.ssh/config`.
