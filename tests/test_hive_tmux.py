@@ -1641,7 +1641,7 @@ class TestCmdTmuxDispatch:
     def test_popup_action_routes(self):
         args = self._args(tmux_action='popup', cwd='/x',
                           client='/dev/ttys000', pane='%7',
-                          command=['hive', 'status'])
+                          popup_command=['hive', 'status'])
         with patch.object(hive, '_tmux_popup') as fn:
             hive.cmd_tmux(args)
         fn.assert_called_once_with(
@@ -2558,3 +2558,80 @@ class TestTmuxRestyle:
         with patch.object(hive.subprocess, 'run', side_effect=fake_run) as p:
             hive._tmux_restyle()
         assert p.call_count == 1  # only the list-sessions probe
+
+
+class TestPopupCliRouting:
+    """End-to-end argv routing for `hive tmux popup`.
+
+    The pre-existing dispatch tests build a Namespace by hand and call
+    cmd_tmux directly, so they shared the parser's bug instead of
+    catching it: popup's REMAINDER positional was named 'command', the
+    same dest as the top-level subparsers, so parsing overwrote the
+    subcommand name and main()'s chain silently matched nothing. Every
+    backtick popup binding was a no-op. These tests go through the real
+    parser and main().
+    """
+
+    ARGV = ['hive', 'tmux', 'popup',
+            '--client', '/dev/ttys002', '--pane', '%63',
+            '--cwd', '/hives/workingal/wg-2',
+            'hive', 'tmux', 'pairs', 'workingal-0']
+
+    def test_argv_reaches_tmux_popup_with_the_command(self, monkeypatch):
+        monkeypatch.setattr(sys, 'argv', self.ARGV)
+        with patch.object(hive, '_tmux_popup') as fn:
+            hive.main()
+        fn.assert_called_once_with(
+            '/hives/workingal/wg-2',
+            ['hive', 'tmux', 'pairs', 'workingal-0'],
+            client='/dev/ttys002', pane='%63')
+
+    def test_subcommand_name_survives_parsing(self, monkeypatch):
+        """The regression itself: args.command must stay 'tmux'."""
+        monkeypatch.setattr(sys, 'argv', self.ARGV)
+        with patch.object(hive, 'cmd_tmux') as fn:
+            hive.main()
+        args = fn.call_args[0][0]
+        assert args.command == 'tmux'
+        assert args.popup_command == ['hive', 'tmux', 'pairs', 'workingal-0']
+
+    def test_unroutable_command_is_loud(self, monkeypatch, capsys):
+        """A future dest collision must fail, not exit 0 doing nothing."""
+        monkeypatch.setattr(sys, 'argv', ['hive', 'status'])
+        with patch.object(hive, 'cmd_status'):
+            with patch.object(hive.argparse.ArgumentParser, 'parse_args',
+                              return_value=hive.argparse.Namespace(
+                                  color=False, command=['not', 'a', 'name'])):
+                with pytest.raises(SystemExit) as exc:
+                    hive.main()
+        assert exc.value.code == 2
+        assert 'Unroutable' in capsys.readouterr().err
+
+
+class TestPopupSizing:
+    def test_wrapped_lines_count_their_real_rows(self):
+        # 150 visible columns inside a 60-wide popup (58 usable) = 3 rows.
+        assert hive._wrapped_rows('x' * 150, 60) == 3
+
+    def test_blank_and_short_lines_take_one_row_each(self):
+        assert hive._wrapped_rows('a\n\nbb\n', 60) == 3
+
+    def test_ansi_colour_does_not_consume_columns(self):
+        plain = 'y' * 40
+        coloured = f'\033[31m{plain}\033[0m'
+        assert hive._wrapped_rows(coloured, 60) == 1
+        assert hive._wrapped_rows(coloured, 60) == hive._wrapped_rows(plain, 60)
+
+    def test_long_handoff_line_does_not_overflow_the_popup(self):
+        """The shape from the real pair listing that scrolled off the top."""
+        text = '\n'.join([
+            'Turn pairs in workingal-0',
+            '  pair - 1:reviewer + 2:implementer #745 docs: define plan',
+            '            handoff unrecognized (7m ago): Addressed the review '
+            'at `00a571e237e8c93a1afaa7b82c50d7706da68968`; CI is in flight',
+        ])
+        pop_w = 97
+        rows = hive._wrapped_rows(text, pop_w)
+        assert rows > len(text.splitlines())  # the wrap is actually counted
+        naive = len(text.splitlines()) + 2
+        assert rows + 2 > naive
