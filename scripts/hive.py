@@ -4330,7 +4330,7 @@ def cmd_tmux(args: argparse.Namespace) -> None:
         return
     if action == 'popup':
         _tmux_popup(
-            getattr(args, 'cwd', None), args.command,
+            getattr(args, 'cwd', None), args.popup_command,
             client=getattr(args, 'client', None),
             pane=getattr(args, 'pane', None))
         return
@@ -4580,6 +4580,21 @@ def _tmux_git_sync(pane_path: str) -> None:
             pass
 
 
+def _wrapped_rows(text: str, pop_w: int) -> int:
+    """Count the display rows `text` occupies inside a popup `pop_w` wide.
+
+    Sizing on newlines alone under-counts: the pair listing carries long
+    handoff lines that wrap, and the overflow scrolls off the top of a
+    `cat` popup. ANSI colour is excluded — it occupies no columns.
+    """
+    inner = max(1, pop_w - 2)  # popup border takes a column each side
+    rows = 0
+    for line in text.splitlines():
+        width = _visual_len(line)
+        rows += max(1, -(-width // inner))  # ceil, and blank lines take 1
+    return rows
+
+
 def _tmux_popup(cwd: str | None, command: list[str],
                 client: str | None = None, pane: str | None = None) -> None:
     """Run a command and show its output in a dynamically-sized tmux popup.
@@ -4623,8 +4638,8 @@ def _tmux_popup(cwd: str | None, command: list[str],
     win_w = _dim('#{window_width}', 120)
     win_h = _dim('#{window_height}', 40)
     pop_w = max(40, min(120, win_w * 80 // 100))
-    line_count = len(tmpfile.read_text(errors='replace').splitlines())
-    pop_h = max(5, line_count + 2)
+    pop_h = max(5, _wrapped_rows(tmpfile.read_text(errors='replace'),
+                                 pop_w) + 2)
     max_h = max(5, win_h * 80 // 100)
     if pop_h > max_h:
         # Content overflows — page it with less so the popup can scroll.
@@ -4777,7 +4792,11 @@ def main():
     tmux_popup.add_argument('--client')
     tmux_popup.add_argument('--pane')
     tmux_popup.add_argument('--cwd')
-    tmux_popup.add_argument('command', nargs=argparse.REMAINDER)
+    # dest must not be 'command': that is the top-level subparsers dest,
+    # and a REMAINDER positional of the same name overwrites the
+    # subcommand name, so main()'s dispatch stops matching 'tmux'.
+    tmux_popup.add_argument('popup_command', metavar='command',
+                            nargs=argparse.REMAINDER)
     tmux_runs = tmux_sub.add_parser('runs')
     tmux_runs.add_argument('--hive-root', dest='hive_root',
                            help='Hive root path (default: detect from cwd)')
@@ -4806,6 +4825,13 @@ def main():
         cmd_apiary(args)
     elif args.command == 'tmux':
         cmd_tmux(args)
+    else:
+        # Unreachable via argparse (the subparsers are required), so this
+        # firing means a subparser dest collided with 'command' and
+        # overwrote the subcommand name. Fail loudly rather than exit 0.
+        print(f'{CROSS()} Unroutable command: {args.command!r}',
+              file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == '__main__':
