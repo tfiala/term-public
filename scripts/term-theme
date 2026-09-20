@@ -108,27 +108,33 @@ if new != cfg.get('theme'):
 EOF
 }
 
-# Codex CLI's accent palette (status line, inline code, links) comes from
-# its syntax theme (`tui.theme` in ~/.codex/config.toml), not from the
-# terminal: its light/dark background detection gets no answer inside
-# tmux and falls back to the dark default catppuccin-mocha, whose pastel
-# truecolors are illegible on the day theme's near-white background — and
-# truecolor bypasses Ghostty's ANSI palette remap entirely. Flip between
-# the catppuccin pair for the mode; restart codex (matching the README
-# contract) to repaint. A theme the user pinned to anything outside the
-# pair is respected. Best-effort: silently a no-op without a ~/.codex
-# dir, python3, or tomllib (python < 3.11). The editor handles the valid
-# TOML spellings of the setting (spaced/quoted headers and keys, dotted
-# keys, inline tables); the edit is committed atomically via a staged
-# temp file — preserving mode and writing through a symlink — and only
-# after re-parsing proves the value landed at [tui].theme exactly. When
-# a sync SHOULD happen but cannot (unparseable file, unsupported shape,
-# failed commit), a warning is printed instead of silent success.
-sync_codex_theme() {
-  local mode=$1 dir=$HOME/.codex rc=0
-  [[ -d $dir ]] || return 0
-  command -v python3 >/dev/null 2>&1 || return 0
-  python3 - "$dir/config.toml" "$mode" <<'EOF' 2>/dev/null || rc=$?
+# Shared editor for a `theme` setting inside a TOML table, used by the codex
+# and grok hooks below. Both CLIs keep their accent palette in a theme name
+# in their own config rather than reading the terminal, so both need the
+# same surgery on the same shape of file.
+#
+# Usage: sync_toml_theme <path> <mode> <table> <default> <fold|exact> \
+#                        <day-names> <night-names>
+#
+# <day-names>/<night-names> are comma-separated. The FIRST name in each is
+# the canonical spelling written for that mode; the rest are aliases the
+# tool also accepts, so a config already naming the right mode another way
+# is left as it is rather than rewritten for nothing. <default> is the theme
+# the tool falls back to when the setting is absent, so an unset value is
+# judged as what it actually renders. `fold` compares names
+# case-insensitively (for a tool that documents case-insensitive theme
+# names); `exact` does not. A current value in neither list is a
+# deliberately pinned — or self-adapting — theme and is never touched.
+#
+# The editor handles the valid TOML spellings of the setting (spaced/quoted
+# headers and keys, dotted keys, inline tables); the edit is committed
+# atomically via a staged temp file — preserving mode and writing through a
+# symlink — and only after re-parsing proves the value landed at
+# [<table>].theme exactly. Exits 3 when a sync SHOULD happen but cannot
+# (unparseable file, unsupported shape, failed commit) so the caller can
+# warn instead of reporting silent success.
+sync_toml_theme() {
+  python3 - "$@" <<'EOF'
 import os
 import re
 import sys
@@ -141,9 +147,26 @@ except ModuleNotFoundError:
 
 NOT_SYNCED = 3  # the theme should change but we could not make it change
 
-path, mode = sys.argv[1], sys.argv[2]
-PAIR = {'day': 'catppuccin-latte', 'night': 'catppuccin-mocha'}
-DEFAULT = 'catppuccin-mocha'  # codex's built-in default when tui.theme is unset
+path, mode, table, default, fold, day_names, night_names = sys.argv[1:8]
+NAMES = {'day': day_names.split(','), 'night': night_names.split(',')}
+
+
+def norm(name):
+    return name.lower() if fold == 'fold' else name
+
+
+# Every spelling we recognize, mapped to the mode it renders for.
+SIDE = {norm(n): side for side, names in NAMES.items() for n in names}
+
+
+def table_of(cfg):
+    """The config's <table>, or None when it is missing or not a table."""
+    section = cfg.get(table)
+    if section is None:
+        return {}
+    return section if isinstance(section, dict) else None
+
+
 try:
     with open(path) as f:
         text = f.read()
@@ -156,24 +179,31 @@ try:
 except tomllib.TOMLDecodeError:
     sys.exit(NOT_SYNCED)  # never touch what we cannot parse — but say so
 
-current = cfg.get('tui', {}).get('theme', DEFAULT)
-if current not in PAIR.values():
-    sys.exit(0)  # a deliberately pinned theme; leave it alone
-new = PAIR[mode]
-if current == new:
-    sys.exit(0)
+section = table_of(cfg)
+if section is None:
+    sys.exit(NOT_SYNCED)  # a non-table <table> is a shape we cannot edit
+current = section.get('theme', default)
+if not isinstance(current, str):
+    sys.exit(NOT_SYNCED)
+side = SIDE.get(norm(current))
+if side is None:
+    sys.exit(0)  # a deliberately pinned theme, or one that self-adapts
+if side == mode:
+    sys.exit(0)  # already this mode's theme, whichever spelling it uses
+new = NAMES[mode][0]
 
 # --- Locate the setting textually.  TOML allows several spellings of the
-# same [tui].theme; each strategy below covers one.  The reparse check at
-# the end is the authority — these only have to hit the right line.
-TUI = r'(?:tui|"tui"|\'tui\')'
+# same [<table>].theme; each strategy below covers one.  The reparse check
+# at the end is the authority — these only have to hit the right line.
+esc = re.escape(table)
+TABLE = r'(?:' + esc + r'|"' + esc + r'"|\'' + esc + r'\')'
 THEME = r'(?:theme|"theme"|\'theme\')'
-HEADER = re.compile(r'\s*\[\s*' + TUI + r'\s*\]\s*(#.*)?$')
+HEADER = re.compile(r'\s*\[\s*' + TABLE + r'\s*\]\s*(#.*)?$')
 THEME_KEY = re.compile(r'\s*' + THEME + r'\s*=')
-DOTTED = re.compile(r'\s*' + TUI + r'\s*\.\s*' + THEME + r'\s*=')
-DOTTED_ANY = re.compile(r'\s*' + TUI + r'\s*\.')
+DOTTED = re.compile(r'\s*' + TABLE + r'\s*\.\s*' + THEME + r'\s*=')
+DOTTED_ANY = re.compile(r'\s*' + TABLE + r'\s*\.')
 INLINE = re.compile(
-    r'^(?P<pre>\s*' + TUI + r'\s*=\s*\{)(?P<body>.*)(?P<post>\}.*)$')
+    r'^(?P<pre>\s*' + TABLE + r'\s*=\s*\{)(?P<body>.*)(?P<post>\}.*)$')
 # The lookbehind keeps a sibling key like my-theme from false-matching.
 INLINE_THEME_VAL = re.compile(
     r'(?<![\w"\'-])' + THEME + r'\s*=\s*(?P<val>"[^"]*"|\'[^\']*\')')
@@ -182,7 +212,7 @@ lines = text.splitlines(keepends=True)
 theme_line = f'theme = "{new}"\n'
 
 # Any [section] header ends the top-level prologue where dotted keys and
-# inline tables can define tui.
+# inline tables can define the table.
 prologue_end = len(lines)
 for i, line in enumerate(lines):
     if re.match(r'\s*\[', line):
@@ -200,7 +230,7 @@ if start is not None and end is None:
     end = len(lines)
 
 if start is not None:
-    # A [tui]-style table: replace its theme line or insert one.
+    # A [<table>]-style table: replace its theme line or insert one.
     for i in range(start + 1, end):
         if THEME_KEY.match(lines[i]):
             lines[i] = theme_line
@@ -211,7 +241,7 @@ if start is not None:
 else:
     for i in range(prologue_end):
         if DOTTED.match(lines[i]):
-            lines[i] = f'tui.theme = "{new}"\n'
+            lines[i] = f'{table}.theme = "{new}"\n'
             break
         m = INLINE.match(lines[i].rstrip('\n'))
         if m:
@@ -226,20 +256,20 @@ else:
             lines[i] = m.group('pre') + body + m.group('post') + '\n'
             break
     else:
-        # No tui table anywhere yet.  If dotted tui.* keys exist, a new
-        # [tui] header would illegally redefine the table — extend the
-        # dotted form instead.
+        # No <table> table anywhere yet.  If dotted <table>.* keys exist, a
+        # new [<table>] header would illegally redefine the table — extend
+        # the dotted form instead.
         dotted_at = None
         for i in range(prologue_end):
             if DOTTED_ANY.match(lines[i]):
                 dotted_at = i
         if dotted_at is not None:
-            lines.insert(dotted_at + 1, f'tui.theme = "{new}"\n')
+            lines.insert(dotted_at + 1, f'{table}.theme = "{new}"\n')
             text = ''.join(lines)
         else:
             if text and not text.endswith('\n'):
                 text += '\n'
-            text += f'\n[tui]\n{theme_line}'
+            text += f'\n[{table}]\n{theme_line}'
             lines = None
     if lines is not None:
         text = ''.join(lines)
@@ -251,7 +281,8 @@ try:
     edited = tomllib.loads(text)
 except tomllib.TOMLDecodeError:
     sys.exit(NOT_SYNCED)
-if edited.get('tui', {}).get('theme') != new:
+edited_section = table_of(edited)
+if edited_section is None or edited_section.get('theme') != new:
     sys.exit(NOT_SYNCED)
 
 real = os.path.realpath(path)
@@ -275,9 +306,65 @@ except OSError:
         pass
     sys.exit(NOT_SYNCED)
 EOF
+}
+
+# Codex CLI's accent palette (status line, inline code, links) comes from
+# its syntax theme (`tui.theme` in ~/.codex/config.toml), not from the
+# terminal: its light/dark background detection gets no answer inside
+# tmux and falls back to the dark default catppuccin-mocha, whose pastel
+# truecolors are illegible on the day theme's near-white background — and
+# truecolor bypasses Ghostty's ANSI palette remap entirely. Flip between
+# the catppuccin pair for the mode; restart codex (matching the README
+# contract) to repaint. A theme the user pinned to anything outside the
+# pair is respected. Best-effort: silently a no-op without a ~/.codex
+# dir, python3, or tomllib (python < 3.11). When a sync SHOULD happen but
+# cannot, a warning is printed instead of silent success.
+sync_codex_theme() {
+  local mode=$1 dir=$HOME/.codex rc=0
+  [[ -d $dir ]] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  sync_toml_theme "$dir/config.toml" "$mode" tui catppuccin-mocha exact \
+    catppuccin-latte catppuccin-mocha 2>/dev/null || rc=$?
   if [[ $rc -ne 0 ]]; then
     echo "term-theme: codex theme not synced — could not update tui.theme in" \
       "~/.codex/config.toml; pick a ${mode} theme with codex's /theme instead" >&2
+  fi
+}
+
+# Grok Build keeps its TUI palette in `ui.theme` (~/.grok/config.toml).
+# Grok ships a day/night pair — GrokDay and GrokNight — but a config
+# pinned to one of them stays on it whatever the terminal does, so the
+# light theme's dark-on-white text is what you get all night. Flip the
+# pair for the mode; restart grok (or use its `/theme`) to repaint.
+#
+# Grok accepts several spellings of each of the pair (`grok-day`, `light`,
+# `day` / `grok-night`, `dark`, case-insensitively), so a config already
+# naming this mode in any of them is left alone. Anything else is left
+# alone too, and for two different reasons worth keeping straight:
+#
+#   * `auto` (alias `system`) already follows the macOS appearance that
+#     this script flips — grok re-reads it every few seconds, so it
+#     repaints live, with no restart and nothing for us to write. It is
+#     the better setting if you want zero-latency switching.
+#   * `terminal` (aliases `transparent`, `native`) draws from the
+#     terminal's own 16-color ANSI palette, which Ghostty's
+#     appearance-pair theme already remaps — self-adapting for the same
+#     reason the Starship prompt needs no nudge.
+#
+# A truecolor theme pinned outside the pair (tokyonight, rosepine-moon,
+# oscura-midnight) is a deliberate choice and is respected. Best-effort:
+# silently a no-op without a ~/.grok dir, python3, or tomllib
+# (python < 3.11). When a sync SHOULD happen but cannot, a warning is
+# printed instead of silent success.
+sync_grok_theme() {
+  local mode=$1 dir=$HOME/.grok rc=0
+  [[ -d $dir ]] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  sync_toml_theme "$dir/config.toml" "$mode" ui groknight fold \
+    grokday,grok-day,light,day groknight,grok-night,dark 2>/dev/null || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "term-theme: grok theme not synced — could not update ui.theme in" \
+      "~/.grok/config.toml; pick a ${mode} theme with grok's /theme instead" >&2
   fi
 }
 
@@ -320,6 +407,7 @@ main() {
   if [[ $action != status ]]; then
     sync_claude_theme "$mode"
     sync_codex_theme "$mode"
+    sync_grok_theme "$mode"
     restyle_hive_tmux
   fi
   printf '%s\n' "$mode"
