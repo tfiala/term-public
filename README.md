@@ -435,6 +435,44 @@ records the mode in `~/.cache/term-theme/mode` and nudges each consumer:
   `tui.theme` in `~/.codex/config.toml` between `catppuccin-latte` (day)
   and `catppuccin-mocha` (night), leaving any other deliberately pinned
   theme alone. Restart codex after a flip.
+- **grok** — best handled by grok itself: set `ui.theme = "auto"` in
+  `$GROK_HOME/config.toml` (default `~/.grok/config.toml`), or `/theme` →
+  *auto (follow system)*. `auto` (alias `system`) reads the same macOS
+  appearance this script flips and re-reads it every few seconds, so grok
+  repaints live, with no restart and nothing for `term-theme` to write;
+  `auto_light_theme`/`auto_dark_theme` already default to the
+  GrokDay/GrokNight pair, so there is nothing else to configure. That is
+  the recommended setting, but it is opt-in, and until a config takes it
+  grok never follows the terminal at all — an unset theme means GrokNight
+  forever, and a pin to GrokDay keeps dark-on-white text all night. So
+  `term-theme` also flips that pair between `grokday` (day) and
+  `groknight` (night), recognizing grok's aliases
+  (`grok-day`/`light`/`day`, `grok-night`/`dark`, case-insensitively);
+  restart grok (or use `/theme`) to repaint after one of those flips.
+
+  Choosing to flip means resolving what grok will actually render, which
+  is not one key in one file. The config root follows `$GROK_HOME`. The
+  layers merge lowest to highest — `/etc/grok/managed_config.toml`, then
+  the org-deployed `managed_config.toml` in that root, then `config.toml`
+  — each replacing the last, and the canonical `ui.theme` is read from the
+  merged result. So a managed `auto` or pinned theme is respected rather
+  than overwritten, and a config naming only the legacy `ui.ui_theme`
+  alias does not displace a managed canonical `ui.theme`. That alias is
+  flipped in place only when it is the key actually controlling the result
+  and `config.toml` is what carries it; otherwise the canonical key is
+  written there, which precedence puts above every lower layer, and the
+  managed files are never edited. A bare top-level `theme` key is outside
+  the documented schema, so the hook stands down and warns rather than
+  guess at it. Left alone as deliberate: `auto`/`system` and any pinned
+  theme (`tokyonight`, `rosepine-moon`, `oscura-midnight`). `terminal`
+  (aliases `transparent`, `native`) is left alone too, since it draws from
+  the terminal's own ANSI palette that Ghostty already remaps — but it is
+  rollout-gated: until the rollout reaches your account, or you set
+  `GROK_TERMINAL_THEME=1` (or `[features] terminal_theme = true`), the
+  name does not parse and grok falls back to its default dark theme, which
+  nothing here will flip; prefer `auto` in that case. Anything outranking
+  `config.toml` also outranks the flip — `GROK_THEME`/`LC_GROK_THEME`, the
+  `GROK_CONFIG`/`GROK_CONFIG_PATH` overlay, and `requirements.toml`/MDM.
 - **neovim** — follows the appearance at startup via the nvim config
   (`vim.o.background` resolved from the macOS appearance, tokyonight picks
   its day/night style from it). Restart nvim after a flip.

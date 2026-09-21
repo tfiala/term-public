@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tomllib
 from pathlib import Path
@@ -91,6 +92,11 @@ def fake_mac(tmp_path):
     env['FAKE_HIVE_LOG'] = str(tmp_path / 'hive-log')
     env['HOME'] = str(tmp_path / 'home')
     env['XDG_CACHE_HOME'] = str(tmp_path / 'cache')
+    # $GROK_HOME relocates grok's config root, so an exported one in the
+    # developer's shell would be inherited straight through the HOME
+    # override and let a passing test rewrite their real config. Tests that
+    # need it set their own temporary value explicitly.
+    env.pop('GROK_HOME', None)
     return env, state
 
 
@@ -501,6 +507,751 @@ class TestCodexThemeSync:
         assert (cfg_path.stat().st_mode & 0o777) == 0o600
         cfg = tomllib.loads(cfg_path.read_text())
         assert cfg['tui']['theme'] == 'catppuccin-latte'
+
+
+class TestGrokThemeSync:
+    """Grok Build draws its whole TUI palette from `ui.theme`
+    (~/.grok/config.toml), so a config pinned to GrokDay keeps its
+    dark-on-white text all night.  term-theme flips the grokday/groknight
+    pair per mode.  Both names, their aliases, and the self-adapting
+    `auto`/`terminal` values were read off the theme table in the grok
+    binary's own bundled docs (06-theming.md, grok 1.2.x).
+    """
+
+    # The shape of the user's real config: the theme sits in a [ui] table
+    # with unrelated keys, after an array-of-tables and other sections,
+    # and with a [privacy] section following it.
+    REALISTIC = (
+        '[cli]\n'
+        'installer = "internal"\n'
+        '\n'
+        '[[marketplace.sources]]\n'
+        'name = "xAI Official"\n'
+        '\n'
+        '[models]\n'
+        'default = "grok-4.6"\n'
+        '\n'
+        '[ui]\n'
+        'max_thoughts_width = 120\n'
+        'permission_mode = "always-approve"\n'
+        '\n'
+        '[privacy]\n'
+        'privacy_banner_acked = "2026-09-19T06:12:15Z"\n'
+    )
+
+    def _config(self, env, content=None) -> Path:
+        cfg = Path(env['HOME']) / '.grok' / 'config.toml'
+        cfg.parent.mkdir(exist_ok=True)
+        if content is not None:
+            cfg.write_text(content)
+        return cfg
+
+    def test_day_flips_unset_theme_to_grokday(self, fake_mac):
+        """No ui.theme means grok's GrokNight default — day must override
+        it, landing in [ui] itself and disturbing no other section."""
+        env, _ = fake_mac
+        cfg_path = self._config(env, self.REALISTIC)
+        run(env, 'day')
+        cfg = tomllib.loads(cfg_path.read_text())
+        assert cfg['ui']['theme'] == 'grokday'
+        assert cfg['ui']['max_thoughts_width'] == 120  # unrelated keys survive
+        assert cfg['ui']['permission_mode'] == 'always-approve'
+        assert 'theme' not in cfg['privacy']
+        assert cfg['marketplace']['sources'][0]['name'] == 'xAI Official'
+
+    def test_night_flips_grokday_back_to_groknight(self, fake_mac):
+        env, _ = fake_mac
+        cfg_path = self._config(env, '[ui]\ntheme = "grokday"\n')
+        run(env, 'night')
+        cfg = tomllib.loads(cfg_path.read_text())
+        assert cfg['ui']['theme'] == 'groknight'
+
+    def test_night_with_unset_theme_writes_nothing(self, fake_mac):
+        """Unset already means the GrokNight default — no gratuitous edit."""
+        env, _ = fake_mac
+        cfg_path = self._config(env, self.REALISTIC)
+        run(env, 'night')
+        assert cfg_path.read_text() == self.REALISTIC
+
+    # Grok accepts several names for each half of the pair, case-insensitively.
+    # A config already naming this mode in any of them needs no rewrite...
+    @pytest.mark.parametrize('mode,name', [
+        ('day', 'grokday'), ('day', 'grok-day'), ('day', 'light'),
+        ('day', 'day'), ('day', 'GrokDay'),
+        ('night', 'groknight'), ('night', 'grok-night'), ('night', 'dark'),
+        ('night', 'GROKNIGHT'),
+    ])
+    def test_alias_for_this_mode_is_left_as_written(self, fake_mac, mode, name):
+        env, _ = fake_mac
+        content = f'[ui]\ntheme = "{name}"\n'
+        cfg_path = self._config(env, content)
+        result = run(env, mode)
+        assert cfg_path.read_text() == content
+        assert 'not synced' not in result.stderr
+
+    # ...but an alias for the OTHER mode is exactly what must flip.
+    @pytest.mark.parametrize('mode,name,want', [
+        ('day', 'grok-night', 'grokday'),
+        ('day', 'dark', 'grokday'),
+        ('day', 'GrokNight', 'grokday'),
+        ('night', 'grok-day', 'groknight'),
+        ('night', 'light', 'groknight'),
+        ('night', 'Day', 'groknight'),
+    ])
+    def test_alias_for_other_mode_flips(self, fake_mac, mode, name, want):
+        env, _ = fake_mac
+        cfg_path = self._config(env, f'[ui]\ntheme = "{name}"\n')
+        result = run(env, mode)
+        cfg = tomllib.loads(cfg_path.read_text())
+        assert cfg['ui']['theme'] == want
+        assert 'not synced' not in result.stderr
+
+    # `auto`/`system` follow the macOS appearance this script just flipped
+    # (grok re-polls within seconds), and `terminal`/`transparent`/`native`
+    # draw from the terminal's own ANSI palette that Ghostty already remaps.
+    # Both are self-adapting: there is nothing to write, and writing would
+    # take away the better behaviour.
+    @pytest.mark.parametrize('name', [
+        'auto', 'system', 'terminal', 'terminal-default', 'transparent',
+        'native',
+    ])
+    def test_self_adapting_theme_is_left_alone(self, fake_mac, name):
+        env, _ = fake_mac
+        content = f'[ui]\ntheme = "{name}"\n'
+        cfg_path = self._config(env, content)
+        for mode in ('day', 'night'):
+            result = run(env, mode)
+            assert cfg_path.read_text() == content
+            assert 'not synced' not in result.stderr
+
+    @pytest.mark.parametrize('name', [
+        'tokyonight', 'rosepine-moon', 'oscura-midnight',
+    ])
+    def test_pinned_theme_is_respected(self, fake_mac, name):
+        """A /theme pick outside the pair is deliberate — leave it."""
+        env, _ = fake_mac
+        content = f'[ui]\ntheme = "{name}"\n'
+        cfg_path = self._config(env, content)
+        for mode in ('day', 'night'):
+            run(env, mode)
+            assert cfg_path.read_text() == content
+
+    def test_missing_grok_dir_is_fine(self, fake_mac):
+        env, _ = fake_mac
+        result = run(env, 'day')
+        assert result.returncode == 0
+        assert not (Path(env['HOME']) / '.grok').exists()
+
+    def test_creates_config_when_dir_exists(self, fake_mac):
+        """An installed grok without a config.toml still gets the binding."""
+        env, _ = fake_mac
+        cfg_path = self._config(env)
+        assert not cfg_path.exists()
+        run(env, 'day')
+        cfg = tomllib.loads(cfg_path.read_text())
+        assert cfg['ui']['theme'] == 'grokday'
+
+    def test_unparseable_config_left_untouched_but_warned(self, fake_mac):
+        """Never touch what we cannot parse — but never claim success."""
+        env, _ = fake_mac
+        content = 'not [ valid toml\n'
+        cfg_path = self._config(env, content)
+        result = run(env, 'day')
+        assert result.returncode == 0
+        assert cfg_path.read_text() == content
+        assert 'grok theme not synced' in result.stderr
+
+    def test_status_does_not_touch_theme(self, fake_mac):
+        env, _ = fake_mac
+        cfg_path = self._config(env, self.REALISTIC)
+        run(env, 'status')
+        assert cfg_path.read_text() == self.REALISTIC
+
+    # The same editor serves codex's [tui] and grok's [ui]; `ui` is a
+    # suffix of `tui`, so a loose table pattern would have the grok hook
+    # write codex's theme (and vice versa).  Neither may touch the other.
+    def test_tui_table_is_not_mistaken_for_ui(self, fake_mac):
+        env, _ = fake_mac
+        cfg_path = self._config(env, '[tui]\ntheme = "catppuccin-mocha"\n')
+        run(env, 'day')
+        cfg = tomllib.loads(cfg_path.read_text())
+        assert cfg['tui']['theme'] == 'catppuccin-mocha'  # untouched
+        assert cfg['ui']['theme'] == 'grokday'  # grok's own table, added
+
+    def test_ui_sub_table_does_not_receive_the_theme(self, fake_mac):
+        """[ui.contextual_hints] is not [ui] — the key must land in the
+        parent table it is read from."""
+        env, _ = fake_mac
+        cfg_path = self._config(
+            env, '[ui]\ncompact_mode = false\n\n'
+                 '[ui.contextual_hints]\nundo = true\n')
+        run(env, 'day')
+        cfg = tomllib.loads(cfg_path.read_text())
+        assert cfg['ui']['theme'] == 'grokday'
+        assert 'theme' not in cfg['ui']['contextual_hints']
+        assert cfg['ui']['contextual_hints']['undo'] is True
+
+    # TOML allows several spellings of the same [ui].theme setting; the
+    # semantic reader accepts them all, so the editor must too.  Each case
+    # parses to ui.theme = groknight.
+    ALT_SPELLINGS = [
+        '[ ui ]\ntheme = "groknight"\n',
+        '["ui"]\ntheme = "groknight"\n',
+        '[ui]\n"theme" = "groknight"\n',
+        'ui.theme = "groknight"\n',
+        'ui = { theme = "groknight", compact_mode = true }\n',
+    ]
+
+    @pytest.mark.parametrize('content', ALT_SPELLINGS)
+    def test_day_syncs_alternate_toml_spellings(self, fake_mac, content):
+        env, _ = fake_mac
+        cfg_path = self._config(env, content)
+        result = run(env, 'day')
+        assert result.returncode == 0
+        cfg = tomllib.loads(cfg_path.read_text())
+        assert cfg['ui']['theme'] == 'grokday'
+        assert 'not synced' not in result.stderr
+
+    def test_dotted_siblings_without_theme(self, fake_mac):
+        """Dotted ui.* keys already define the table — a new [ui] header
+        would be illegal, so the dotted form must be extended."""
+        env, _ = fake_mac
+        cfg_path = self._config(env, 'ui.compact_mode = true\n')
+        run(env, 'day')
+        cfg = tomllib.loads(cfg_path.read_text())
+        assert cfg['ui']['theme'] == 'grokday'
+        assert cfg['ui']['compact_mode'] is True
+
+    def test_symlinked_config_edited_through_not_replaced(self, fake_mac):
+        """A dotfiles-managed symlink stays a symlink; the edit lands in
+        its target."""
+        env, _ = fake_mac
+        target_dir = Path(env['HOME']) / 'dotfiles'
+        target_dir.mkdir()
+        target = target_dir / 'grok-config.toml'
+        target.write_text('[ui]\ntheme = "groknight"\n')
+        cfg_path = Path(env['HOME']) / '.grok' / 'config.toml'
+        cfg_path.parent.mkdir()
+        cfg_path.symlink_to(target)
+        run(env, 'day')
+        assert cfg_path.is_symlink()
+        cfg = tomllib.loads(target.read_text())
+        assert cfg['ui']['theme'] == 'grokday'
+
+    def test_failed_commit_preserves_original_and_warns(self, fake_mac):
+        """The staged atomic write must never truncate the real config."""
+        env, _ = fake_mac
+        content = '[ui]\ntheme = "groknight"\n'
+        cfg_path = self._config(env, content)
+        cfg_path.parent.chmod(0o500)  # staging in the config dir fails
+        try:
+            result = run(env, 'day')
+        finally:
+            cfg_path.parent.chmod(0o755)
+        assert result.returncode == 0
+        assert cfg_path.read_text() == content
+        assert 'grok theme not synced' in result.stderr
+
+    def test_file_mode_preserved(self, fake_mac):
+        env, _ = fake_mac
+        cfg_path = self._config(env, '[ui]\ntheme = "groknight"\n')
+        cfg_path.chmod(0o600)
+        run(env, 'day')
+        assert (cfg_path.stat().st_mode & 0o777) == 0o600
+        cfg = tomllib.loads(cfg_path.read_text())
+        assert cfg['ui']['theme'] == 'grokday'
+
+
+class TestGrokConfigResolution:
+    """Deciding whether to flip grok's theme means resolving the theme grok
+    will actually render, not reading one key in one file (PR #46 review).
+    Three things make that non-trivial: the config root is `$GROK_HOME`
+    when set; `ui.ui_theme` is a documented legacy alias read when
+    `ui.theme` is absent; and `managed_config.toml` is an org-deployed
+    layer merging *below* config.toml, so config.toml's silence is not the
+    same as grok's built-in default.  Getting any of them wrong writes over
+    a pinned or automatic theme this hook promises to preserve.
+    """
+
+    PAIR_NIGHT = '[ui]\ntheme = "groknight"\n'
+
+    def _env(self, env, root: Path):
+        root.mkdir(parents=True, exist_ok=True)
+        return dict(env, GROK_HOME=str(root))
+
+    def _default_grok(self, env, content=None) -> Path:
+        cfg = Path(env['HOME']) / '.grok' / 'config.toml'
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        if content is not None:
+            cfg.write_text(content)
+        return cfg
+
+    # --- $GROK_HOME ------------------------------------------------------
+
+    def test_grok_home_selects_the_active_config(self, fake_mac, tmp_path):
+        """The active install is the one that changes; the inactive default
+        config must come back byte-identical."""
+        env, _ = fake_mac
+        active = tmp_path / 'active'
+        env2 = self._env(env, active)
+        (active / 'config.toml').write_text(self.PAIR_NIGHT)
+        inactive = self._default_grok(env, self.PAIR_NIGHT)
+        run(env2, 'day')
+        assert tomllib.loads(
+            (active / 'config.toml').read_text())['ui']['theme'] == 'grokday'
+        assert inactive.read_text() == self.PAIR_NIGHT  # untouched
+
+    def test_grok_home_without_a_default_grok_dir(self, fake_mac, tmp_path):
+        """No ~/.grok at all must not mean the active install is skipped."""
+        env, _ = fake_mac
+        active = tmp_path / 'active'
+        env2 = self._env(env, active)
+        (active / 'config.toml').write_text(self.PAIR_NIGHT)
+        assert not (Path(env['HOME']) / '.grok').exists()
+        result = run(env2, 'day')
+        assert result.returncode == 0
+        assert tomllib.loads(
+            (active / 'config.toml').read_text())['ui']['theme'] == 'grokday'
+
+    def test_empty_grok_home_falls_back_to_the_default(self, fake_mac):
+        """`GROK_HOME=` is unset, not a root named the empty string."""
+        env, _ = fake_mac
+        cfg = self._default_grok(env, self.PAIR_NIGHT)
+        run(dict(env, GROK_HOME=''), 'day')
+        assert tomllib.loads(cfg.read_text())['ui']['theme'] == 'grokday'
+
+    # --- a theme key outside the documented schema -----------------------
+
+    # `ui.theme` and its legacy alias `ui.ui_theme` are the documented
+    # fields; a bare top-level `theme` is neither.  Rather than guess
+    # whether grok honours it, stand down — and say so, because a sync the
+    # user expected did not happen.
+    @pytest.mark.parametrize('value', ['auto', 'tokyonight', 'groknight'])
+    def test_top_level_theme_stands_down_and_warns(self, fake_mac, tmp_path,
+                                                   value):
+        env, _ = fake_mac
+        active = tmp_path / 'active'
+        env2 = self._env(env, active)
+        content = f'theme = "{value}"\n'
+        (active / 'config.toml').write_text(content)
+        result = run(env2, 'day')
+        assert result.returncode == 0
+        assert (active / 'config.toml').read_text() == content
+        assert 'grok theme not synced' in result.stderr
+
+    def test_top_level_theme_in_managed_layer_also_stands_down(
+            self, fake_mac, tmp_path):
+        env, _ = fake_mac
+        active = tmp_path / 'active'
+        env2 = self._env(env, active)
+        (active / 'managed_config.toml').write_text('theme = "auto"\n')
+        content = '[models]\ndefault = "grok-4.6"\n'
+        (active / 'config.toml').write_text(content)
+        result = run(env2, 'day')
+        assert (active / 'config.toml').read_text() == content
+        assert 'grok theme not synced' in result.stderr
+
+    # --- the legacy `ui.ui_theme` alias ----------------------------------
+
+    def test_legacy_alias_is_flipped_where_it_lives(self, fake_mac, tmp_path):
+        """Writing the canonical key instead would leave a stale alias
+        beside it saying the opposite."""
+        env, _ = fake_mac
+        active = tmp_path / 'active'
+        env2 = self._env(env, active)
+        (active / 'config.toml').write_text('[ui]\nui_theme = "groknight"\n')
+        run(env2, 'day')
+        cfg = tomllib.loads((active / 'config.toml').read_text())
+        assert cfg['ui']['ui_theme'] == 'grokday'
+        assert 'theme' not in cfg['ui']  # no competing canonical key added
+
+    @pytest.mark.parametrize('value', ['auto', 'tokyonight'])
+    def test_legacy_alias_self_adapting_or_pinned_is_preserved(
+            self, fake_mac, tmp_path, value):
+        env, _ = fake_mac
+        active = tmp_path / 'active'
+        env2 = self._env(env, active)
+        content = f'[ui]\nui_theme = "{value}"\n'
+        (active / 'config.toml').write_text(content)
+        result = run(env2, 'day')
+        assert (active / 'config.toml').read_text() == content
+        assert 'not synced' not in result.stderr
+
+    def test_canonical_key_outranks_the_legacy_alias(self, fake_mac, tmp_path):
+        """`ui.theme` present means the alias is not what grok renders."""
+        env, _ = fake_mac
+        active = tmp_path / 'active'
+        env2 = self._env(env, active)
+        (active / 'config.toml').write_text(
+            '[ui]\ntheme = "auto"\nui_theme = "groknight"\n')
+        result = run(env2, 'day')
+        cfg = tomllib.loads((active / 'config.toml').read_text())
+        assert cfg['ui']['theme'] == 'auto'  # the effective value, preserved
+        assert cfg['ui']['ui_theme'] == 'groknight'  # and the stale one left
+        assert 'not synced' not in result.stderr
+
+    # --- the managed_config.toml layer -----------------------------------
+
+    @pytest.mark.parametrize('value', ['auto', 'system', 'tokyonight'])
+    def test_managed_self_adapting_or_pinned_is_not_overridden(
+            self, fake_mac, tmp_path, value):
+        """config.toml being silent is not grok's built-in default when a
+        managed layer supplies the theme — writing the canonical key here
+        would override an org's choice, since config.toml outranks it."""
+        env, _ = fake_mac
+        active = tmp_path / 'active'
+        env2 = self._env(env, active)
+        (active / 'managed_config.toml').write_text(f'[ui]\ntheme = "{value}"\n')
+        content = '[models]\ndefault = "grok-4.6"\n'
+        (active / 'config.toml').write_text(content)
+        result = run(env2, 'day')
+        assert (active / 'config.toml').read_text() == content
+        assert 'not synced' not in result.stderr
+
+    def test_managed_pair_theme_gets_a_canonical_override(self, fake_mac,
+                                                          tmp_path):
+        """A managed GrokNight is ours to flip, and config.toml is the
+        documented place to outrank it — the managed file stays untouched."""
+        env, _ = fake_mac
+        active = tmp_path / 'active'
+        env2 = self._env(env, active)
+        managed = '[ui]\ntheme = "groknight"\n'
+        (active / 'managed_config.toml').write_text(managed)
+        (active / 'config.toml').write_text('[models]\ndefault = "grok-4.6"\n')
+        run(env2, 'day')
+        cfg = tomllib.loads((active / 'config.toml').read_text())
+        assert cfg['ui']['theme'] == 'grokday'
+        assert cfg['models']['default'] == 'grok-4.6'
+        assert (active / 'managed_config.toml').read_text() == managed
+
+    def test_config_toml_outranks_the_managed_layer(self, fake_mac, tmp_path):
+        """The user's own pin wins over a managed pair theme, so there is
+        nothing to flip."""
+        env, _ = fake_mac
+        active = tmp_path / 'active'
+        env2 = self._env(env, active)
+        (active / 'managed_config.toml').write_text('[ui]\ntheme = "groknight"\n')
+        content = '[ui]\ntheme = "auto"\n'
+        (active / 'config.toml').write_text(content)
+        result = run(env2, 'day')
+        assert (active / 'config.toml').read_text() == content
+        assert 'not synced' not in result.stderr
+
+    def test_managed_legacy_alias_is_resolved_too(self, fake_mac, tmp_path):
+        env, _ = fake_mac
+        active = tmp_path / 'active'
+        env2 = self._env(env, active)
+        (active / 'managed_config.toml').write_text('[ui]\nui_theme = "auto"\n')
+        content = '[models]\ndefault = "grok-4.6"\n'
+        (active / 'config.toml').write_text(content)
+        result = run(env2, 'day')
+        assert (active / 'config.toml').read_text() == content
+        assert 'not synced' not in result.stderr
+
+    def test_unparseable_managed_layer_warns_rather_than_guessing(
+            self, fake_mac, tmp_path):
+        """A layer we cannot read is a theme we cannot resolve."""
+        env, _ = fake_mac
+        active = tmp_path / 'active'
+        env2 = self._env(env, active)
+        (active / 'managed_config.toml').write_text('not [ valid toml\n')
+        content = '[models]\ndefault = "grok-4.6"\n'
+        (active / 'config.toml').write_text(content)
+        result = run(env2, 'day')
+        assert result.returncode == 0
+        assert (active / 'config.toml').read_text() == content
+        assert 'grok theme not synced' in result.stderr
+
+    def test_absent_managed_layer_is_the_ordinary_case(self, fake_mac,
+                                                       tmp_path):
+        """No managed file means the built-in default really does apply."""
+        env, _ = fake_mac
+        active = tmp_path / 'active'
+        env2 = self._env(env, active)
+        (active / 'config.toml').write_text('[models]\ndefault = "grok-4.6"\n')
+        assert not (active / 'managed_config.toml').exists()
+        result = run(env2, 'day')
+        cfg = tomllib.loads((active / 'config.toml').read_text())
+        assert cfg['ui']['theme'] == 'grokday'
+        assert 'not synced' not in result.stderr
+
+    def test_codex_is_unaffected_by_grok_layering(self, fake_mac, tmp_path):
+        """codex passes no layering extras, so a managed_config.toml or a
+        top-level theme beside its config must change nothing for it."""
+        env, _ = fake_mac
+        codex = Path(env['HOME']) / '.codex'
+        codex.mkdir()
+        (codex / 'managed_config.toml').write_text('[tui]\ntheme = "auto"\n')
+        (codex / 'config.toml').write_text(
+            'theme = "auto"\n[tui]\ntheme = "catppuccin-mocha"\n')
+        result = run(env, 'day')
+        cfg = tomllib.loads((codex / 'config.toml').read_text())
+        assert cfg['tui']['theme'] == 'catppuccin-latte'  # still flips
+        assert cfg['theme'] == 'auto'  # the stray top-level key is left alone
+        assert 'not synced' not in result.stderr
+
+
+@pytest.fixture
+def caller_grok_home(tmp_path, monkeypatch):
+    """A $GROK_HOME exported by whoever runs pytest.
+
+    Listed before `fake_mac` in a test's arguments so it is set up first,
+    which is what puts it in the environment `fake_mac` copies.
+    """
+    caller = tmp_path / 'caller-grok'
+    caller.mkdir()
+    (caller / 'config.toml').write_text('[ui]\ntheme = "groknight"\n')
+    monkeypatch.setenv('GROK_HOME', str(caller))
+    return caller
+
+
+class TestFixtureIsolation:
+    """`fake_mac` overrides HOME so the script's writes land in tmp_path.
+    Once the grok hook began honouring $GROK_HOME, an exported one escaped
+    that containment entirely: it is read *instead of* HOME, so a passing
+    test would rewrite the developer's real grok config (PR #46 review).
+    """
+
+    def test_fixture_does_not_carry_a_caller_grok_home(self, caller_grok_home,
+                                                       fake_mac):
+        env, _ = fake_mac
+        assert 'GROK_HOME' not in env
+
+    def test_caller_config_survives_a_passing_test(self, caller_grok_home,
+                                                   fake_mac):
+        """The regression the review demonstrated: green test, mutated
+        config outside the fixture."""
+        env, _ = fake_mac
+        before = (caller_grok_home / 'config.toml').read_text()
+        result = run(env, 'day')
+        assert result.returncode == 0
+        assert (caller_grok_home / 'config.toml').read_text() == before
+
+    def test_tests_can_still_set_their_own_grok_home(self, caller_grok_home,
+                                                     fake_mac, tmp_path):
+        """Clearing the inherited value must not stop a test opting in."""
+        env, _ = fake_mac
+        mine = tmp_path / 'mine'
+        mine.mkdir()
+        (mine / 'config.toml').write_text('[ui]\ntheme = "groknight"\n')
+        run(dict(env, GROK_HOME=str(mine)), 'day')
+        assert tomllib.loads(
+            (mine / 'config.toml').read_text())['ui']['theme'] == 'grokday'
+        assert (caller_grok_home / 'config.toml').read_text() == \
+            '[ui]\ntheme = "groknight"\n'
+
+
+class TestGrokLayerMerge:
+    """Grok merges the config layers and *then* reads the canonical field.
+    Resolving one layer at a time and stopping at the first spelling found
+    reads the wrong theme (PR #46 review): a higher layer naming only the
+    legacy alias does not displace a lower layer's canonical `ui.theme`.
+    """
+
+    def _at(self, env, root: Path, cfg=None, managed=None) -> Path:
+        root.mkdir(parents=True, exist_ok=True)
+        if cfg is not None:
+            (root / 'config.toml').write_text(cfg)
+        if managed is not None:
+            (root / 'managed_config.toml').write_text(managed)
+        return root / 'config.toml'
+
+    def _env(self, env, root: Path):
+        return dict(env, GROK_HOME=str(root))
+
+    # Reaching a *system*-managed layer means /etc/grok, which a test
+    # cannot write, so the three-layer cases drive the shared editor with
+    # its lower paths pointed at fixtures instead.
+    def _editor(self, env, cfg: Path, mode: str, lowers, script=None):
+        extras = json.dumps({'legacy_key': 'ui_theme',
+                             'lower_paths': lowers,
+                             'strict_unknown_theme': True})
+        # The script path is passed as a positional and quoted, not
+        # interpolated: a checkout under a path with spaces would otherwise
+        # break `source` before the function was ever called.
+        shell = ('source <(sed "$ d" "$1"); '
+                 'sync_toml_theme "$2" "$3" ui groknight fold '
+                 'grokday,grok-day,light,day groknight,grok-night,dark "$4"')
+        return subprocess.run(
+            ['bash', '-c', shell, 'editor', str(script or TERM_THEME),
+             str(cfg), mode, extras],
+            env=env, capture_output=True, text=True)
+
+    def test_config_alias_does_not_displace_a_managed_canonical(
+            self, fake_mac, tmp_path):
+        """Merged canonical is groknight, so day must flip — reading
+        config.toml alone sees `auto` and wrongly stands down."""
+        env, _ = fake_mac
+        root = tmp_path / 'g'
+        cfg = self._at(env, root, cfg='[ui]\nui_theme = "auto"\n',
+                       managed='[ui]\ntheme = "groknight"\n')
+        managed_before = (root / 'managed_config.toml').read_text()
+        result = self._env(env, root)
+        run(result, 'day')
+        parsed = tomllib.loads(cfg.read_text())
+        assert parsed['ui']['theme'] == 'grokday'  # canonical override here
+        assert parsed['ui']['ui_theme'] == 'auto'  # the alias is left alone
+        assert (root / 'managed_config.toml').read_text() == managed_before
+
+    def test_managed_canonical_auto_survives_a_config_alias(self, fake_mac,
+                                                            tmp_path):
+        """The inverse: the alias is not what grok renders, so flipping it
+        would change nothing real while the effective `auto` stayed live."""
+        env, _ = fake_mac
+        content = '[ui]\nui_theme = "groknight"\n'
+        cfg = self._at(env, tmp_path / 'g', cfg=content,
+                       managed='[ui]\ntheme = "auto"\n')
+        result = run(self._env(env, tmp_path / 'g'), 'day')
+        assert cfg.read_text() == content
+        assert 'not synced' not in result.stderr
+
+    def test_config_canonical_outranks_every_lower_layer(self, fake_mac,
+                                                         tmp_path):
+        env, _ = fake_mac
+        content = '[ui]\ntheme = "auto"\n'
+        cfg = self._at(env, tmp_path / 'g', cfg=content,
+                       managed='[ui]\ntheme = "groknight"\n')
+        result = run(self._env(env, tmp_path / 'g'), 'day')
+        assert cfg.read_text() == content
+        assert 'not synced' not in result.stderr
+
+    def test_managed_alias_only_is_promoted_to_canonical_here(self, fake_mac,
+                                                              tmp_path):
+        """No canonical key in any layer and the alias lives in a file we
+        never edit, so the flip lands on the canonical key in config.toml."""
+        env, _ = fake_mac
+        cfg = self._at(env, tmp_path / 'g',
+                       cfg='[models]\ndefault = "grok-4.6"\n',
+                       managed='[ui]\nui_theme = "groknight"\n')
+        run(self._env(env, tmp_path / 'g'), 'day')
+        parsed = tomllib.loads(cfg.read_text())
+        assert parsed['ui']['theme'] == 'grokday'
+        assert (tmp_path / 'g' / 'managed_config.toml').read_text() == \
+            '[ui]\nui_theme = "groknight"\n'
+
+    # --- three layers: system-managed, user-managed, user ----------------
+
+    def test_system_managed_canonical_beats_user_managed_alias(self, fake_mac,
+                                                               tmp_path):
+        env, _ = fake_mac
+        root = tmp_path / 'g'
+        root.mkdir()
+        content = '[models]\ndefault = "grok-4.6"\n'
+        cfg = root / 'config.toml'
+        cfg.write_text(content)
+        (root / 'sys.toml').write_text('[ui]\ntheme = "auto"\n')
+        (root / 'managed_config.toml').write_text('[ui]\nui_theme = "groknight"\n')
+        r = self._editor(env, cfg, 'day', ['sys.toml', 'managed_config.toml'])
+        assert r.returncode == 0
+        assert cfg.read_text() == content  # effective auto, nothing to do
+
+    def test_three_layer_alias_chain_still_resolves_and_flips(self, fake_mac,
+                                                             tmp_path):
+        """No canonical anywhere: the alias is the controlling key, and the
+        highest layer naming it wins the merge."""
+        env, _ = fake_mac
+        root = tmp_path / 'g'
+        root.mkdir()
+        cfg = root / 'config.toml'
+        cfg.write_text('[ui]\nui_theme = "groknight"\n')
+        (root / 'sys.toml').write_text('[ui]\nui_theme = "auto"\n')
+        r = self._editor(env, cfg, 'day', ['sys.toml'])
+        assert r.returncode == 0
+        parsed = tomllib.loads(cfg.read_text())
+        assert parsed['ui']['ui_theme'] == 'grokday'  # flipped where it lives
+        assert 'theme' not in parsed['ui']
+
+    # Layers disagreeing is the ordinary case, not an impasse: upstream
+    # merges system-managed, then managed, then user, each replacing the
+    # last scalar. Every combination below therefore has one known
+    # effective theme, and refusing to act on it was a defect of its own
+    # (PR #46 review).
+    def test_user_canonical_beats_both_managed_layers(self, fake_mac,
+                                                      tmp_path):
+        env, _ = fake_mac
+        root = tmp_path / 'g'
+        root.mkdir()
+        cfg = root / 'config.toml'
+        cfg.write_text('[ui]\ntheme = "groknight"\n')
+        (root / 'sys.toml').write_text('[ui]\ntheme = "auto"\n')
+        (root / 'managed_config.toml').write_text('[ui]\ntheme = "tokyonight"\n')
+        r = self._editor(env, cfg, 'day', ['sys.toml', 'managed_config.toml'])
+        assert r.returncode == 0
+        assert tomllib.loads(cfg.read_text())['ui']['theme'] == 'grokday'
+
+    def test_managed_aliases_never_block_a_user_canonical_key(self, fake_mac,
+                                                              tmp_path):
+        """Keys we do not resolve from cannot affect the outcome."""
+        env, _ = fake_mac
+        root = tmp_path / 'g'
+        root.mkdir()
+        cfg = root / 'config.toml'
+        cfg.write_text('[ui]\ntheme = "groknight"\n')
+        (root / 'sys.toml').write_text('[ui]\nui_theme = "auto"\n')
+        (root / 'managed_config.toml').write_text('[ui]\nui_theme = "tokyonight"\n')
+        r = self._editor(env, cfg, 'day', ['sys.toml', 'managed_config.toml'])
+        assert r.returncode == 0
+        assert tomllib.loads(cfg.read_text())['ui']['theme'] == 'grokday'
+
+    def test_managed_outranks_system_managed(self, fake_mac, tmp_path):
+        """$GROK_HOME/managed_config.toml replaces /etc/grok's value, so
+        the effective theme is the higher one and it is ours to flip."""
+        env, _ = fake_mac
+        root = tmp_path / 'g'
+        root.mkdir()
+        cfg = root / 'config.toml'
+        cfg.write_text('[models]\ndefault = "grok-4.6"\n')
+        (root / 'sys.toml').write_text('[ui]\ntheme = "tokyonight"\n')
+        (root / 'managed_config.toml').write_text('[ui]\ntheme = "groknight"\n')
+        r = self._editor(env, cfg, 'day', ['sys.toml', 'managed_config.toml'])
+        assert r.returncode == 0
+        assert tomllib.loads(cfg.read_text())['ui']['theme'] == 'grokday'
+
+    def test_system_managed_wins_when_managed_is_silent(self, fake_mac,
+                                                        tmp_path):
+        """The inverse direction of the same ordering: a pinned
+        system-managed theme with nothing above it is still deliberate."""
+        env, _ = fake_mac
+        root = tmp_path / 'g'
+        root.mkdir()
+        content = '[models]\ndefault = "grok-4.6"\n'
+        cfg = root / 'config.toml'
+        cfg.write_text(content)
+        (root / 'sys.toml').write_text('[ui]\ntheme = "tokyonight"\n')
+        (root / 'managed_config.toml').write_text('[ui]\ncompact_mode = true\n')
+        r = self._editor(env, cfg, 'day', ['sys.toml', 'managed_config.toml'])
+        assert r.returncode == 0
+        assert cfg.read_text() == content  # pinned, nothing to do
+
+    def test_two_spellings_of_one_theme_are_not_a_disagreement(
+            self, fake_mac, tmp_path):
+        env, _ = fake_mac
+        root = tmp_path / 'g'
+        root.mkdir()
+        cfg = root / 'config.toml'
+        cfg.write_text('[models]\ndefault = "grok-4.6"\n')
+        (root / 'sys.toml').write_text('[ui]\ntheme = "groknight"\n')
+        (root / 'managed_config.toml').write_text('[ui]\ntheme = "grok-night"\n')
+        r = self._editor(env, cfg, 'day', ['sys.toml', 'managed_config.toml'])
+        assert r.returncode == 0
+        assert tomllib.loads(cfg.read_text())['ui']['theme'] == 'grokday'
+
+    def test_editor_runs_from_a_path_containing_spaces(self, fake_mac,
+                                                       tmp_path):
+        """The helper sources the script by path, so it is the SCRIPT path
+        that has to contain the spaces: pointing only the config there
+        leaves the quoting this guards completely untested (PR #46
+        review)."""
+        env, _ = fake_mac
+        root = tmp_path / 'dir with spaces'
+        root.mkdir()
+        script = root / 'term-theme'
+        shutil.copy(TERM_THEME, script)
+        cfg = root / 'config.toml'
+        cfg.write_text('[ui]\ntheme = "groknight"\n')
+        r = self._editor(env, cfg, 'day', [], script=script)
+        assert r.returncode == 0, r.stderr
+        assert tomllib.loads(cfg.read_text())['ui']['theme'] == 'grokday'
 
 
 class TestHiveRestyle:
