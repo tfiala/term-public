@@ -435,21 +435,27 @@ records the mode in `~/.cache/term-theme/mode` and nudges each consumer:
   `tui.theme` in `~/.codex/config.toml` between `catppuccin-latte` (day)
   and `catppuccin-mocha` (night), leaving any other deliberately pinned
   theme alone. Restart codex after a flip.
-- **grok** — Grok Build draws its whole TUI palette from `ui.theme` in
-  `~/.grok/config.toml`, so a config pinned to the light theme keeps its
-  dark-on-white text all night. `term-theme` flips that pair between
-  `grokday` (day) and `groknight` (night), recognizing grok's aliases
+- **grok** — best handled by grok itself: set `ui.theme = "auto"` in
+  `~/.grok/config.toml` (or `/theme` → *auto (follow system)*). `auto`
+  (alias `system`) reads the same macOS appearance this script flips and
+  re-reads it every few seconds, so grok repaints live, with no restart
+  and nothing for `term-theme` to write; `auto_light_theme` and
+  `auto_dark_theme` already default to the GrokDay/GrokNight pair, so
+  there is nothing else to configure. That is the recommended setting,
+  but it is opt-in, and until a config takes it grok never follows the
+  terminal at all: it draws its whole TUI palette from `ui.theme`, where
+  unset means GrokNight forever and a pin to GrokDay keeps dark-on-white
+  text all night. So `term-theme` also flips that pair between `grokday`
+  (day) and `groknight` (night), recognizing grok's aliases
   (`grok-day`/`light`/`day`, `grok-night`/`dark`, case-insensitively) so a
-  config already naming the current mode is left as written. Restart grok
-  (or use its `/theme`) to repaint. Two values are left alone because they
-  already self-adapt: `auto` (alias `system`) follows the same macOS
-  appearance this script flips and re-reads it every few seconds — the
-  better setting if you want live switching with no restart — and
-  `terminal` (aliases `transparent`, `native`) draws from the terminal's
-  own ANSI palette, which Ghostty already remaps. Any other pinned theme
-  (`tokyonight`, `rosepine-moon`, `oscura-midnight`) is respected.
-  `GROK_THEME`/`LC_GROK_THEME` override the config file, so a session
-  started with either set ignores the flip.
+  config already naming the current mode is left as written; restart grok
+  (or use `/theme`) to repaint after one of those flips. Left alone:
+  `auto`/`system`, and `terminal` (aliases `transparent`, `native`), which
+  draws from the terminal's own ANSI palette that Ghostty already remaps —
+  both self-adapt — plus any other pinned theme (`tokyonight`,
+  `rosepine-moon`, `oscura-midnight`). `GROK_THEME`/`LC_GROK_THEME`
+  override the config file, so a session started with either set ignores
+  the flip.
 - **neovim** — follows the appearance at startup via the nvim config
   (`vim.o.background` resolved from the macOS appearance, tokyonight picks
   its day/night style from it). Restart nvim after a flip.

@@ -345,7 +345,8 @@ sync_codex_theme() {
 #   * `auto` (alias `system`) already follows the macOS appearance that
 #     this script flips — grok re-reads it every few seconds, so it
 #     repaints live, with no restart and nothing for us to write. It is
-#     the better setting if you want zero-latency switching.
+#     the setting the README recommends; the pair flip below is the
+#     zero-config fallback for a config that has not taken it.
 #   * `terminal` (aliases `transparent`, `native`) draws from the
 #     terminal's own 16-color ANSI palette, which Ghostty's
 #     appearance-pair theme already remaps — self-adapting for the same
