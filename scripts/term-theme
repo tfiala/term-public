@@ -201,16 +201,12 @@ def unattributable(parsed):
     return strict_unknown and 'theme' in parsed
 
 
-def theme_of(parsed):
-    """(value, key) for the highest-precedence theme one layer defines."""
+def section_of(parsed):
+    """<table> as a mapping, () when present but not a table, {} when absent."""
     sec = parsed.get(table)
-    if not isinstance(sec, dict):
-        return None, None
-    if 'theme' in sec:
-        return sec['theme'], 'theme'
-    if legacy_key and legacy_key in sec:
-        return sec[legacy_key], legacy_key
-    return None, None
+    if sec is None:
+        return {}
+    return sec if isinstance(sec, dict) else ()
 
 
 # Guessing costs the user a pinned or automatic theme, so a layer carrying
@@ -219,12 +215,13 @@ def theme_of(parsed):
 if unattributable(cfg):
     sys.exit(NOT_SYNCED)
 
-current, edit_key = theme_of(cfg)
-# Lower layers (an org-deployed managed config) supply the effective theme
-# when this file is silent.  We never edit those; when the value they carry
-# is ours to flip, we write the canonical key here, which the documented
-# precedence puts above them.
-for name in lower_paths if current is None else []:
+# Layers MERGE, then the canonical key is read from the result -- a higher
+# layer naming only the legacy alias does not displace a lower layer's
+# canonical key, so resolving one layer at a time and stopping at the first
+# hit reads the wrong theme (PR #46 review). Collect lower layers (an
+# org-deployed managed config) lowest-precedence first; we never edit them.
+lowers = []
+for name in lower_paths:
     lower_path = name if os.path.isabs(name) else os.path.join(
         os.path.dirname(os.path.abspath(path)), name)
     try:
@@ -236,13 +233,38 @@ for name in lower_paths if current is None else []:
         sys.exit(NOT_SYNCED)  # a layer we cannot read is a theme we cannot resolve
     if unattributable(lower):
         sys.exit(NOT_SYNCED)
-    current, _ = theme_of(lower)
-    if current is not None:
+    sec = section_of(lower)
+    if sec == ():
+        sys.exit(NOT_SYNCED)
+    lowers.append(sec)
+
+KEYS = [k for k in ('theme', legacy_key) if k]
+# Their relative order is not something we can establish, so two managed
+# layers disagreeing on a key we would resolve from is a theme we cannot
+# resolve -- say so rather than let the merge order decide it.
+for key in KEYS:
+    seen = [repr(sec[key]) for sec in lowers if key in sec]
+    if len(set(seen)) > 1:
+        sys.exit(NOT_SYNCED)
+
+merged = {}
+for sec in lowers + [section]:
+    merged.update(sec)
+
+current, eff_key = default, 'theme'
+for key in KEYS:
+    if key in merged:
+        current, eff_key = merged[key], key
         break
-if current is None:
-    current = default  # nothing in any layer: the tool's built-in default
-if edit_key is None:
-    edit_key = 'theme'  # the canonical key is where a new value goes
+
+# Which key to write is not which key we read: the canonical key always
+# controls, so we flip the alias in place only when it is the controlling
+# key AND this file is what carries it. Otherwise write the canonical key
+# here, which precedence puts above every lower layer.
+if eff_key != 'theme' and eff_key in section:
+    edit_key = eff_key
+else:
+    edit_key = 'theme'
 
 if not isinstance(current, str):
     sys.exit(NOT_SYNCED)
@@ -427,11 +449,12 @@ sync_codex_theme() {
 #     is read when `theme` is absent, so it is the key to flip when it is
 #     the one carrying the value.
 #   * `managed_config.toml` (in the config root, and /etc/grok) is an
-#     org-deployed layer that merges *below* config.toml. A theme there is
-#     the effective one while config.toml is silent, so treating that
-#     silence as grok's built-in default would write over an org's `auto`
-#     or pinned choice. We never edit that file; when its value is ours to
-#     flip we write the canonical key here, which precedence puts above it.
+#     org-deployed layer that merges *below* config.toml. The layers merge
+#     first and the canonical key is read from the result, so config.toml
+#     naming only the alias does NOT displace a managed `ui.theme`, and
+#     resolving one layer at a time reads the wrong theme. We never edit
+#     those files; when the merged value is ours to flip we write the
+#     canonical key here, which precedence puts above them.
 #   * A bare top-level `theme` key is outside the documented schema
 #     (`ui.theme`/`ui.ui_theme` are the fields). Rather than guess whether
 #     grok honours it, stand down and warn — guessing wrong costs the user
@@ -452,7 +475,7 @@ sync_grok_theme() {
   sync_toml_theme "$dir/config.toml" "$mode" ui groknight fold \
     grokday,grok-day,light,day groknight,grok-night,dark \
     '{"legacy_key": "ui_theme",
-      "lower_paths": ["managed_config.toml", "/etc/grok/managed_config.toml"],
+      "lower_paths": ["/etc/grok/managed_config.toml", "managed_config.toml"],
       "strict_unknown_theme": true}' 2>/dev/null || rc=$?
   if [[ $rc -ne 0 ]]; then
     echo "term-theme: grok theme not synced — could not resolve or update" \

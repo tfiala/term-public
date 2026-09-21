@@ -451,13 +451,20 @@ records the mode in `~/.cache/term-theme/mode` and nudges each consumer:
   restart grok (or use `/theme`) to repaint after one of those flips.
 
   Choosing to flip means resolving what grok will actually render, which
-  is not one key in one file: the config root follows `$GROK_HOME`,
-  `ui.ui_theme` is a documented legacy alias for `ui.theme` and is flipped
-  where it lives, and `managed_config.toml` is an org-deployed layer
-  merging *below* `config.toml`, so a managed `auto` or pinned theme is
-  respected rather than overwritten. A bare top-level `theme` key is
-  outside the documented schema, so the hook stands down and warns instead
-  of guessing. Left alone as deliberate: `auto`/`system` and any pinned
+  is not one key in one file. The config root follows `$GROK_HOME`. The
+  layers — `managed_config.toml` in that root and in `/etc/grok`, both
+  org-deployed and both merging *below* `config.toml` — are merged before
+  the theme is read, and the canonical `ui.theme` is read from the result,
+  so a managed `auto` or pinned theme is respected rather than
+  overwritten, and a config naming only the legacy `ui.ui_theme` alias
+  does not displace a managed canonical `ui.theme`. That alias is flipped
+  in place only when it is the key actually controlling the result and
+  `config.toml` is what carries it; otherwise the canonical key is written
+  there, which precedence puts above every lower layer, and the managed
+  files are never edited. Where the hook cannot resolve an answer it
+  stands down and warns rather than guess: two managed layers disagreeing
+  on the theme, or a bare top-level `theme` key, which is outside the
+  documented schema. Left alone as deliberate: `auto`/`system` and any pinned
   theme (`tokyonight`, `rosepine-moon`, `oscura-midnight`). `terminal`
   (aliases `transparent`, `native`) is left alone too, since it draws from
   the terminal's own ANSI palette that Ghostty already remaps — but it is
