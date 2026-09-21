@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tomllib
 from pathlib import Path
@@ -1061,19 +1062,19 @@ class TestGrokLayerMerge:
     # Reaching a *system*-managed layer means /etc/grok, which a test
     # cannot write, so the three-layer cases drive the shared editor with
     # its lower paths pointed at fixtures instead.
-    def _editor(self, env, cfg: Path, mode: str, lowers):
+    def _editor(self, env, cfg: Path, mode: str, lowers, script=None):
         extras = json.dumps({'legacy_key': 'ui_theme',
                              'lower_paths': lowers,
                              'strict_unknown_theme': True})
         # The script path is passed as a positional and quoted, not
         # interpolated: a checkout under a path with spaces would otherwise
         # break `source` before the function was ever called.
-        script = ('source <(sed "$ d" "$1"); '
-                  'sync_toml_theme "$2" "$3" ui groknight fold '
-                  'grokday,grok-day,light,day groknight,grok-night,dark "$4"')
+        shell = ('source <(sed "$ d" "$1"); '
+                 'sync_toml_theme "$2" "$3" ui groknight fold '
+                 'grokday,grok-day,light,day groknight,grok-night,dark "$4"')
         return subprocess.run(
-            ['bash', '-c', script, 'editor', str(TERM_THEME), str(cfg), mode,
-             extras],
+            ['bash', '-c', shell, 'editor', str(script or TERM_THEME),
+             str(cfg), mode, extras],
             env=env, capture_output=True, text=True)
 
     def test_config_alias_does_not_displace_a_managed_canonical(
@@ -1237,14 +1238,18 @@ class TestGrokLayerMerge:
 
     def test_editor_runs_from_a_path_containing_spaces(self, fake_mac,
                                                        tmp_path):
-        """The helper sources the script by path; an unquoted
-        interpolation would fail before reaching the function."""
+        """The helper sources the script by path, so it is the SCRIPT path
+        that has to contain the spaces: pointing only the config there
+        leaves the quoting this guards completely untested (PR #46
+        review)."""
         env, _ = fake_mac
         root = tmp_path / 'dir with spaces'
         root.mkdir()
+        script = root / 'term-theme'
+        shutil.copy(TERM_THEME, script)
         cfg = root / 'config.toml'
         cfg.write_text('[ui]\ntheme = "groknight"\n')
-        r = self._editor(env, cfg, 'day', [])
+        r = self._editor(env, cfg, 'day', [], script=script)
         assert r.returncode == 0, r.stderr
         assert tomllib.loads(cfg.read_text())['ui']['theme'] == 'grokday'
 
