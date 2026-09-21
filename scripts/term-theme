@@ -219,7 +219,10 @@ if unattributable(cfg):
 # layer naming only the legacy alias does not displace a lower layer's
 # canonical key, so resolving one layer at a time and stopping at the first
 # hit reads the wrong theme (PR #46 review). Collect lower layers (an
-# org-deployed managed config) lowest-precedence first; we never edit them.
+# org-deployed managed config) lowest-precedence first, in the order the
+# caller lists them; we never edit them. Every disagreement between layers
+# is settled by that order -- a later layer replaces an earlier scalar --
+# so there is no such thing as an unresolvable conflict between them.
 lowers = []
 for name in lower_paths:
     lower_path = name if os.path.isabs(name) else os.path.join(
@@ -239,14 +242,6 @@ for name in lower_paths:
     lowers.append(sec)
 
 KEYS = [k for k in ('theme', legacy_key) if k]
-# Their relative order is not something we can establish, so two managed
-# layers disagreeing on a key we would resolve from is a theme we cannot
-# resolve -- say so rather than let the merge order decide it.
-for key in KEYS:
-    seen = [repr(sec[key]) for sec in lowers if key in sec]
-    if len(set(seen)) > 1:
-        sys.exit(NOT_SYNCED)
-
 merged = {}
 for sec in lowers + [section]:
     merged.update(sec)
@@ -448,8 +443,9 @@ sync_codex_theme() {
 #   * Within [ui], `ui_theme` is a documented legacy alias for `theme` and
 #     is read when `theme` is absent, so it is the key to flip when it is
 #     the one carrying the value.
-#   * `managed_config.toml` (in the config root, and /etc/grok) is an
-#     org-deployed layer that merges *below* config.toml. The layers merge
+#   * `managed_config.toml` is an org-deployed layer that merges *below*
+#     config.toml, lowest to highest: /etc/grok, then the config root,
+#     then config.toml itself, each replacing the last. The layers merge
 #     first and the canonical key is read from the result, so config.toml
 #     naming only the alias does NOT displace a managed `ui.theme`, and
 #     resolving one layer at a time reads the wrong theme. We never edit

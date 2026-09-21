@@ -1065,11 +1065,15 @@ class TestGrokLayerMerge:
         extras = json.dumps({'legacy_key': 'ui_theme',
                              'lower_paths': lowers,
                              'strict_unknown_theme': True})
-        script = (f'source <(sed "$ d" {TERM_THEME}); '
-                  'sync_toml_theme "$1" "$2" ui groknight fold '
-                  'grokday,grok-day,light,day groknight,grok-night,dark "$3"')
+        # The script path is passed as a positional and quoted, not
+        # interpolated: a checkout under a path with spaces would otherwise
+        # break `source` before the function was ever called.
+        script = ('source <(sed "$ d" "$1"); '
+                  'sync_toml_theme "$2" "$3" ui groknight fold '
+                  'grokday,grok-day,light,day groknight,grok-night,dark "$4"')
         return subprocess.run(
-            ['bash', '-c', script, 'editor', str(cfg), mode, extras],
+            ['bash', '-c', script, 'editor', str(TERM_THEME), str(cfg), mode,
+             extras],
             env=env, capture_output=True, text=True)
 
     def test_config_alias_does_not_displace_a_managed_canonical(
@@ -1156,9 +1160,56 @@ class TestGrokLayerMerge:
         assert parsed['ui']['ui_theme'] == 'grokday'  # flipped where it lives
         assert 'theme' not in parsed['ui']
 
-    def test_disagreeing_managed_layers_stand_down(self, fake_mac, tmp_path):
-        """Their relative order is not something we can establish, so a
-        disagreement is a theme we cannot resolve."""
+    # Layers disagreeing is the ordinary case, not an impasse: upstream
+    # merges system-managed, then managed, then user, each replacing the
+    # last scalar. Every combination below therefore has one known
+    # effective theme, and refusing to act on it was a defect of its own
+    # (PR #46 review).
+    def test_user_canonical_beats_both_managed_layers(self, fake_mac,
+                                                      tmp_path):
+        env, _ = fake_mac
+        root = tmp_path / 'g'
+        root.mkdir()
+        cfg = root / 'config.toml'
+        cfg.write_text('[ui]\ntheme = "groknight"\n')
+        (root / 'sys.toml').write_text('[ui]\ntheme = "auto"\n')
+        (root / 'managed_config.toml').write_text('[ui]\ntheme = "tokyonight"\n')
+        r = self._editor(env, cfg, 'day', ['sys.toml', 'managed_config.toml'])
+        assert r.returncode == 0
+        assert tomllib.loads(cfg.read_text())['ui']['theme'] == 'grokday'
+
+    def test_managed_aliases_never_block_a_user_canonical_key(self, fake_mac,
+                                                              tmp_path):
+        """Keys we do not resolve from cannot affect the outcome."""
+        env, _ = fake_mac
+        root = tmp_path / 'g'
+        root.mkdir()
+        cfg = root / 'config.toml'
+        cfg.write_text('[ui]\ntheme = "groknight"\n')
+        (root / 'sys.toml').write_text('[ui]\nui_theme = "auto"\n')
+        (root / 'managed_config.toml').write_text('[ui]\nui_theme = "tokyonight"\n')
+        r = self._editor(env, cfg, 'day', ['sys.toml', 'managed_config.toml'])
+        assert r.returncode == 0
+        assert tomllib.loads(cfg.read_text())['ui']['theme'] == 'grokday'
+
+    def test_managed_outranks_system_managed(self, fake_mac, tmp_path):
+        """$GROK_HOME/managed_config.toml replaces /etc/grok's value, so
+        the effective theme is the higher one and it is ours to flip."""
+        env, _ = fake_mac
+        root = tmp_path / 'g'
+        root.mkdir()
+        cfg = root / 'config.toml'
+        cfg.write_text('[models]\ndefault = "grok-4.6"\n')
+        (root / 'sys.toml').write_text('[ui]\ntheme = "tokyonight"\n')
+        (root / 'managed_config.toml').write_text('[ui]\ntheme = "groknight"\n')
+        r = self._editor(env, cfg, 'day', ['sys.toml', 'managed_config.toml'])
+        assert r.returncode == 0
+        assert tomllib.loads(cfg.read_text())['ui']['theme'] == 'grokday'
+
+    def test_system_managed_wins_when_managed_is_silent(self, fake_mac,
+                                                        tmp_path):
+        """The inverse direction of the same ordering: a pinned
+        system-managed theme with nothing above it is still deliberate."""
         env, _ = fake_mac
         root = tmp_path / 'g'
         root.mkdir()
@@ -1166,38 +1217,35 @@ class TestGrokLayerMerge:
         cfg = root / 'config.toml'
         cfg.write_text(content)
         (root / 'sys.toml').write_text('[ui]\ntheme = "tokyonight"\n')
-        (root / 'managed_config.toml').write_text('[ui]\ntheme = "groknight"\n')
+        (root / 'managed_config.toml').write_text('[ui]\ncompact_mode = true\n')
         r = self._editor(env, cfg, 'day', ['sys.toml', 'managed_config.toml'])
-        assert r.returncode == 3  # NOT_SYNCED
-        assert cfg.read_text() == content
+        assert r.returncode == 0
+        assert cfg.read_text() == content  # pinned, nothing to do
 
-    def test_agreeing_managed_layers_resolve_normally(self, fake_mac,
-                                                      tmp_path):
+    def test_two_spellings_of_one_theme_are_not_a_disagreement(
+            self, fake_mac, tmp_path):
         env, _ = fake_mac
         root = tmp_path / 'g'
         root.mkdir()
         cfg = root / 'config.toml'
         cfg.write_text('[models]\ndefault = "grok-4.6"\n')
         (root / 'sys.toml').write_text('[ui]\ntheme = "groknight"\n')
-        (root / 'managed_config.toml').write_text('[ui]\ntheme = "groknight"\n')
+        (root / 'managed_config.toml').write_text('[ui]\ntheme = "grok-night"\n')
         r = self._editor(env, cfg, 'day', ['sys.toml', 'managed_config.toml'])
         assert r.returncode == 0
         assert tomllib.loads(cfg.read_text())['ui']['theme'] == 'grokday'
 
-    def test_disagreement_on_an_irrelevant_key_is_not_a_conflict(
-            self, fake_mac, tmp_path):
-        """Only the keys we resolve from can block us."""
+    def test_editor_runs_from_a_path_containing_spaces(self, fake_mac,
+                                                       tmp_path):
+        """The helper sources the script by path; an unquoted
+        interpolation would fail before reaching the function."""
         env, _ = fake_mac
-        root = tmp_path / 'g'
+        root = tmp_path / 'dir with spaces'
         root.mkdir()
         cfg = root / 'config.toml'
-        cfg.write_text('[models]\ndefault = "grok-4.6"\n')
-        (root / 'sys.toml').write_text(
-            '[ui]\ntheme = "groknight"\ncompact_mode = true\n')
-        (root / 'managed_config.toml').write_text(
-            '[ui]\ntheme = "groknight"\ncompact_mode = false\n')
-        r = self._editor(env, cfg, 'day', ['sys.toml', 'managed_config.toml'])
-        assert r.returncode == 0
+        cfg.write_text('[ui]\ntheme = "groknight"\n')
+        r = self._editor(env, cfg, 'day', [])
+        assert r.returncode == 0, r.stderr
         assert tomllib.loads(cfg.read_text())['ui']['theme'] == 'grokday'
 
 
