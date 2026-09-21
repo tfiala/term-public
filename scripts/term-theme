@@ -135,6 +135,7 @@ EOF
 # warn instead of reporting silent success.
 sync_toml_theme() {
   python3 - "$@" <<'EOF'
+import json
 import os
 import re
 import sys
@@ -148,6 +149,17 @@ except ModuleNotFoundError:
 NOT_SYNCED = 3  # the theme should change but we could not make it change
 
 path, mode, table, default, fold, day_names, night_names = sys.argv[1:8]
+# Optional JSON for a tool whose effective theme is not simply
+# <table>.theme in one file.  legacy_key names a documented alias read when
+# the canonical key is absent; lower_paths are lower-precedence config
+# layers (relative names resolve beside <path>) consulted when this file is
+# silent; strict_unknown_theme stands down rather than guess when a layer
+# carries a bare top-level `theme` key we cannot attribute.
+extras = json.loads(sys.argv[8]) if len(sys.argv) > 8 else {}
+legacy_key = extras.get('legacy_key')
+lower_paths = extras.get('lower_paths', [])
+strict_unknown = extras.get('strict_unknown_theme', False)
+
 NAMES = {'day': day_names.split(','), 'night': night_names.split(',')}
 
 
@@ -182,7 +194,56 @@ except tomllib.TOMLDecodeError:
 section = table_of(cfg)
 if section is None:
     sys.exit(NOT_SYNCED)  # a non-table <table> is a shape we cannot edit
-current = section.get('theme', default)
+
+
+def unattributable(parsed):
+    """A bare top-level `theme` we cannot account for in this tool's schema."""
+    return strict_unknown and 'theme' in parsed
+
+
+def theme_of(parsed):
+    """(value, key) for the highest-precedence theme one layer defines."""
+    sec = parsed.get(table)
+    if not isinstance(sec, dict):
+        return None, None
+    if 'theme' in sec:
+        return sec['theme'], 'theme'
+    if legacy_key and legacy_key in sec:
+        return sec[legacy_key], legacy_key
+    return None, None
+
+
+# Guessing costs the user a pinned or automatic theme, so a layer carrying
+# a theme key outside the documented schema stops us rather than being
+# treated as silence.
+if unattributable(cfg):
+    sys.exit(NOT_SYNCED)
+
+current, edit_key = theme_of(cfg)
+# Lower layers (an org-deployed managed config) supply the effective theme
+# when this file is silent.  We never edit those; when the value they carry
+# is ours to flip, we write the canonical key here, which the documented
+# precedence puts above them.
+for name in lower_paths if current is None else []:
+    lower_path = name if os.path.isabs(name) else os.path.join(
+        os.path.dirname(os.path.abspath(path)), name)
+    try:
+        with open(lower_path, 'rb') as f:
+            lower = tomllib.load(f)
+    except FileNotFoundError:
+        continue
+    except (OSError, tomllib.TOMLDecodeError):
+        sys.exit(NOT_SYNCED)  # a layer we cannot read is a theme we cannot resolve
+    if unattributable(lower):
+        sys.exit(NOT_SYNCED)
+    current, _ = theme_of(lower)
+    if current is not None:
+        break
+if current is None:
+    current = default  # nothing in any layer: the tool's built-in default
+if edit_key is None:
+    edit_key = 'theme'  # the canonical key is where a new value goes
+
 if not isinstance(current, str):
     sys.exit(NOT_SYNCED)
 side = SIDE.get(norm(current))
@@ -196,8 +257,9 @@ new = NAMES[mode][0]
 # same [<table>].theme; each strategy below covers one.  The reparse check
 # at the end is the authority — these only have to hit the right line.
 esc = re.escape(table)
+esck = re.escape(edit_key)
 TABLE = r'(?:' + esc + r'|"' + esc + r'"|\'' + esc + r'\')'
-THEME = r'(?:theme|"theme"|\'theme\')'
+THEME = r'(?:' + esck + r'|"' + esck + r'"|\'' + esck + r'\')'
 HEADER = re.compile(r'\s*\[\s*' + TABLE + r'\s*\]\s*(#.*)?$')
 THEME_KEY = re.compile(r'\s*' + THEME + r'\s*=')
 DOTTED = re.compile(r'\s*' + TABLE + r'\s*\.\s*' + THEME + r'\s*=')
@@ -209,7 +271,7 @@ INLINE_THEME_VAL = re.compile(
     r'(?<![\w"\'-])' + THEME + r'\s*=\s*(?P<val>"[^"]*"|\'[^\']*\')')
 
 lines = text.splitlines(keepends=True)
-theme_line = f'theme = "{new}"\n'
+theme_line = f'{edit_key} = "{new}"\n'
 
 # Any [section] header ends the top-level prologue where dotted keys and
 # inline tables can define the table.
@@ -241,7 +303,7 @@ if start is not None:
 else:
     for i in range(prologue_end):
         if DOTTED.match(lines[i]):
-            lines[i] = f'{table}.theme = "{new}"\n'
+            lines[i] = f'{table}.{edit_key} = "{new}"\n'
             break
         m = INLINE.match(lines[i].rstrip('\n'))
         if m:
@@ -250,9 +312,9 @@ else:
             if vm:
                 body = body[:vm.start('val')] + f'"{new}"' + body[vm.end('val'):]
             elif body.strip():
-                body = body + f', theme = "{new}"'
+                body = body + f', {edit_key} = "{new}"'
             else:
-                body = f' theme = "{new}" '
+                body = f' {edit_key} = "{new}" '
             lines[i] = m.group('pre') + body + m.group('post') + '\n'
             break
     else:
@@ -264,7 +326,7 @@ else:
             if DOTTED_ANY.match(lines[i]):
                 dotted_at = i
         if dotted_at is not None:
-            lines.insert(dotted_at + 1, f'{table}.theme = "{new}"\n')
+            lines.insert(dotted_at + 1, f'{table}.{edit_key} = "{new}"\n')
             text = ''.join(lines)
         else:
             if text and not text.endswith('\n'):
@@ -282,7 +344,7 @@ try:
 except tomllib.TOMLDecodeError:
     sys.exit(NOT_SYNCED)
 edited_section = table_of(edited)
-if edited_section is None or edited_section.get('theme') != new:
+if edited_section is None or edited_section.get(edit_key) != new:
     sys.exit(NOT_SYNCED)
 
 real = os.path.realpath(path)
@@ -353,19 +415,49 @@ sync_codex_theme() {
 #     reason the Starship prompt needs no nudge.
 #
 # A truecolor theme pinned outside the pair (tokyonight, rosepine-moon,
-# oscura-midnight) is a deliberate choice and is respected. Best-effort:
-# silently a no-op without a ~/.grok dir, python3, or tomllib
-# (python < 3.11). When a sync SHOULD happen but cannot, a warning is
-# printed instead of silent success.
+# oscura-midnight) is a deliberate choice and is respected.
+#
+# Deciding that means resolving the theme grok will actually render, not
+# just reading one key in one file:
+#
+#   * The config root is $GROK_HOME when set, not always ~/.grok. Editing
+#     the default path would leave the active install untouched and
+#     silently restyle an inactive one.
+#   * Within [ui], `ui_theme` is a documented legacy alias for `theme` and
+#     is read when `theme` is absent, so it is the key to flip when it is
+#     the one carrying the value.
+#   * `managed_config.toml` (in the config root, and /etc/grok) is an
+#     org-deployed layer that merges *below* config.toml. A theme there is
+#     the effective one while config.toml is silent, so treating that
+#     silence as grok's built-in default would write over an org's `auto`
+#     or pinned choice. We never edit that file; when its value is ours to
+#     flip we write the canonical key here, which precedence puts above it.
+#   * A bare top-level `theme` key is outside the documented schema
+#     (`ui.theme`/`ui.ui_theme` are the fields). Rather than guess whether
+#     grok honours it, stand down and warn — guessing wrong costs the user
+#     the very pinned or automatic theme this hook promises to preserve.
+#
+# Not resolved here, because term-theme's own environment is not
+# necessarily grok's: GROK_THEME/LC_GROK_THEME (tier 2) and the
+# GROK_CONFIG/GROK_CONFIG_PATH overlay and requirements.toml/MDM (tiers
+# 3-4) all outrank config.toml. The README documents that.
+#
+# Best-effort: silently a no-op without a grok config dir, python3, or
+# tomllib (python < 3.11). When a sync SHOULD happen but cannot, a warning
+# is printed instead of silent success.
 sync_grok_theme() {
-  local mode=$1 dir=$HOME/.grok rc=0
+  local mode=$1 dir=${GROK_HOME:-$HOME/.grok} rc=0
   [[ -d $dir ]] || return 0
   command -v python3 >/dev/null 2>&1 || return 0
   sync_toml_theme "$dir/config.toml" "$mode" ui groknight fold \
-    grokday,grok-day,light,day groknight,grok-night,dark 2>/dev/null || rc=$?
+    grokday,grok-day,light,day groknight,grok-night,dark \
+    '{"legacy_key": "ui_theme",
+      "lower_paths": ["managed_config.toml", "/etc/grok/managed_config.toml"],
+      "strict_unknown_theme": true}' 2>/dev/null || rc=$?
   if [[ $rc -ne 0 ]]; then
-    echo "term-theme: grok theme not synced — could not update ui.theme in" \
-      "~/.grok/config.toml; pick a ${mode} theme with grok's /theme instead" >&2
+    echo "term-theme: grok theme not synced — could not resolve or update" \
+      "ui.theme in ${dir}/config.toml; pick a ${mode} theme with grok's" \
+      "/theme instead" >&2
   fi
 }
 
