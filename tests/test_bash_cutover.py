@@ -389,6 +389,26 @@ class TestHistoryFileLocation:
         assert content.startswith("#1700000001\necho tp_current\n")
         assert "tp_legacy_residue" not in content
 
+    def test_no_copy_once_histfile_exists(self, tmp_path):
+        """Shell startup stays cheap: once the history file exists, no
+        shell copies the (possibly large) legacy file again, even though
+        the atomic link would refuse to publish it anyway."""
+        histfile = tmp_path / HISTFILE_REL
+        histfile.parent.mkdir(parents=True)
+        histfile.write_text("echo tp_current\n")
+        self._seed_legacy(tmp_path, "echo tp_legacy\n")
+        stubs = tmp_path / "stubs"
+        stubs.mkdir()
+        calls = tmp_path / "cp-calls"
+        (stubs / "cp").write_text(
+            f'#!/bin/bash\necho called >> "{calls}"\nexit 1\n')
+        (stubs / "cp").chmod(0o755)
+        r = self._interactive(
+            tmp_path, "true\n",
+            path=f"{stubs}:{os.environ.get('PATH', '/usr/bin:/bin')}")
+        assert r.returncode == 0
+        assert not calls.exists()
+
     def test_lost_migration_race_keeps_winner(self, tmp_path):
         """Two new shells can both see no history file.  A cp stand-in
         lets the "other" shell win between the check and the publish: it
