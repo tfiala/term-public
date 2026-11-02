@@ -106,7 +106,9 @@ class TestPrefixSearch:
         The recalled entry's payload is a command substitution, so its
         executed output (tp_ok_42) cannot come from terminal echo of the
         typed/recalled line itself."""
-        (tmp_path / ".bash_history").write_text(
+        histfile = tmp_path / ".local" / "state" / "bash" / "history"
+        histfile.parent.mkdir(parents=True)
+        histfile.write_text(
             "echo tp_ok_$((40+2))\n"
             "true tp_last_entry\n")
         out = _pty_session(tmp_path, "echo\x1b[A\rexit\r")

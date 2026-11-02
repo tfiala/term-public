@@ -8,9 +8,12 @@ script, and bash/bashrc's environment setup.
 
 import os
 import re
+import stat
 import subprocess
 import tomllib
 from pathlib import Path
+
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +23,11 @@ TMUX_CONF = REPO_ROOT / "tmux" / "tmux.conf"
 STARSHIP_TOML = REPO_ROOT / "starship" / "starship.toml"
 BOOTSTRAP = REPO_ROOT / "setup" / "bootstrap-macos.sh"
 HIVE_PY = REPO_ROOT / "scripts" / "hive.py"
+
+# The history file bash/bashrc sets, relative to HOME, and the legacy
+# default it migrates from (the rationale is in the bashrc comment).
+HISTFILE_REL = Path(".local/state/bash/history")
+LEGACY_HISTFILE_REL = Path(".bash_history")
 
 # Every bash 5 tmux may pin: the Linux system bash (a path macOS does not
 # have) and the two Homebrew prefixes.  macOS /bin/bash 3.2 is never one.
@@ -285,9 +293,11 @@ class TestHistory:
         assert r.returncode == 0
         assert r.stdout.splitlines()[-1].strip() == "1"
         # extended_history parity: the entry is timestamped in the file.
-        content = (tmp_path / ".bash_history").read_text()
+        content = (tmp_path / HISTFILE_REL).read_text()
         assert "echo tp_hist_one" in content
         assert re.search(r"^#\d+$", content, re.M)
+        # Nothing reaches bash's default path any more.
+        assert not (tmp_path / LEGACY_HISTFILE_REL).exists()
 
     def test_history_shared_across_sessions(self, tmp_path):
         """share_history, half 2: entries another shell appends to
@@ -310,6 +320,130 @@ class TestHistory:
         r = self._interactive(tmp_path, "true\n")
         assert r.returncode == 0
         assert "FROM_BAK_PC" in r.stdout
+
+
+class TestHistoryFileLocation:
+    """The history file lives off ~/.bash_history, so a bash that skips
+    bash/bashrc cannot clobber it, and an existing ~/.bash_history is
+    carried over once."""
+
+    def _interactive(self, home, input_text, path=None):
+        return subprocess.run(
+            ["bash", "--rcfile", str(BASHRC), "-i"],
+            input=input_text,
+            capture_output=True,
+            text=True,
+            env={"PATH": path or os.environ.get("PATH", "/usr/bin:/bin"),
+                 "HOME": str(home), "TERM": "xterm-256color"},
+            timeout=15,
+        )
+
+    def _seed_legacy(self, home, text, mode=0o600):
+        legacy = home / LEGACY_HISTFILE_REL
+        legacy.write_text(text)
+        legacy.chmod(mode)
+        return legacy
+
+    def test_histfile_is_the_state_path(self, tmp_path):
+        r = self._interactive(tmp_path, 'echo "HF=$HISTFILE"\n')
+        assert r.returncode == 0
+        assert f"HF={tmp_path / HISTFILE_REL}" in r.stdout.splitlines()
+
+    def test_state_dir_created_private(self, tmp_path):
+        r = self._interactive(tmp_path, "true\n")
+        assert r.returncode == 0
+        histdir = (tmp_path / HISTFILE_REL).parent
+        assert stat.S_IMODE(histdir.stat().st_mode) == 0o700
+
+    @pytest.mark.parametrize("legacy_mode", [0o600, 0o644])
+    def test_legacy_history_migrated_once(self, tmp_path, legacy_mode):
+        """The first shell copies ~/.bash_history in byte for byte, never
+        more readable than 0600, leaves the legacy file in place for
+        shells started before the switch, and the migrated entry is
+        recallable.  The grep pattern is split so its own line never
+        matches."""
+        legacy_text = "#1700000000\necho tp_migrated_entry\n"
+        legacy = self._seed_legacy(tmp_path, legacy_text, legacy_mode)
+        r = self._interactive(
+            tmp_path, 'history | grep -c "tp_migrated_ent""ry"\n')
+        assert r.returncode == 0
+        assert r.stdout.splitlines()[-1].strip() == "1"
+        histfile = tmp_path / HISTFILE_REL
+        assert histfile.read_text().startswith(legacy_text)
+        assert stat.S_IMODE(histfile.stat().st_mode) == 0o600
+        assert legacy.read_text() == legacy_text
+        assert stat.S_IMODE(legacy.stat().st_mode) == legacy_mode
+        assert sorted(p.name for p in histfile.parent.iterdir()) == ["history"]
+
+    def test_existing_histfile_never_overwritten(self, tmp_path):
+        """Migration is one-shot: once the history file exists, a legacy
+        file (which shells without bash/bashrc keep rewriting) is never
+        copied over it again."""
+        histfile = tmp_path / HISTFILE_REL
+        histfile.parent.mkdir(parents=True)
+        histfile.write_text("#1700000001\necho tp_current\n")
+        self._seed_legacy(tmp_path, "echo tp_legacy_residue\n")
+        r = self._interactive(tmp_path, "true\n")
+        assert r.returncode == 0
+        content = histfile.read_text()
+        assert content.startswith("#1700000001\necho tp_current\n")
+        assert "tp_legacy_residue" not in content
+
+    def test_lost_migration_race_keeps_winner(self, tmp_path):
+        """Two new shells can both see no history file.  A cp stand-in
+        lets the "other" shell win between the check and the publish: it
+        creates the history file with its own entry, then this shell's
+        copy proceeds.  The winner's file must survive untouched, with
+        no temp copy left behind."""
+        histfile = tmp_path / HISTFILE_REL
+        stubs = tmp_path / "stubs"
+        stubs.mkdir()
+        real_cp = subprocess.run(["bash", "-c", "command -v cp"],
+                                 capture_output=True, text=True,
+                                 check=True).stdout.strip()
+        (stubs / "cp").write_text(
+            "#!/bin/bash\n"
+            f'printf "#1700000002\\necho tp_winner\\n" > "{histfile}"\n'
+            f'exec {real_cp} "$@"\n')
+        (stubs / "cp").chmod(0o755)
+        self._seed_legacy(tmp_path, "echo tp_loser_copy\n")
+        r = self._interactive(
+            tmp_path, "true\n",
+            path=f"{stubs}:{os.environ.get('PATH', '/usr/bin:/bin')}")
+        assert r.returncode == 0
+        content = histfile.read_text()
+        assert content.startswith("#1700000002\necho tp_winner\n")
+        assert "tp_loser_copy" not in content
+        assert sorted(p.name for p in histfile.parent.iterdir()) == ["history"]
+
+    def test_uncreatable_dir_falls_back_to_default(self, tmp_path):
+        """If the state directory cannot be created, history still
+        persists at bash's default rather than nowhere."""
+        (tmp_path / ".local").write_text("not a directory\n")
+        r = self._interactive(tmp_path, 'echo "HF=$HISTFILE"\n')
+        assert r.returncode == 0
+        assert f"HF={tmp_path / LEGACY_HISTFILE_REL}" in r.stdout.splitlines()
+
+    def test_rcless_shell_cannot_clobber_history(self, tmp_path):
+        """The failure this location exists for: a bash that skips
+        bash/bashrc and runs with bash's defaults rewrites only the
+        legacy path; the live history file stays byte-identical."""
+        self._seed_legacy(tmp_path, "#1700000000\necho tp_kept\n")
+        assert self._interactive(tmp_path, "true\n").returncode == 0
+        histfile = tmp_path / HISTFILE_REL
+        before = histfile.read_bytes()
+        r = subprocess.run(
+            ["bash", "--noprofile", "--norc", "-i"],
+            input="echo tp_rcless_paste\n",
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                 "HOME": str(tmp_path), "TERM": "xterm-256color"},
+            timeout=15,
+        )
+        assert r.returncode == 0
+        assert "tp_rcless_paste" in (tmp_path / LEGACY_HISTFILE_REL).read_text()
+        assert histfile.read_bytes() == before
 
 
 def _install_fake_home(tmp_path):

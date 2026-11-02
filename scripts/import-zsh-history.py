@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""import-zsh-history.py - One-shot ~/.zsh_history -> ~/.bash_history import.
+"""import-zsh-history.py - One-shot ~/.zsh_history -> bash history import.
 
 The bash cutover (#15/#19) kept the zsh era's history *behavior* (see the
 History section of bash/bashrc) but not its accumulated *data*.  This
@@ -12,14 +12,19 @@ into the timestamped format bash reads when HISTTIMEFORMAT is set
     #<start>
     <command>
 
-and appends them to the bash history file.  Multi-line zsh entries
+and appends them to the bash history file, by default the one bash/bashrc
+sets as HISTFILE (~/.local/state/bash/history).  Multi-line zsh entries
 (backslash-continued lines) are unfolded back into real newlines, which
 bash re-joins into one entry via the timestamp markers.  Bytes zsh
 "metafied" (0x83 marker + byte^0x20, used for non-ASCII) are restored.
 
 Safety / idempotency: the destination is backed up to
 <bash_history>.zsh-import.bak first, and the script refuses to run again
-while that backup exists — delete it to force a re-import.
+while that backup exists — delete it to force a re-import.  With the
+default destination it also refuses while bash/bashrc has not yet migrated
+~/.bash_history (importing first would make the migration skip it), and when
+the legacy ~/.bash_history.zsh-import.bak shows the import already ran into
+the old file.
 """
 
 import argparse
@@ -29,6 +34,35 @@ from pathlib import Path
 
 ZSH_META = 0x83  # zsh Meta marker byte: next byte is stored XOR 0x20
 BACKUP_SUFFIX = ".zsh-import.bak"
+# The HISTFILE bash/bashrc sets, relative to HOME, and the pre-2026-11
+# default it migrates from.  setup.sh names both too.
+HISTFILE_REL = Path(".local/state/bash/history")
+LEGACY_HISTFILE_REL = Path(".bash_history")
+
+
+def default_guard(home: Path) -> str | None:
+    """Why an import into the default destination must not run yet, or None.
+
+    bash/bashrc migrates ~/.bash_history only while its own history file
+    does not exist, so an import that creates that file first would leave
+    the legacy history behind for good.  A legacy done-marker means the
+    import already ran into ~/.bash_history, which the migration carries.
+    """
+    dest = home / HISTFILE_REL
+    legacy = home / LEGACY_HISTFILE_REL
+    legacy_marker = legacy.with_name(legacy.name + BACKUP_SUFFIX)
+    if legacy_marker.exists():
+        return (
+            f"{legacy_marker} exists — zsh history was already imported into\n"
+            f"       {legacy}, which bash/bashrc migrates to {dest}."
+        )
+    if legacy.is_file() and not dest.exists():
+        return (
+            f"{legacy} has not been migrated to {dest} yet.\n"
+            f"       Start one interactive bash (bash/bashrc migrates it), "
+            f"then rerun."
+        )
+    return None
 
 
 def unmetafy(data: bytes) -> bytes:
@@ -110,6 +144,9 @@ def import_history(zsh_path: Path, bash_path: Path) -> int:
         print(f"error: no entries parsed from {zsh_path}", file=sys.stderr)
         return 1
 
+    # The default destination's directory may not exist yet on a machine
+    # where no shell has run bash/bashrc.  0700: it holds only history.
+    bash_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     existing = bash_path.read_bytes() if bash_path.is_file() else b""
     # History can contain private commands, so the backup is created 0600
     # regardless of umask; O_EXCL also makes the done-marker check above
@@ -147,10 +184,17 @@ def main() -> int:
     parser.add_argument(
         "--bash-history",
         type=Path,
-        default=Path.home() / ".bash_history",
-        help="destination bash history file (default: ~/.bash_history)",
+        default=None,
+        help=f"destination bash history file (default: ~/{HISTFILE_REL})",
     )
     args = parser.parse_args()
+    if args.bash_history is None:
+        home = Path.home()
+        reason = default_guard(home)
+        if reason:
+            print(f"error: {reason}", file=sys.stderr)
+            return 1
+        args.bash_history = home / HISTFILE_REL
     return import_history(args.zsh_history, args.bash_history)
 
 

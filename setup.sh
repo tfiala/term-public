@@ -473,8 +473,12 @@ fi
 
 # Offer the one-shot history import while zsh history is still around and
 # the import has not already run (the importer leaves the .zsh-import.bak
-# backup behind as its done-marker).
-if [[ -f "$HOME/.zsh_history" && ! -f "$HOME/.bash_history.zsh-import.bak" ]]; then
+# backup behind as its done-marker).  Either marker counts: imports before
+# 2026-11 went into ~/.bash_history, which bash/bashrc migrates to the
+# current history file.
+if [[ -f "$HOME/.zsh_history" \
+      && ! -f "$HOME/.local/state/bash/history.zsh-import.bak" \
+      && ! -f "$HOME/.bash_history.zsh-import.bak" ]]; then
   echo "NOTE: zsh command history found at $HOME/.zsh_history."
   echo "      Import it into bash history with:"
   echo "      $ROOT_DIR/scripts/import-zsh-history.py"
