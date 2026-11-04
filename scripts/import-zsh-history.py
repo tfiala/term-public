@@ -150,14 +150,21 @@ def import_history(zsh_path: Path, bash_path: Path) -> int:
         # where no shell has run bash/bashrc.  0700: it holds only history.
         bash_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         existing = bash_path.read_bytes() if bash_path.is_file() else b""
+        # Opened before the backup exists, because the backup is the
+        # done-marker: a destination that cannot be written must not leave
+        # a false one.  The 0600 mode applies only if the file is being
+        # created; an existing destination keeps its current mode.
+        dest_fd = os.open(bash_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                          0o600)
         # History can contain private commands, so the backup is created
         # 0600 regardless of umask; O_EXCL also makes the done-marker check
         # above race-safe.
-        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        backup_fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                            0o600)
     except OSError as err:
         print(f"error: cannot write {bash_path}: {err}", file=sys.stderr)
         return 1
-    with os.fdopen(fd, "wb") as f:
+    with os.fdopen(backup_fd, "wb") as f:
         f.write(existing)
 
     converted = render_bash_history(entries).encode("utf-8")
@@ -165,10 +172,7 @@ def import_history(zsh_path: Path, bash_path: Path) -> int:
         converted = b"\n" + converted
     # Append via O_APPEND, never read-modify-replace: a `history -a` from
     # a live shell between the snapshot above and this write must survive.
-    # The 0600 mode applies only if the file is being created; an existing
-    # destination keeps its current mode.
-    fd = os.open(bash_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    with os.fdopen(fd, "wb") as f:
+    with os.fdopen(dest_fd, "wb") as f:
         f.write(converted)
 
     print(f"Imported {len(entries)} entries from {zsh_path} into {bash_path}")

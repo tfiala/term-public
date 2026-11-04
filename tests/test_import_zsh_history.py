@@ -176,6 +176,29 @@ class TestImport:
             readonly.chmod(0o700)
         assert f"error: cannot write {bash}" in capsys.readouterr().err
 
+    def _assert_refused_without_marker(self, zsh, bash, capsys):
+        assert importer.import_history(zsh, bash) == 1
+        assert f"error: cannot write {bash}" in capsys.readouterr().err
+        marker = bash.with_name(bash.name + importer.BACKUP_SUFFIX)
+        assert not marker.exists()
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores mode bits")
+    def test_read_only_history_file_leaves_no_marker(self, tmp_path, capsys):
+        """The backup is the done-marker, so a destination that cannot be
+        written must not leave one: the rerun after fixing the mode has to
+        import, not claim the import already ran."""
+        zsh, bash = self._seed(tmp_path)
+        bash.chmod(0o400)
+        self._assert_refused_without_marker(zsh, bash, capsys)
+        bash.chmod(0o600)
+        assert importer.import_history(zsh, bash) == 0
+        assert "echo imported" in bash.read_text()
+
+    def test_directory_at_destination_leaves_no_marker(self, tmp_path, capsys):
+        zsh, bash = self._seed(tmp_path, bash_text=None)
+        bash.mkdir()
+        self._assert_refused_without_marker(zsh, bash, capsys)
+
     @pytest.mark.parametrize("markers,noted", [
         ([], True),
         ([importer.HISTFILE_REL], False),
