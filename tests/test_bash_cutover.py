@@ -481,14 +481,17 @@ class TestHistoryFileLocation:
         """A copy or link that fails publishes nothing.  HISTFILE must then
         stay on bash's default: moving anyway lets the first command create
         the new file, which ends the migration and strands the legacy
-        history.  The failure is reported, and the next shell carries
-        everything over, including what was typed in between."""
+        history.  The failed cp leaves a partial copy, as one that dies
+        partway does, and that copy must not be published either.  The
+        failure is reported, and the next shell carries everything over,
+        including what was typed in between."""
         legacy_text = "#1700000000\necho tp_legacy\n"
         legacy = self._seed_legacy(tmp_path, legacy_text)
         histfile = tmp_path / HISTFILE_REL
         stubs = tmp_path / "stubs"
         stubs.mkdir()
-        (stubs / tool).write_text("#!/bin/sh\nexit 1\n")
+        partial_copy = {"cp": 'head -c 5 "$1" > "$2"\n', "ln": ""}[tool]
+        (stubs / tool).write_text(f"#!/bin/sh\n{partial_copy}exit 1\n")
         (stubs / tool).chmod(0o755)
         r = self._interactive(
             tmp_path, 'echo "HF=$HISTFILE"\necho tp_in_between\n',
