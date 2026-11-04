@@ -59,8 +59,9 @@ def default_guard(home: Path) -> str | None:
     if legacy.is_file() and not dest.exists():
         return (
             f"{legacy} has not been migrated to {dest} yet.\n"
-            f"       Start one interactive bash (bash/bashrc migrates it), "
-            f"then rerun."
+            f"       Start one interactive bash (bash/bashrc migrates it, or "
+            f"says why it cannot),\n"
+            f"       then rerun."
         )
     return None
 
@@ -144,14 +145,18 @@ def import_history(zsh_path: Path, bash_path: Path) -> int:
         print(f"error: no entries parsed from {zsh_path}", file=sys.stderr)
         return 1
 
-    # The default destination's directory may not exist yet on a machine
-    # where no shell has run bash/bashrc.  0700: it holds only history.
-    bash_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    existing = bash_path.read_bytes() if bash_path.is_file() else b""
-    # History can contain private commands, so the backup is created 0600
-    # regardless of umask; O_EXCL also makes the done-marker check above
-    # race-safe.
-    fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        # The default destination's directory may not exist yet on a machine
+        # where no shell has run bash/bashrc.  0700: it holds only history.
+        bash_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        existing = bash_path.read_bytes() if bash_path.is_file() else b""
+        # History can contain private commands, so the backup is created
+        # 0600 regardless of umask; O_EXCL also makes the done-marker check
+        # above race-safe.
+        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError as err:
+        print(f"error: cannot write {bash_path}: {err}", file=sys.stderr)
+        return 1
     with os.fdopen(fd, "wb") as f:
         f.write(existing)
 

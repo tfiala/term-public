@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / 'scripts'
 sys.path.insert(0, str(_SCRIPTS_DIR))
 importer = importlib.import_module('import-zsh-history')
@@ -155,14 +157,55 @@ class TestImport:
         assert importer.import_history(tmp_path / "nope", bash) == 1
         assert not bash.exists()
 
-    def test_setup_sh_names_both_backup_markers(self):
-        """setup.sh's already-imported guard must test the exact files the
-        importer writes: the current default's marker and the legacy one
-        (literal-constant contract)."""
+    def test_destination_under_a_file_fails_cleanly(self, tmp_path, capsys):
+        zsh, _ = self._seed(tmp_path, bash_text=None)
+        (tmp_path / "blocked").write_text("not a directory\n")
+        bash = tmp_path / "blocked" / "history"
+        assert importer.import_history(zsh, bash) == 1
+        assert f"error: cannot write {bash}" in capsys.readouterr().err
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores mode bits")
+    def test_read_only_destination_fails_cleanly(self, tmp_path, capsys):
+        zsh, _ = self._seed(tmp_path, bash_text=None)
+        readonly = tmp_path / "readonly"
+        readonly.mkdir(mode=0o500)
+        bash = readonly / "history"
+        try:
+            assert importer.import_history(zsh, bash) == 1
+        finally:
+            readonly.chmod(0o700)
+        assert f"error: cannot write {bash}" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("markers,noted", [
+        ([], True),
+        ([importer.HISTFILE_REL], False),
+        ([importer.LEGACY_HISTFILE_REL], False),
+        ([importer.HISTFILE_REL, importer.LEGACY_HISTFILE_REL], False),
+    ])
+    def test_setup_sh_note_stops_at_either_marker(self, tmp_path, markers,
+                                                  noted):
+        """setup.sh's reminder must stop once the importer has left its
+        done-marker at either the current default or the legacy path.  Runs
+        setup.sh's real block under a temp HOME, with the marker names taken
+        from the importer."""
         text = SETUP_SH.read_text()
-        for rel in (importer.HISTFILE_REL, importer.LEGACY_HISTFILE_REL):
-            marker = f'$HOME/{rel}{importer.BACKUP_SUFFIX}'
-            assert f'! -f "{marker}"' in text
+        start = text.index('if [[ -f "$HOME/.zsh_history"')
+        block = text[start:text.index("\nfi\n", start) + len("\nfi\n")]
+        (tmp_path / ".zsh_history").write_text(": 1700000000:0;echo hi\n")
+        for rel in markers:
+            marker = tmp_path / f"{rel}{importer.BACKUP_SUFFIX}"
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch()
+        r = subprocess.run(
+            ["bash", "--norc", "-c", block],
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                 "HOME": str(tmp_path), "ROOT_DIR": "/repo"},
+            timeout=15,
+        )
+        assert r.returncode == 0
+        assert ("NOTE: zsh command history found" in r.stdout) is noted
 
     def test_default_destination_is_bashrc_histfile(self, tmp_path):
         """Both ends of the path contract: the importer's default is the
