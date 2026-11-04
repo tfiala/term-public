@@ -70,11 +70,24 @@ History matches the zsh-era behavior (which came from oh-my-zsh's
 `lib/history.zsh`): entries are timestamped, duplicates and space-prefixed
 commands stay out, history expansions (`!!`, `!$`) are loaded for review
 instead of run blind, and — the bash spelling of zsh's `share_history` —
-every command is flushed to `~/.bash_history` as it runs and the merged
+every command is flushed to the history file as it runs and the merged
 file is reloaded at each prompt, so tmux panes share one live history and
 a killed pane loses nothing. `scripts/import-zsh-history.py` does a
 one-shot import of an existing `~/.zsh_history` into bash's timestamped
 format (`setup.sh` reminds you while one is present).
+
+The history file is `~/.local/state/bash/history`, not bash's default
+`~/.bash_history`. A bash started without this config (`bash --norc -i`)
+rewrites `~/.bash_history` on exit with bash's defaults: the last 500
+lines, timestamps stripped. With the history kept elsewhere, such a shell
+can only rewrite a file nothing reads. The first shell after the switch
+copies `~/.bash_history` in. If it cannot, it says so and stays on
+`~/.bash_history`, and the next shell tries again. A `HISTFILE` you set or
+unset yourself is left alone. Shells started before the switch keep
+writing the old file until they are restarted (`exec bash`), and their
+commands from that window stay only there. Once no such shell remains,
+copy out anything you want from that window, and `~/.bash_history` can be
+deleted.
 
 Recall — the role zsh-autosuggestions played in the zsh era — comes from
 two bindings in `bash/bashrc`. Up/Down prefix-search the history: with

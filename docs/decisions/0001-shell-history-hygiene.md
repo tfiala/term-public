@@ -36,6 +36,18 @@ before `history -a` writes it. Nothing about #24's design blocks it.
 
 This ADR records why we are not doing that, and what we do instead.
 
+**Amended 2026-11-02: the history file moved.** `bash/bashrc` now moves
+bash's default `HISTFILE` to `~/.local/state/bash/history`, and the first
+shell after the switch copies `~/.bash_history` there. A `HISTFILE` the
+caller set or unset is left alone. A bash that skips `bash/bashrc` still
+rewrites bash's default `~/.bash_history` on exit (its last 500 lines,
+timestamps stripped). On 2026-11-02 interactive shells started that way by
+another repo's test helpers did so repeatedly and reduced a full history to
+500 lines of pasted runbook. The contract below governs the live history
+file, wherever `HISTFILE` points. The Context, Evidence and Alternatives
+Considered sections predate the move, and their `~/.bash_history`
+references describe that file as it was.
+
 ## Decision
 
 **Do not filter shell history by exit status.** No `PROMPT_COMMAND` hook culls,
@@ -45,8 +57,8 @@ neither "all non-zero" nor a narrowed subset such as 127.
 History hygiene is handled by two deliberate controls instead:
 
 1. **Targeted removal after the fact.** A `histrm <pattern>` helper removes
-   matching entries from `~/.bash_history`. This ADR fixes its required
-   postconditions and leaves the algorithm to the implementation:
+   matching entries from the history file (`$HISTFILE`). This ADR fixes its
+   required postconditions and leaves the algorithm to the implementation:
 
    - **Backup.** A copy of the pre-removal file exists before the destination
      is modified, created `0600` regardless of umask, since history can
@@ -57,7 +69,7 @@ History hygiene is handled by two deliberate controls instead:
      (which leaves a readable window), ownership is preserved, and the final
      destination mode is no more permissive than the mode it had before,
      capped at `0600`. An atomic replace that publishes a fresh inode created
-     under the default umask would silently relax `~/.bash_history` from
+     under the default umask would silently relax the history file from
      `0600` to `0644` — the operation would satisfy every other postcondition
      while exposing the private commands this contract exists to protect.
      Diagnostics are value-safe for the same reason: counts and bounded
@@ -192,8 +204,9 @@ mistake.
 ## Infra Impact
 
 None. `term-public` configures a local interactive shell; this decision touches
-`bash/bashrc`, `~/.bash_history`, and a future `scripts/` helper. No cluster
-resource, RBAC, NetworkPolicy, registry image, or secret is involved.
+`bash/bashrc`, the history file (`~/.local/state/bash/history`), and a
+future `scripts/` helper. No cluster resource, RBAC, NetworkPolicy, registry
+image, or secret is involved.
 
 ## Evidence
 

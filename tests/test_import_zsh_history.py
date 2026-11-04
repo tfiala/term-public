@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / 'scripts'
 sys.path.insert(0, str(_SCRIPTS_DIR))
 importer = importlib.import_module('import-zsh-history')
@@ -155,12 +157,93 @@ class TestImport:
         assert importer.import_history(tmp_path / "nope", bash) == 1
         assert not bash.exists()
 
-    def test_setup_sh_names_the_real_backup_marker(self):
-        """setup.sh's already-imported guard must test the exact file the
-        importer writes (literal-constant contract)."""
+    def test_destination_under_a_file_fails_cleanly(self, tmp_path, capsys):
+        zsh, _ = self._seed(tmp_path, bash_text=None)
+        (tmp_path / "blocked").write_text("not a directory\n")
+        bash = tmp_path / "blocked" / "history"
+        assert importer.import_history(zsh, bash) == 1
+        assert f"error: cannot write {bash}" in capsys.readouterr().err
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores mode bits")
+    def test_read_only_destination_fails_cleanly(self, tmp_path, capsys):
+        zsh, _ = self._seed(tmp_path, bash_text=None)
+        readonly = tmp_path / "readonly"
+        readonly.mkdir(mode=0o500)
+        bash = readonly / "history"
+        try:
+            assert importer.import_history(zsh, bash) == 1
+        finally:
+            readonly.chmod(0o700)
+        assert f"error: cannot write {bash}" in capsys.readouterr().err
+
+    def _assert_refused_without_marker(self, zsh, bash, capsys):
+        assert importer.import_history(zsh, bash) == 1
+        assert f"error: cannot write {bash}" in capsys.readouterr().err
+        marker = bash.with_name(bash.name + importer.BACKUP_SUFFIX)
+        assert not marker.exists()
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores mode bits")
+    def test_read_only_history_file_leaves_no_marker(self, tmp_path, capsys):
+        """The backup is the done-marker, so a destination that cannot be
+        written must not leave one: the rerun after fixing the mode has to
+        import, not claim the import already ran."""
+        zsh, bash = self._seed(tmp_path)
+        bash.chmod(0o400)
+        self._assert_refused_without_marker(zsh, bash, capsys)
+        bash.chmod(0o600)
+        assert importer.import_history(zsh, bash) == 0
+        assert "echo imported" in bash.read_text()
+
+    def test_directory_at_destination_leaves_no_marker(self, tmp_path, capsys):
+        zsh, bash = self._seed(tmp_path, bash_text=None)
+        bash.mkdir()
+        self._assert_refused_without_marker(zsh, bash, capsys)
+
+    @pytest.mark.parametrize("markers,noted", [
+        ([], True),
+        ([importer.HISTFILE_REL], False),
+        ([importer.LEGACY_HISTFILE_REL], False),
+        ([importer.HISTFILE_REL, importer.LEGACY_HISTFILE_REL], False),
+    ])
+    def test_setup_sh_note_stops_at_either_marker(self, tmp_path, markers,
+                                                  noted):
+        """setup.sh's reminder must stop once the importer has left its
+        done-marker at either the current default or the legacy path.  Runs
+        setup.sh's real block under a temp HOME, with the marker names taken
+        from the importer."""
         text = SETUP_SH.read_text()
-        marker = f'$HOME/.bash_history{importer.BACKUP_SUFFIX}'
-        assert f'! -f "{marker}"' in text
+        start = text.index('if [[ -f "$HOME/.zsh_history"')
+        block = text[start:text.index("\nfi\n", start) + len("\nfi\n")]
+        (tmp_path / ".zsh_history").write_text(": 1700000000:0;echo hi\n")
+        for rel in markers:
+            marker = tmp_path / f"{rel}{importer.BACKUP_SUFFIX}"
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch()
+        r = subprocess.run(
+            ["bash", "--norc", "-c", block],
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                 "HOME": str(tmp_path), "ROOT_DIR": "/repo"},
+            timeout=15,
+        )
+        assert r.returncode == 0
+        assert ("NOTE: zsh command history found" in r.stdout) is noted
+
+    def test_default_destination_is_bashrc_histfile(self, tmp_path):
+        """Both ends of the path contract: the importer's default is the
+        HISTFILE a real interactive bash/bashrc shell ends up with."""
+        r = subprocess.run(
+            ["bash", "--rcfile", str(BASHRC), "-i"],
+            input='echo "HF=$HISTFILE"\n',
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                 "HOME": str(tmp_path), "TERM": "xterm-256color"},
+            timeout=15,
+        )
+        assert r.returncode == 0
+        assert f"HF={tmp_path / importer.HISTFILE_REL}" in r.stdout.splitlines()
 
     def test_imported_entry_visible_to_bash(self, tmp_path):
         """End to end: bash parses the converted format — the imported
@@ -168,7 +251,7 @@ class TestImport:
         pattern is split so its own history line never matches."""
         zsh = tmp_path / ".zsh_history"
         zsh.write_text(": 1700000000:0;echo tp_zsh_marker\n")
-        bash_hist = tmp_path / ".bash_history"
+        bash_hist = tmp_path / importer.HISTFILE_REL
         assert importer.import_history(zsh, bash_hist) == 0
         r = subprocess.run(
             ["bash", "--rcfile", str(BASHRC), "-i"],
@@ -181,3 +264,80 @@ class TestImport:
         )
         assert r.returncode == 0
         assert r.stdout.splitlines()[-1].strip() == "1"
+
+
+class TestDefaultDestination:
+    """Run as a script with no --bash-history: the destination is
+    bash/bashrc's HISTFILE, and the import refuses to get ahead of the
+    ~/.bash_history migration."""
+
+    SCRIPT = _SCRIPTS_DIR / "import-zsh-history.py"
+
+    def _run(self, home):
+        return subprocess.run(
+            [sys.executable, str(self.SCRIPT)],
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                 "HOME": str(home)},
+            timeout=15,
+        )
+
+    def _seed_zsh(self, home):
+        (home / ".zsh_history").write_text(": 1700000000:0;echo imported\n")
+
+    def test_imports_into_new_dir_created_private(self, tmp_path):
+        self._seed_zsh(tmp_path)
+        r = self._run(tmp_path)
+        assert r.returncode == 0, r.stderr
+        dest = tmp_path / importer.HISTFILE_REL
+        assert dest.read_text() == "#1700000000\necho imported\n"
+        assert stat.S_IMODE(dest.parent.stat().st_mode) == 0o700
+        assert not (tmp_path / importer.LEGACY_HISTFILE_REL).exists()
+
+    def test_refuses_before_legacy_migrated(self, tmp_path):
+        """Creating the history file first would make bash/bashrc skip
+        the migration and strand ~/.bash_history."""
+        self._seed_zsh(tmp_path)
+        (tmp_path / ".bash_history").write_text("echo legacy\n")
+        r = self._run(tmp_path)
+        assert r.returncode == 1
+        assert "not been migrated" in r.stderr
+        assert not (tmp_path / importer.HISTFILE_REL).exists()
+
+    def test_imports_once_migrated(self, tmp_path):
+        self._seed_zsh(tmp_path)
+        (tmp_path / ".bash_history").write_text("echo legacy\n")
+        dest = tmp_path / importer.HISTFILE_REL
+        dest.parent.mkdir(parents=True)
+        dest.write_text("echo legacy\n")
+        r = self._run(tmp_path)
+        assert r.returncode == 0, r.stderr
+        assert dest.read_text() == "echo legacy\n#1700000000\necho imported\n"
+
+    def test_legacy_marker_means_already_imported(self, tmp_path):
+        """An import before the move went into ~/.bash_history, which the
+        migration carries; importing again would duplicate every entry."""
+        self._seed_zsh(tmp_path)
+        (tmp_path / (".bash_history" + importer.BACKUP_SUFFIX)).write_text("")
+        dest = tmp_path / importer.HISTFILE_REL
+        dest.parent.mkdir(parents=True)
+        dest.write_text("echo migrated\n")
+        r = self._run(tmp_path)
+        assert r.returncode == 1
+        assert "already imported" in r.stderr
+        assert dest.read_text() == "echo migrated\n"
+
+    def test_explicit_destination_skips_the_guard(self, tmp_path):
+        self._seed_zsh(tmp_path)
+        (tmp_path / ".bash_history").write_text("echo legacy\n")
+        r = subprocess.run(
+            [sys.executable, str(self.SCRIPT),
+             "--bash-history", str(tmp_path / "elsewhere")],
+            capture_output=True, text=True,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                 "HOME": str(tmp_path)},
+            timeout=15,
+        )
+        assert r.returncode == 0, r.stderr
+        assert (tmp_path / "elsewhere").read_text() == "#1700000000\necho imported\n"
