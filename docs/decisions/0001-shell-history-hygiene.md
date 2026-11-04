@@ -36,15 +36,17 @@ before `history -a` writes it. Nothing about #24's design blocks it.
 
 This ADR records why we are not doing that, and what we do instead.
 
-**Amended 2026-11-02: the history file moved.** `bash/bashrc` now sets
-`HISTFILE` to `~/.local/state/bash/history`, and the first shell after the
-switch copies `~/.bash_history` there. A bash that skips `bash/bashrc`
-still rewrites bash's default `~/.bash_history` on exit (its last 500
-lines, timestamps stripped). On 2026-11-02 interactive shells started that
-way by another repo's test helpers did so repeatedly and reduced a full
-history to 500 lines of pasted runbook. The contract below governs the live
-history file, wherever `HISTFILE` points. The Evidence section predates the
-move, and its `~/.bash_history` measurements describe that file as it was.
+**Amended 2026-11-02: the history file moved.** `bash/bashrc` now moves
+bash's default `HISTFILE` to `~/.local/state/bash/history`, and the first
+shell after the switch copies `~/.bash_history` there. A `HISTFILE` the
+caller set or unset is left alone. A bash that skips `bash/bashrc` still
+rewrites bash's default `~/.bash_history` on exit (its last 500 lines,
+timestamps stripped). On 2026-11-02 interactive shells started that way by
+another repo's test helpers did so repeatedly and reduced a full history to
+500 lines of pasted runbook. The contract below governs the live history
+file, wherever `HISTFILE` points. The Context, Evidence and Alternatives
+Considered sections predate the move, and their `~/.bash_history`
+references describe that file as it was.
 
 ## Decision
 

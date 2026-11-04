@@ -327,14 +327,14 @@ class TestHistoryFileLocation:
     bash/bashrc cannot clobber it, and an existing ~/.bash_history is
     carried over once."""
 
-    def _interactive(self, home, input_text, path=None):
+    def _interactive(self, home, input_text, path=None, env=None):
         return subprocess.run(
             ["bash", "--rcfile", str(BASHRC), "-i"],
             input=input_text,
             capture_output=True,
             text=True,
             env={"PATH": path or os.environ.get("PATH", "/usr/bin:/bin"),
-                 "HOME": str(home), "TERM": "xterm-256color"},
+                 "HOME": str(home), "TERM": "xterm-256color", **(env or {})},
             timeout=15,
         )
 
@@ -443,6 +443,125 @@ class TestHistoryFileLocation:
         r = self._interactive(tmp_path, 'echo "HF=$HISTFILE"\n')
         assert r.returncode == 0
         assert f"HF={tmp_path / LEGACY_HISTFILE_REL}" in r.stdout.splitlines()
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores mode bits")
+    @pytest.mark.parametrize("readonly", ["dir", "file"])
+    @pytest.mark.parametrize("has_legacy", [True, False])
+    def test_unwritable_location_falls_back_to_default(self, tmp_path,
+                                                       readonly, has_legacy):
+        """A location that exists but cannot be written would persist
+        nothing, so the shell stays on bash's default and says so.  With
+        no legacy file there is nothing to carry, so it is the location
+        itself that has to decide this.  The persistence check needs the
+        legacy file: bash 3.2's `history -a` cannot create a missing one."""
+        legacy = tmp_path / LEGACY_HISTFILE_REL
+        if has_legacy:
+            self._seed_legacy(tmp_path, "echo tp_legacy\n")
+        histfile = tmp_path / HISTFILE_REL
+        histfile.parent.mkdir(parents=True)
+        if readonly == "file":
+            histfile.write_text("echo tp_current\n")
+            histfile.chmod(0o400)
+        else:
+            histfile.parent.chmod(0o500)
+        try:
+            r = self._interactive(
+                tmp_path, 'echo "HF=$HISTFILE"\necho tp_persisted\n')
+        finally:
+            histfile.parent.chmod(0o700)
+        assert r.returncode == 0
+        assert f"HF={legacy}" in r.stdout.splitlines()
+        assert f"history stays in {legacy}" in r.stderr
+        if has_legacy:
+            assert "tp_persisted" in legacy.read_text()
+
+    @pytest.mark.parametrize("tool", ["cp", "ln"])
+    def test_failed_migration_stays_on_default_and_retries(self, tmp_path,
+                                                           tool):
+        """A copy or link that fails publishes nothing.  HISTFILE must then
+        stay on bash's default: moving anyway lets the first command create
+        the new file, which ends the migration and strands the legacy
+        history.  The failure is reported, and the next shell carries
+        everything over, including what was typed in between."""
+        legacy_text = "#1700000000\necho tp_legacy\n"
+        legacy = self._seed_legacy(tmp_path, legacy_text)
+        histfile = tmp_path / HISTFILE_REL
+        stubs = tmp_path / "stubs"
+        stubs.mkdir()
+        (stubs / tool).write_text("#!/bin/sh\nexit 1\n")
+        (stubs / tool).chmod(0o755)
+        r = self._interactive(
+            tmp_path, 'echo "HF=$HISTFILE"\necho tp_in_between\n',
+            path=f"{stubs}:{os.environ.get('PATH', '/usr/bin:/bin')}")
+        assert r.returncode == 0
+        assert f"HF={legacy}" in r.stdout.splitlines()
+        assert f"history stays in {legacy}" in r.stderr
+        assert not histfile.exists()
+        assert list(histfile.parent.iterdir()) == []
+        assert "tp_in_between" in legacy.read_text()
+
+        r = self._interactive(
+            tmp_path,
+            'echo "HF=$HISTFILE"\n'
+            'history | grep -c "tp_leg""acy"\n'
+            'history | grep -c "tp_in_betw""een"\n')
+        assert r.returncode == 0
+        lines = r.stdout.splitlines()
+        assert f"HF={histfile}" in lines
+        assert [line.strip() for line in lines[-2:]] == ["1", "1"]
+        assert "history stays in" not in r.stderr
+        assert histfile.read_text().startswith(legacy_text)
+
+    def test_caller_histfile_left_alone(self, tmp_path):
+        """A HISTFILE from the caller is a sandbox.  It keeps its value and
+        its export, nothing migrates, and the location is not created."""
+        self._seed_legacy(tmp_path, "echo tp_legacy\n")
+        sandbox = tmp_path / "sandbox"
+        r = self._interactive(
+            tmp_path,
+            'echo "HF=$HISTFILE"\necho "CHILD=$(printenv HISTFILE)"\n',
+            env={"HISTFILE": str(sandbox)})
+        assert r.returncode == 0
+        lines = r.stdout.splitlines()
+        assert f"HF={sandbox}" in lines
+        assert f"CHILD={sandbox}" in lines
+        assert not (tmp_path / HISTFILE_REL).parent.exists()
+
+    @pytest.mark.parametrize("opt_out,shown", [
+        ("unset HISTFILE", "unset"),
+        ("HISTFILE=", ""),
+    ])
+    def test_history_opt_out_honoured(self, tmp_path, opt_out, shown):
+        """Turning history off before this block runs stays off.  The
+        location is not created, and the state path is never assigned."""
+        (tmp_path / ".bashrc.bak").write_text(f"{opt_out}\n")
+        r = self._interactive(
+            tmp_path, 'echo "HF=[${HISTFILE-unset}]"\necho tp_private\n')
+        assert r.returncode == 0
+        assert f"HF=[{shown}]" in r.stdout.splitlines()
+        assert not (tmp_path / HISTFILE_REL).parent.exists()
+        assert not (tmp_path / LEGACY_HISTFILE_REL).exists()
+
+    def test_moved_histfile_is_not_exported(self, tmp_path):
+        """A default that arrives exported still moves, but assigning keeps
+        the export flag.  Left exported, a bash that skips bash/bashrc would
+        inherit the live path and cut it to 500 lines: the failure this
+        location exists for, at the new address."""
+        histfile = tmp_path / HISTFILE_REL
+        histfile.parent.mkdir(parents=True)
+        lines = "".join(f"echo tp_{n}\n" for n in range(600))
+        histfile.write_text(lines)
+        r = self._interactive(
+            tmp_path,
+            'echo "HF=$HISTFILE"\n'
+            'echo "CHILD=$(printenv HISTFILE)"\n'
+            "bash --noprofile --norc -i </dev/null >/dev/null 2>&1\n",
+            env={"HISTFILE": str(tmp_path / LEGACY_HISTFILE_REL)})
+        assert r.returncode == 0
+        out = r.stdout.splitlines()
+        assert f"HF={histfile}" in out
+        assert "CHILD=" in out
+        assert histfile.read_text().startswith(lines)
 
     def test_rcless_shell_cannot_clobber_history(self, tmp_path):
         """The failure this location exists for: a bash that skips

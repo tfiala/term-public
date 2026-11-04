@@ -136,13 +136,18 @@ esac
 shopt -s histappend histverify checkwinsize
 
 # The history file lives off bash's default ~/.bash_history.  Any bash
-# that skips this file (`bash --norc -i`, `env -i bash -i`, a stock
-# /bin/bash) still loads ~/.bash_history and rewrites it on exit with
-# bash's defaults: its last 500 lines, timestamps stripped.  On 2026-11-02
-# test helpers in another repo did exactly that, and a full history was
-# cut down to 500 lines of pasted runbook.  Here such a shell can only
-# clobber a file nothing reads.  The path is also named by setup.sh and
-# scripts/import-zsh-history.py.
+# that skips this file (`bash --norc -i`) still loads ~/.bash_history and
+# rewrites it on exit with bash's defaults: its last 500 lines, timestamps
+# stripped.  On 2026-11-02 test helpers in another repo did exactly that,
+# and a full history was cut down to 500 lines of pasted runbook.  Here
+# such a shell can only clobber a file nothing reads.  The path is also
+# named by setup.sh and scripts/import-zsh-history.py.
+#
+# Only bash's own default moves.  A HISTFILE the caller set or unset is a
+# sandbox or an opt-out, and it stays exactly as it is.  The moved value
+# is never exported: assigning to a HISTFILE that came from the
+# environment keeps its export flag, and a child that skips this file
+# would then load the live history and cut it to 500 lines.
 #
 # One-time migration: the first shell that finds no history file here
 # copies ~/.bash_history in.  It copies rather than moves, because shells
@@ -151,25 +156,38 @@ shopt -s histappend histverify checkwinsize
 # prompt.  The copy is created under umask 077, so it is never more
 # readable than 0600, and link(2) publishes it atomically: when two new
 # shells race, the loser's link fails and the winner's copy stands.
+#
+# HISTFILE moves only once the history is there and writable.  After a
+# failed copy, or in a location that cannot be written, it stays on
+# bash's default: history keeps persisting and the next shell retries.
+# Moving anyway would let the first command create the new file, which
+# ends the migration for good and strands the old history.
 _tp_histdir="$HOME/.local/state/bash"
-if [[ ! -e "$_tp_histdir/history" ]]; then
-  (
-    umask 077
-    mkdir -p "$_tp_histdir" || exit
-    if [[ -f "$HOME/.bash_history" ]]; then
-      _tp_tmp="$_tp_histdir/history.migrate.$$"
-      cp "$HOME/.bash_history" "$_tp_tmp" &&
-        ln "$_tp_tmp" "$_tp_histdir/history" 2>/dev/null
-      rm -f "$_tp_tmp"
-    fi
-  )
+_tp_histfile="$_tp_histdir/history"
+if [[ "${HISTFILE-}" == "$HOME/.bash_history" ]]; then
+  if [[ ! -e "$_tp_histfile" ]]; then
+    (
+      umask 077
+      mkdir -p "$_tp_histdir" || exit
+      if [[ -f "$HOME/.bash_history" ]]; then
+        _tp_tmp="$_tp_histdir/history.migrate.$$"
+        cp "$HOME/.bash_history" "$_tp_tmp" &&
+          ln "$_tp_tmp" "$_tp_histfile" 2>/dev/null
+        rm -f "$_tp_tmp"
+      fi
+    )
+  fi
+  if [[ -w "$_tp_histfile" ||
+        ( ! -e "$_tp_histfile" && ! -f "$HOME/.bash_history" &&
+          -w "$_tp_histdir" ) ]]; then
+    HISTFILE="$_tp_histfile"
+    export -n HISTFILE
+  else
+    printf 'bashrc: history stays in %s: cannot use %s\n' \
+      "$HISTFILE" "$_tp_histfile" >&2
+  fi
 fi
-# A directory that cannot be created leaves bash's default in place, so
-# history still persists somewhere.
-if [[ -d "$_tp_histdir" ]]; then
-  HISTFILE="$_tp_histdir/history"
-fi
-unset _tp_histdir
+unset _tp_histdir _tp_histfile
 HISTSIZE=100000
 HISTFILESIZE=200000
 HISTCONTROL=ignoreboth
