@@ -512,6 +512,8 @@ hive tmux role implementer
 hive tmux role reviewer
 hive tmux role clear
 hive tmux pairs
+hive tmux kill
+hive tmux kill home-dc --yes
 ```
 
 `hive tmux` starts (or attaches to) a per-hive tmux session — one window per
@@ -525,6 +527,18 @@ or a dropped SSH connection. The `tmux/tmux.conf` base config carries the
 settings that make Claude CLI render correctly inside tmux (notably
 `allow-passthrough on` plus synchronized output) and pins `default-shell` to
 Homebrew bash.
+
+Each `hive tmux` run from outside tmux adds a new session (`<hive>-0`,
+`<hive>-1`, …) to the hive's tmux session group, and every session in the
+group shows the same windows. A window stays open until the last session in
+its group is gone, and detaching does not end a session. So
+`tmux kill-session -t <hive>-N` ends one view and leaves every window, and the
+agents in them, running in the others; the next `hive tmux` shows them all
+again. To really close a hive, use `hive tmux kill [HIVE]`. It kills every
+session named exactly `<hive>-<N>` whose `HIVE_ROOT` is that hive and nothing
+else, so `hive tmux kill home` never touches `home-dc-0`. It lists what it
+will close and asks first; `--yes` skips the question. Run from
+inside one of that hive's sessions, it kills that session last.
 
 Agent windows on the same non-default `(remote, branch)` also get the
 ADR-0003 turn indicator: `▶` marks the next prompt, `✓` marks the implementer

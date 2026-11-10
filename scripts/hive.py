@@ -22,6 +22,7 @@ Subcommands:
     --new-window   Open a new window on an unused workspace
     pairs          Show implementer/reviewer turn detail for the session
     role ROLE      Declare implementer/reviewer role, or clear it
+    kill [HIVE]    Kill one hive's sessions and every window in them [--yes]
 
 Apiary mode (--apiary):
   Operates across all configured hives defined in ~/.config/hive/apiary.json.
@@ -2257,20 +2258,29 @@ def _tmux_sessions() -> list[str]:
     return r.stdout.split()
 
 
+def _is_hive_session(name: str, session: str) -> bool:
+    """True if `session` is one of hive `name`'s sessions: exactly `<name>-<N>`.
+
+    A prefix test is not enough. Hive `home-dc`'s sessions (`home-dc-0`)
+    start with `home-`, so a prefix test would hand them to hive `home`.
+    """
+    return re.fullmatch(rf'{re.escape(name)}-[0-9]+', session) is not None
+
+
+def _hive_sessions(name: str, sessions: list[str]) -> list[str]:
+    """The sessions in `sessions` that belong to hive `name`, in order."""
+    return [s for s in sessions if _is_hive_session(name, s)]
+
+
 def _next_session_num(name: str, sessions: list[str]) -> int:
     """Find the next free session number for a hive (sessions are <name>-N)."""
-    prefix = f'{name}-'
-    nums = [
-        int(s[len(prefix):])
-        for s in sessions
-        if s.startswith(prefix) and s[len(prefix):].isdigit()
-    ]
+    nums = [int(s[len(name) + 1:]) for s in _hive_sessions(name, sessions)]
     return max(nums) + 1 if nums else 0
 
 
 def _group_exists(name: str, sessions: list[str]) -> bool:
     """True if a session for this hive already exists."""
-    return any(s.startswith(f'{name}-') for s in sessions)
+    return bool(_hive_sessions(name, sessions))
 
 
 def _current_session() -> str | None:
@@ -4351,11 +4361,28 @@ def cmd_tmux(args: argparse.Namespace) -> None:
         _tmux_restyle()
         return
 
+    if action == 'kill':
+        kill_hive = getattr(args, 'kill_hive', None)
+        if kill_hive and getattr(args, 'hive', None):
+            print(f'{CROSS()} Name the hive once: either `kill HIVE` or '
+                  f'--hive, not both.', file=sys.stderr)
+            sys.exit(2)
+        hive = _require_tmux_hive(kill_hive or getattr(args, 'hive', None))
+        if not _tmux_kill(hive, assume_yes=getattr(args, 'assume_yes', False)):
+            sys.exit(1)
+        return
+
     if getattr(args, 'list_hives', False):
         _tmux_list()
         return
 
-    hive_arg = getattr(args, 'hive', None)
+    hive = _require_tmux_hive(getattr(args, 'hive', None))
+    _tmux_start(hive, _palette_for_mode(_hive_color(hive), _appearance_mode()),
+                new_window=getattr(args, 'new_window', False))
+
+
+def _require_tmux_hive(hive_arg: str | None) -> Path:
+    """Resolve the hive a tmux command acts on, or exit with the reason."""
     hive = _resolve_tmux_hive(hive_arg)
     if hive is None:
         if hive_arg:
@@ -4364,9 +4391,7 @@ def cmd_tmux(args: argparse.Namespace) -> None:
             print(f'{CROSS()} Not inside a hive. Use --hive to specify one, '
                   f'or --list to see configured hives.', file=sys.stderr)
         sys.exit(1)
-
-    _tmux_start(hive, _palette_for_mode(_hive_color(hive), _appearance_mode()),
-                new_window=getattr(args, 'new_window', False))
+    return hive
 
 
 def _tmux_list() -> None:
@@ -4476,7 +4501,7 @@ def _tmux_start(hive: Path, color: dict, new_window: bool) -> None:
         return _tmux_env_args(hive, name, color, number)
 
     current = _current_session()
-    if current and current.startswith(f'{name}-'):
+    if current and _is_hive_session(name, current):
         # Already inside a session for this hive.
         if new_window:
             used = _used_workspaces(current, workspaces)
@@ -4500,7 +4525,7 @@ def _tmux_start(hive: Path, color: dict, new_window: bool) -> None:
 
     if _group_exists(name, sessions):
         # Join the existing group — windows are shared, so don't recreate them.
-        target = next(s for s in sessions if s.startswith(f'{name}-'))
+        target = _hive_sessions(name, sessions)[0]
         subprocess.run(
             ['tmux', 'new-session', '-d', '-t', target, '-s', session_name])
     else:
@@ -4518,6 +4543,155 @@ def _tmux_start(hive: Path, color: dict, new_window: bool) -> None:
     subprocess.run(['tmux', 'select-window', '-t', f'{session_name}:1'],
                    capture_output=True)
     os.execlp('tmux', 'tmux', 'attach-session', '-t', session_name)
+
+
+def _tmux_no_server(stderr: str) -> bool:
+    """True if a failed tmux call failed only because no server is running."""
+    return 'no server running' in stderr or (
+        'error connecting to' in stderr
+        and ('No such file or directory' in stderr
+             or 'Connection refused' in stderr))
+
+
+def _tmux_session_hive_root(session: str) -> tuple[bool, Path | None]:
+    """Read a session's HIVE_ROOT: (read ok, the root or None when unset).
+
+    Every session `hive tmux` makes sources the hive config, which sets
+    HIVE_ROOT in the session environment, so this names the session's hive.
+    """
+    r = subprocess.run(
+        ['tmux', 'show-environment', '-t', f'={session}', 'HIVE_ROOT'],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        return ('unknown variable' in r.stderr, None)
+    line = r.stdout.strip()
+    if line.startswith('-') or '=' not in line:
+        return (True, None)
+    return (True, Path(line.split('=', 1)[1]).resolve())
+
+
+def _tmux_kill(hive: Path, assume_yes: bool) -> bool:
+    """Kill every tmux session of one hive, and with them its windows.
+
+    `hive tmux` joins each new session to the hive's session group, and a
+    group's windows stay open until its last session is gone. Killing one
+    session (`tmux kill-session -t <hive>-N`) therefore leaves the windows,
+    and every process in them, running in the sessions that remain, and
+    the next `hive tmux` joins the group again and shows them all.
+
+    Only sessions named exactly `<hive>-<N>` qualify, and one whose
+    HIVE_ROOT names a different hive is left alone, so another hive's
+    sessions are never touched. Returns False when tmux could not be read,
+    a session could not be checked or killed, or confirmation was needed
+    and could not be asked for.
+    """
+    name = _short_name(hive)
+    root = hive.resolve()
+    r = subprocess.run(
+        ['tmux', 'list-sessions', '-F', '#{session_name}\t#{session_attached}'],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        if _tmux_no_server(r.stderr):
+            print(f'No tmux sessions for hive {name}.')
+            return True
+        print(f'{CROSS()} Could not list tmux sessions: {r.stderr.strip()}',
+              file=sys.stderr)
+        return False
+    attached: dict[str, bool] = {}
+    for line in r.stdout.splitlines():
+        session, _, count = line.partition('\t')
+        attached[session] = count not in ('', '0')
+
+    targets: list[str] = []
+    foreign: list[tuple[str, Path]] = []
+    unreadable: list[str] = []
+    for session in _hive_sessions(name, list(attached)):
+        ok, owner = _tmux_session_hive_root(session)
+        if not ok:
+            unreadable.append(session)
+        elif owner is not None and owner != root:
+            foreign.append((session, owner))
+        else:
+            targets.append(session)
+    for session, owner in foreign:
+        print(f'Leaving {session} alone: its HIVE_ROOT is {owner}, '
+              f'not {root}.')
+    for session in unreadable:
+        print(f'{CROSS()} Leaving {session} alone: could not read its '
+              f'HIVE_ROOT.', file=sys.stderr)
+    if not targets:
+        print(f'No tmux sessions for hive {name}.')
+        return not unreadable
+
+    r = subprocess.run(
+        ['tmux', 'list-windows', '-a', '-F', '#{session_name}\t#{window_id}'],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f'{CROSS()} Could not list tmux windows: {r.stderr.strip()}',
+              file=sys.stderr)
+        return False
+    windows_of: dict[str, set[str]] = {}
+    for line in r.stdout.splitlines():
+        session, _, window = line.partition('\t')
+        windows_of.setdefault(session, set()).add(window)
+    doomed = set().union(*(windows_of.get(s, set()) for s in targets))
+    holders = sorted(s for s, windows in windows_of.items()
+                     if s not in targets and windows & doomed)
+    kept = doomed & set().union(*(windows_of[s] for s in holders))
+    closing = len(doomed - kept)
+
+    print(f'Hive {name}: {len(targets)} '
+          f'session{"" if len(targets) == 1 else "s"}, closing {closing} '
+          f'window{"" if closing == 1 else "s"}. Every process in them '
+          f'stops.')
+    for session in targets:
+        print(f'  {session}{"  (attached)" if attached[session] else ""}')
+    if kept:
+        print(f'{len(kept)} window{"" if len(kept) == 1 else "s"} stay open: '
+              f'also in {", ".join(holders)}, which is not one of this '
+              f"hive's sessions.")
+
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            sys.stdout.flush()  # the list above comes before the refusal
+            print(f'{CROSS()} Not killing without confirmation, and stdin '
+                  f'is not a terminal. Pass --yes to kill anyway.',
+                  file=sys.stderr)
+            return False
+        try:
+            answer = input('Kill them? [y/N] ')
+        except EOFError:
+            answer = ''
+        if answer.strip().lower() not in ('y', 'yes'):
+            print('Nothing killed.')
+            return True
+
+    # Kill the session this command runs in last: killing it ends this
+    # process along with everything else in its windows.
+    current = _current_session()
+    others = [s for s in targets if s != current]
+    failed = False
+    for session in others:
+        k = subprocess.run(['tmux', 'kill-session', '-t', f'={session}'],
+                           capture_output=True, text=True)
+        if k.returncode != 0:
+            print(f'{CROSS()} Could not kill {session}: {k.stderr.strip()}',
+                  file=sys.stderr)
+            failed = True
+    ok = not failed and not unreadable
+    if current in targets:
+        print(f'Killing {current}, the session this runs in, last.',
+              flush=True)
+        # Usually the kill ends this process before anything below runs.
+        k = subprocess.run(['tmux', 'kill-session', '-t', f'={current}'],
+                           capture_output=True, text=True)
+        if k.returncode != 0:
+            print(f'{CROSS()} Could not kill {current}: {k.stderr.strip()}',
+                  file=sys.stderr)
+            return False
+    if ok:
+        print(f'{CHECK()} Killed every session of hive {name}.')
+    return ok
 
 
 def _tmux_git_sync(pane_path: str) -> None:
@@ -4803,6 +4977,17 @@ def main():
     tmux_sub.add_parser(
         'restyle',
         help='Re-apply day/night styling to live hive sessions')
+    tmux_kill = tmux_sub.add_parser(
+        'kill',
+        help="Kill one hive's tmux sessions and every window in them")
+    # dest must not be 'hive': that is the tmux parser's --hive, and a
+    # subparser default of the same name would overwrite it.
+    tmux_kill.add_argument(
+        'kill_hive', metavar='HIVE', nargs='?',
+        help='Hive short name or path (default: --hive, or detect from cwd)')
+    tmux_kill.add_argument(
+        '-y', '--yes', action='store_true', dest='assume_yes',
+        help='Kill without asking first')
 
     args = parser.parse_args()
 
