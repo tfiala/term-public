@@ -22,7 +22,8 @@ Subcommands:
     --new-window   Open a new window on an unused workspace
     pairs          Show implementer/reviewer turn detail for the session
     role ROLE      Declare implementer/reviewer role, or clear it
-    kill [HIVE]    Kill one hive's sessions and every window in them [--yes]
+    kill [HIVE]    Kill one hive's sessions, closing the windows only they
+                   hold [--yes]
 
 Apiary mode (--apiary):
   Operates across all configured hives defined in ~/.config/hive/apiary.json.
@@ -2263,8 +2264,11 @@ def _is_hive_session(name: str, session: str) -> bool:
 
     A prefix test is not enough. Hive `home-dc`'s sessions (`home-dc-0`)
     start with `home-`, so a prefix test would hand them to hive `home`.
+    `N` is written the way hive numbers sessions: from 0, with no leading
+    zeros, so a hand-made `home-01` never qualifies.
     """
-    return re.fullmatch(rf'{re.escape(name)}-[0-9]+', session) is not None
+    return re.fullmatch(rf'{re.escape(name)}-(?:0|[1-9][0-9]*)',
+                        session) is not None
 
 
 def _hive_sessions(name: str, sessions: list[str]) -> list[str]:
@@ -4553,21 +4557,28 @@ def _tmux_no_server(stderr: str) -> bool:
              or 'Connection refused' in stderr))
 
 
-def _tmux_session_hive_root(session: str) -> tuple[bool, Path | None]:
-    """Read a session's HIVE_ROOT: (read ok, the root or None when unset).
+def _tmux_session_hive_root(session: str) -> tuple[str, Path | None]:
+    """Read a session's HIVE_ROOT as (state, root).
 
-    Every session `hive tmux` makes sources the hive config, which sets
-    HIVE_ROOT in the session environment, so this names the session's hive.
+    Every session `hive tmux` makes has HIVE_ROOT in its session
+    environment, set to the hive's absolute path. The state is:
+      'set'    a usable absolute path; root is that path, resolved.
+      'unset'  missing, marked removed, empty or relative. hive never makes
+               such a session, so it is not a hive session.
+      'error'  tmux could not answer, so nothing is known about it.
     """
     r = subprocess.run(
         ['tmux', 'show-environment', '-t', f'={session}', 'HIVE_ROOT'],
         capture_output=True, text=True)
     if r.returncode != 0:
-        return ('unknown variable' in r.stderr, None)
+        return ('unset' if 'unknown variable' in r.stderr else 'error', None)
     line = r.stdout.strip()
     if line.startswith('-') or '=' not in line:
-        return (True, None)
-    return (True, Path(line.split('=', 1)[1]).resolve())
+        return ('unset', None)
+    value = line.split('=', 1)[1]
+    if not os.path.isabs(value):
+        return ('unset', None)
+    return ('set', Path(value).resolve())
 
 
 def _tmux_kill(hive: Path, assume_yes: bool) -> bool:
@@ -4579,14 +4590,23 @@ def _tmux_kill(hive: Path, assume_yes: bool) -> bool:
     and every process in them, running in the sessions that remain, and
     the next `hive tmux` joins the group again and shows them all.
 
-    Only sessions named exactly `<hive>-<N>` qualify, and one whose
-    HIVE_ROOT names a different hive is left alone, so another hive's
-    sessions are never touched. Returns False when tmux could not be read,
-    a session could not be checked or killed, or confirmation was needed
-    and could not be asked for.
+    A session qualifies only when its name is exactly `<hive>-<N>` and its
+    HIVE_ROOT is this hive. One with another hive's HIVE_ROOT, or with
+    none (hive always sets it, so such a session was made some other way),
+    is left alone, so nothing but this hive's sessions is ever touched.
+    Returns False when tmux could not be read, a session could not be
+    checked or killed, the hive's name cannot be matched, or confirmation
+    was needed and could not be asked for.
     """
     name = _short_name(hive)
     root = hive.resolve()
+    if '.' in name or ':' in name:
+        # tmux rewrites both to '_' in session names, so `a.b-0` runs as
+        # `a_b-0`: matching would only ever find nothing.
+        print(f"{CROSS()} Cannot match hive {name}'s sessions: tmux "
+              f"rewrites '.' and ':' in session names to '_'.",
+              file=sys.stderr)
+        return False
     r = subprocess.run(
         ['tmux', 'list-sessions', '-F', '#{session_name}\t#{session_attached}'],
         capture_output=True, text=True)
@@ -4603,25 +4623,31 @@ def _tmux_kill(hive: Path, assume_yes: bool) -> bool:
         attached[session] = count not in ('', '0')
 
     targets: list[str] = []
-    foreign: list[tuple[str, Path]] = []
     unreadable: list[str] = []
     for session in _hive_sessions(name, list(attached)):
-        ok, owner = _tmux_session_hive_root(session)
-        if not ok:
+        state, owner = _tmux_session_hive_root(session)
+        if state == 'error':
             unreadable.append(session)
-        elif owner is not None and owner != root:
-            foreign.append((session, owner))
+        elif state == 'unset':
+            print(f'Leaving {session} alone: it has no HIVE_ROOT, so hive '
+                  f'did not make it.')
+        elif owner != root:
+            print(f'Leaving {session} alone: its HIVE_ROOT is {owner}, '
+                  f'not {root}.')
         else:
             targets.append(session)
-    for session, owner in foreign:
-        print(f'Leaving {session} alone: its HIVE_ROOT is {owner}, '
-              f'not {root}.')
     for session in unreadable:
         print(f'{CROSS()} Leaving {session} alone: could not read its '
               f'HIVE_ROOT.', file=sys.stderr)
     if not targets:
+        if unreadable:
+            print(f'{CROSS()} Nothing killed: could not check '
+                  f'{len(unreadable)} possible session'
+                  f'{"" if len(unreadable) == 1 else "s"} of hive {name}.',
+                  file=sys.stderr)
+            return False
         print(f'No tmux sessions for hive {name}.')
-        return not unreadable
+        return True
 
     r = subprocess.run(
         ['tmux', 'list-windows', '-a', '-F', '#{session_name}\t#{window_id}'],
@@ -4647,9 +4673,10 @@ def _tmux_kill(hive: Path, assume_yes: bool) -> bool:
     for session in targets:
         print(f'  {session}{"  (attached)" if attached[session] else ""}')
     if kept:
-        print(f'{len(kept)} window{"" if len(kept) == 1 else "s"} stay open: '
-              f'also in {", ".join(holders)}, which is not one of this '
-              f"hive's sessions.")
+        print(f'{len(kept)} window{" stays" if len(kept) == 1 else "s stay"} '
+              f'open: also in {", ".join(holders)}, which '
+              f'{"is" if len(holders) == 1 else "are"} not part of hive '
+              f'{name}.')
 
     if not assume_yes:
         if not sys.stdin.isatty():
@@ -4666,8 +4693,10 @@ def _tmux_kill(hive: Path, assume_yes: bool) -> bool:
             print('Nothing killed.')
             return True
 
-    # Kill the session this command runs in last: killing it ends this
-    # process along with everything else in its windows.
+    # Kill the session tmux reports for this command's pane last. Inside a
+    # group that is tmux's best guess, not necessarily the session typed
+    # into, which is harmless: the hive's sessions share their windows, so
+    # this process lives until the last of them is gone, in any order.
     current = _current_session()
     others = [s for s in targets if s != current]
     failed = False
@@ -4680,7 +4709,7 @@ def _tmux_kill(hive: Path, assume_yes: bool) -> bool:
             failed = True
     ok = not failed and not unreadable
     if current in targets:
-        print(f'Killing {current}, the session this runs in, last.',
+        print(f'Killing {current} last: this command runs in its windows.',
               flush=True)
         # Usually the kill ends this process before anything below runs.
         k = subprocess.run(['tmux', 'kill-session', '-t', f'={current}'],
@@ -4979,12 +5008,14 @@ def main():
         help='Re-apply day/night styling to live hive sessions')
     tmux_kill = tmux_sub.add_parser(
         'kill',
-        help="Kill one hive's tmux sessions and every window in them")
+        help="Kill one hive's tmux sessions, closing the windows only they "
+             "hold")
     # dest must not be 'hive': that is the tmux parser's --hive, and a
     # subparser default of the same name would overwrite it.
     tmux_kill.add_argument(
         'kill_hive', metavar='HIVE', nargs='?',
-        help='Hive short name or path (default: --hive, or detect from cwd)')
+        help='Hive short name or path (default: the hive given as '
+             '`hive tmux --hive HIVE kill`, or detect from cwd)')
     tmux_kill.add_argument(
         '-y', '--yes', action='store_true', dest='assume_yes',
         help='Kill without asking first')

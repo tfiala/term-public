@@ -223,9 +223,12 @@ class TestSessionHelpers:
 
     def test_is_hive_session_needs_exactly_name_dash_number(self):
         assert hive._is_hive_session('home', 'home-0')
+        assert hive._is_hive_session('home', 'home-10')
         assert hive._is_hive_session('home', 'home-12')
+        # hive numbers from 0 without leading zeros, in ASCII digits only.
         for other in ('home-dc-0', 'home-', 'home-x', 'home0', 'xhome-0',
-                      'home-0-1', 'home-²'):
+                      'home-0-1', 'home-²', 'home-01', 'home-00',
+                      'home-٣', 'home-1٣'):
             assert not hive._is_hive_session('home', other), other
 
     def test_is_hive_session_treats_name_literally(self):
@@ -1893,6 +1896,27 @@ class TestTmuxStartKeepsHivesApart:
         execlp.assert_called_once_with(
             'tmux', 'tmux', 'attach-session', '-t', 'home-0')
 
+    def test_joins_its_own_group_even_when_listed_after_home_dc(
+            self, home, tmp_path):
+        runs = []
+
+        def fake_run(cmd, **kw):
+            runs.append(cmd)
+            return MagicMock(returncode=0, stdout='', stderr='')
+
+        with patch.object(hive, '_current_session', return_value=None), \
+             patch.object(hive, '_tmux_sessions',
+                          return_value=['home-dc-0', 'home-1']), \
+             patch.object(hive, '_TMUX_DIR', tmp_path / 'hive-tmux'), \
+             patch.object(hive, '_tmux_refresh_labels'), \
+             patch.object(hive, '_tmux_turn_refresh'), \
+             patch.object(hive.os, 'execlp'), \
+             patch.object(hive.subprocess, 'run', side_effect=fake_run):
+            hive._tmux_start(home, hive._SHELL_PALETTE[0], new_window=False)
+        new = [c for c in runs if c[:2] == ['tmux', 'new-session']]
+        assert new == [['tmux', 'new-session', '-d', '-t', 'home-1',
+                        '-s', 'home-2']]
+
     def test_new_window_from_home_dc_session_does_not_land_there(
             self, home, tmp_path):
         runs, _ = self._start(home, tmp_path, 'home-dc-0', True)
@@ -1915,7 +1939,10 @@ class FakeTmux:
             name: {'root': root, 'windows': set(windows), 'attached': att}
             for name, (root, windows, att) in sessions.items()}
         self.list_error = list_error
+        self.windows_error = None
         self.unreadable: set[str] = set()
+        # Raw `show-environment` output for a session, e.g. '-HIVE_ROOT'.
+        self.env_lines: dict[str, str] = {}
         self.fail_kill: set[str] = set()
         self.kills: list[str] = []
 
@@ -1941,12 +1968,16 @@ class FakeTmux:
             name = self._exact_target(cmd)
             if name in self.unreadable:
                 return self._done(1, stderr='server exited unexpectedly')
+            if name in self.env_lines:
+                return self._done(stdout=self.env_lines[name] + '\n')
             root = self.sessions[name]['root']
             if root is None:
                 return self._done(1, stderr='unknown variable: HIVE_ROOT')
             return self._done(stdout=f'HIVE_ROOT={root}\n')
         if verb == 'list-windows':
             assert '-a' in cmd
+            if self.windows_error:
+                return self._done(1, stderr=self.windows_error)
             return self._done(stdout=''.join(
                 f'{name}\t{window}\n'
                 for name, s in self.sessions.items()
@@ -2017,10 +2048,85 @@ class TestTmuxKill:
         assert 'Leaving home-1 alone' in out
         assert str(hives['other-home']) in out
 
-    def test_session_without_hive_root_still_qualifies(self, hives):
+    @pytest.mark.parametrize('env_line', [
+        None,             # never set: tmux says "unknown variable"
+        '-HIVE_ROOT',     # marked removed
+        'HIVE_ROOT=',     # empty: once read as the current directory
+        'HIVE_ROOT=home', # relative
+    ])
+    @pytest.mark.parametrize('cwd', ['root', 'parent'])
+    def test_session_without_usable_hive_root_is_left_alone(
+            self, hives, monkeypatch, capsys, env_line, cwd):
+        # hive sets HIVE_ROOT on every session it makes, so a `<hive>-<N>`
+        # session without one was made some other way. Run from the hive
+        # root (where an empty value would resolve to the hive) and from
+        # its parent (where the relative `home` would).
+        home = str(hives['home'])
+        fake = FakeTmux({'home-0': (home, {'@1'}, False),
+                         'home-7': (None, {'@7'}, False)})
+        if env_line is not None:
+            fake.env_lines['home-7'] = env_line
+        monkeypatch.chdir(hives['home'] if cwd == 'root'
+                          else hives['home'].parent)
+        ok, _ = self._kill(fake, hives['home'])
+        assert ok
+        assert fake.kills == ['home-0']
+        assert 'Leaving home-7 alone: it has no HIVE_ROOT' in (
+            capsys.readouterr().out)
+
+    def test_only_unusable_hive_roots_kills_nothing(self, hives, capsys):
         fake = FakeTmux({'home-0': (None, {'@1'}, False)})
         ok, _ = self._kill(fake, hives['home'])
+        assert ok and fake.kills == []
+        assert 'No tmux sessions for hive home' in capsys.readouterr().out
+
+    def test_hand_made_leading_zero_name_is_not_a_candidate(self, hives):
+        home = str(hives['home'])
+        fake = FakeTmux({'home-0': (home, {'@1'}, False),
+                         'home-01': (home, {'@2'}, False)})
+        ok, _ = self._kill(fake, hives['home'])
         assert ok and fake.kills == ['home-0']
+
+    def test_every_candidate_unreadable_is_an_error(self, hives, capsys):
+        home = str(hives['home'])
+        fake = FakeTmux({'home-0': (home, {'@1'}, False),
+                         'home-1': (home, {'@1'}, False)})
+        fake.unreadable.update({'home-0', 'home-1'})
+        ok, _ = self._kill(fake, hives['home'])
+        assert not ok and fake.kills == []
+        captured = capsys.readouterr()
+        # A failed check must not read as "nothing to kill".
+        assert 'No tmux sessions' not in captured.out
+        assert 'Nothing killed: could not check 2 possible sessions' in (
+            captured.err)
+
+    def test_failed_window_listing_kills_nothing(self, hives, capsys):
+        fake = FakeTmux({'home-0': (str(hives['home']), {'@1'}, False)})
+        fake.windows_error = 'server exited unexpectedly'
+        ok, _ = self._kill(fake, hives['home'])
+        assert not ok and fake.kills == []
+        assert 'Could not list tmux windows' in capsys.readouterr().err
+
+    def test_failed_kill_of_current_session_is_reported(self, hives, capsys):
+        home = str(hives['home'])
+        fake = FakeTmux({'home-0': (home, {'@1'}, False),
+                         'home-1': (home, {'@1'}, True)})
+        fake.fail_kill.add('home-1')
+        ok, _ = self._kill(fake, hives['home'], current='home-1')
+        assert not ok
+        assert fake.kills == ['home-0', 'home-1']
+        assert 'Could not kill home-1' in capsys.readouterr().err
+
+    @pytest.mark.parametrize('leaf', ['a.b', 'a:b'])
+    def test_name_tmux_rewrites_is_refused(self, tmp_path, capsys, leaf):
+        # tmux runs hive `a.b`'s sessions as `a_b-N`, so matching `a.b-N`
+        # would always report a false "nothing to kill".
+        root = tmp_path / leaf
+        root.mkdir()
+        fake = FakeTmux({'a_b-0': (str(root), {'@1'}, False)})
+        ok, _ = self._kill(fake, root)
+        assert not ok and fake.kills == []
+        assert "rewrites '.' and ':'" in capsys.readouterr().err
 
     def test_unreadable_hive_root_is_left_alone_and_fails(self, hives, capsys):
         home = str(hives['home'])
@@ -2112,7 +2218,18 @@ class TestTmuxKill:
         assert ok and fake.kills == ['home-0']
         out = capsys.readouterr().out
         assert 'closing 1 window.' in out
-        assert '1 window stay open: also in scratch' in out
+        assert ('1 window stays open: also in scratch, which is not part '
+                'of hive home.') in out
+
+    def test_windows_kept_by_several_sessions_read_plural(self, hives,
+                                                          capsys):
+        home = str(hives['home'])
+        fake = FakeTmux({'home-0': (home, {'@1', '@2', '@3'}, True),
+                         'notes': (None, {'@2'}, False),
+                         'scratch': (None, {'@3'}, False)})
+        self._kill(fake, hives['home'])
+        assert ('2 windows stay open: also in notes, scratch, which are not '
+                'part of hive home.') in capsys.readouterr().out
 
 
 class TestTmuxKillCli:

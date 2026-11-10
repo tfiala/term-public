@@ -534,11 +534,15 @@ group shows the same windows. A window stays open until the last session in
 its group is gone, and detaching does not end a session. So
 `tmux kill-session -t <hive>-N` ends one view and leaves every window, and the
 agents in them, running in the others; the next `hive tmux` shows them all
-again. To really close a hive, use `hive tmux kill [HIVE]`. It kills every
-session named exactly `<hive>-<N>` whose `HIVE_ROOT` is that hive and nothing
-else, so `hive tmux kill home` never touches `home-dc-0`. It lists what it
-will close and asks first; `--yes` skips the question. Run from
-inside one of that hive's sessions, it kills that session last.
+again. To really close a hive, use `hive tmux kill [HIVE]` (or
+`hive tmux --hive HIVE kill`). It kills every session named exactly
+`<hive>-<N>` whose `HIVE_ROOT` is that hive and nothing else, so
+`hive tmux kill home` never touches `home-dc-0`. A session with another hive's
+`HIVE_ROOT`, or with none (hive always sets it), is left alone and named in the
+output. It lists the sessions and the windows it will close, and asks first.
+Without a terminal to ask on, it refuses unless given `--yes`, which skips the
+question. A window that a session outside the hive also holds stays open, and
+the output says so. It can be run from inside one of the hive's own sessions.
 
 Agent windows on the same non-default `(remote, branch)` also get the
 ADR-0003 turn indicator: `▶` marks the next prompt, `✓` marks the implementer
