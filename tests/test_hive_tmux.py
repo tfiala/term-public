@@ -216,6 +216,29 @@ class TestSessionHelpers:
         assert hive._group_exists('infra', ['infra-0', 'flow-1'])
         assert not hive._group_exists('infra', ['flow-1'])
 
+    def test_group_exists_ignores_a_hive_whose_name_extends_this_one(self):
+        # `home-dc-0` starts with `home-` but belongs to hive home-dc.
+        assert not hive._group_exists('home', ['home-dc-0'])
+        assert hive._group_exists('home-dc', ['home-dc-0'])
+
+    def test_is_hive_session_needs_exactly_name_dash_number(self):
+        assert hive._is_hive_session('home', 'home-0')
+        assert hive._is_hive_session('home', 'home-10')
+        assert hive._is_hive_session('home', 'home-12')
+        # hive numbers from 0 without leading zeros, in ASCII digits only.
+        for other in ('home-dc-0', 'home-', 'home-x', 'home0', 'xhome-0',
+                      'home-0-1', 'home-²', 'home-01', 'home-00',
+                      'home-٣', 'home-1٣'):
+            assert not hive._is_hive_session('home', other), other
+
+    def test_is_hive_session_treats_name_literally(self):
+        # A regex metacharacter in a hive name must not widen the match.
+        assert not hive._is_hive_session('a.b', 'axb-0')
+        assert hive._is_hive_session('a.b', 'a.b-0')
+
+    def test_next_session_num_ignores_extending_hive(self):
+        assert hive._next_session_num('home', ['home-dc-5', 'home-1']) == 2
+
     def test_workspace_number(self):
         assert hive._workspace_number('widget-3') == '3'
         assert hive._workspace_number('flow-app-12') == '12'
@@ -1834,6 +1857,436 @@ class TestTmuxStartNewWindow:
             hive._tmux_start(fake_hive, hive._SHELL_PALETTE[0], new_window=False)
         run.assert_not_called()
         assert 'Already in infra session' in capsys.readouterr().out
+
+
+class TestTmuxStartKeepsHivesApart:
+    """Hive `home` must not join, or add windows to, hive `home-dc`."""
+
+    @pytest.fixture
+    def home(self, tmp_path):
+        root = tmp_path / 'home'
+        (root / 'home-1' / '.git').mkdir(parents=True)
+        return root
+
+    def _start(self, home, tmp_path, current, new_window):
+        runs = []
+
+        def fake_run(cmd, **kw):
+            runs.append(cmd)
+            return MagicMock(returncode=0, stdout='', stderr='')
+
+        with patch.object(hive, '_current_session', return_value=current), \
+             patch.object(hive, '_tmux_sessions',
+                          return_value=['home-dc-0', 'home-dc-1']), \
+             patch.object(hive, '_TMUX_DIR', tmp_path / 'hive-tmux'), \
+             patch.object(hive, '_tmux_refresh_labels'), \
+             patch.object(hive, '_tmux_turn_refresh'), \
+             patch.object(hive.os, 'execlp') as execlp, \
+             patch.object(hive.subprocess, 'run', side_effect=fake_run):
+            hive._tmux_start(home, hive._SHELL_PALETTE[0],
+                             new_window=new_window)
+        return runs, execlp
+
+    def test_new_session_does_not_join_home_dc_group(self, home, tmp_path):
+        runs, execlp = self._start(home, tmp_path, None, False)
+        new = [c for c in runs if c[:2] == ['tmux', 'new-session']]
+        assert new and new[0][:5] == ['tmux', 'new-session', '-d', '-s',
+                                      'home-0']
+        assert not any('home-dc-0' in c or 'home-dc-1' in c for c in runs)
+        execlp.assert_called_once_with(
+            'tmux', 'tmux', 'attach-session', '-t', 'home-0')
+
+    def test_joins_its_own_group_even_when_listed_after_home_dc(
+            self, home, tmp_path):
+        runs = []
+
+        def fake_run(cmd, **kw):
+            runs.append(cmd)
+            return MagicMock(returncode=0, stdout='', stderr='')
+
+        with patch.object(hive, '_current_session', return_value=None), \
+             patch.object(hive, '_tmux_sessions',
+                          return_value=['home-dc-0', 'home-1']), \
+             patch.object(hive, '_TMUX_DIR', tmp_path / 'hive-tmux'), \
+             patch.object(hive, '_tmux_refresh_labels'), \
+             patch.object(hive, '_tmux_turn_refresh'), \
+             patch.object(hive.os, 'execlp'), \
+             patch.object(hive.subprocess, 'run', side_effect=fake_run):
+            hive._tmux_start(home, hive._SHELL_PALETTE[0], new_window=False)
+        new = [c for c in runs if c[:2] == ['tmux', 'new-session']]
+        assert new == [['tmux', 'new-session', '-d', '-t', 'home-1',
+                        '-s', 'home-2']]
+
+    def test_new_window_from_home_dc_session_does_not_land_there(
+            self, home, tmp_path):
+        runs, _ = self._start(home, tmp_path, 'home-dc-0', True)
+        assert not any(c[:2] == ['tmux', 'new-window'] and 'home-dc-0' in c
+                       for c in runs)
+
+
+# --- hive tmux kill ----------------------------------------------------------
+
+
+class FakeTmux:
+    """Just enough of a tmux server for `_tmux_kill`, recording every kill.
+
+    `sessions` maps a session name to (HIVE_ROOT or None, window ids,
+    attached). Every session target must be exact (`=name`).
+    """
+
+    def __init__(self, sessions, list_error=None):
+        self.sessions = {
+            name: {'root': root, 'windows': set(windows), 'attached': att}
+            for name, (root, windows, att) in sessions.items()}
+        self.list_error = list_error
+        self.windows_error = None
+        self.unreadable: set[str] = set()
+        # Raw `show-environment` output for a session, e.g. '-HIVE_ROOT'.
+        self.env_lines: dict[str, str] = {}
+        self.fail_kill: set[str] = set()
+        self.kills: list[str] = []
+
+    @staticmethod
+    def _done(returncode=0, stdout='', stderr=''):
+        return MagicMock(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def _exact_target(self, cmd):
+        target = cmd[cmd.index('-t') + 1]
+        assert target.startswith('='), f'inexact tmux target: {cmd}'
+        return target[1:]
+
+    def run(self, cmd, **kw):
+        assert cmd[0] == 'tmux', cmd
+        verb = cmd[1]
+        if verb == 'list-sessions':
+            if self.list_error:
+                return self._done(1, stderr=self.list_error)
+            return self._done(stdout=''.join(
+                f'{name}\t{1 if s["attached"] else 0}\n'
+                for name, s in self.sessions.items()))
+        if verb == 'show-environment':
+            name = self._exact_target(cmd)
+            if name in self.unreadable:
+                return self._done(1, stderr='server exited unexpectedly')
+            if name in self.env_lines:
+                return self._done(stdout=self.env_lines[name] + '\n')
+            root = self.sessions[name]['root']
+            if root is None:
+                return self._done(1, stderr='unknown variable: HIVE_ROOT')
+            return self._done(stdout=f'HIVE_ROOT={root}\n')
+        if verb == 'list-windows':
+            assert '-a' in cmd
+            if self.windows_error:
+                return self._done(1, stderr=self.windows_error)
+            return self._done(stdout=''.join(
+                f'{name}\t{window}\n'
+                for name, s in self.sessions.items()
+                for window in sorted(s['windows'])))
+        if verb == 'kill-session':
+            name = self._exact_target(cmd)
+            self.kills.append(name)
+            if name in self.fail_kill or name not in self.sessions:
+                return self._done(1, stderr=f"can't find session: {name}")
+            del self.sessions[name]
+            return self._done()
+        raise AssertionError(f'unexpected tmux call: {cmd}')
+
+
+class TestTmuxKill:
+    @pytest.fixture
+    def hives(self, tmp_path):
+        roots = {'home': tmp_path / 'home', 'home-dc': tmp_path / 'home-dc',
+                 'other-home': tmp_path / 'elsewhere' / 'home'}
+        for root in roots.values():
+            root.mkdir(parents=True)
+        return roots
+
+    def _kill(self, fake, root, *, yes=True, current=None, tty=False,
+              answer=None):
+        with patch.object(hive.subprocess, 'run', side_effect=fake.run), \
+             patch.object(hive, '_current_session', return_value=current), \
+             patch.object(hive.sys.stdin, 'isatty', return_value=tty), \
+             patch('builtins.input', return_value=answer) as asked:
+            ok = hive._tmux_kill(root, assume_yes=yes)
+        return ok, asked
+
+    def test_kills_only_sessions_named_exactly_hive_dash_number(self, hives):
+        home, dc = str(hives['home']), str(hives['home-dc'])
+        fake = FakeTmux({
+            'home-0': (home, {'@1'}, True),
+            'home-10': (home, {'@1'}, False),
+            'home-dc-0': (dc, {'@7'}, True),
+            'home-dc-1': (dc, {'@7'}, False),
+            'home-x': (home, {'@9'}, False),
+        })
+        ok, _ = self._kill(fake, hives['home'])
+        assert ok
+        assert sorted(fake.kills) == ['home-0', 'home-10']
+        assert set(fake.sessions) == {'home-dc-0', 'home-dc-1', 'home-x'}
+
+    def test_killing_home_dc_leaves_home_running(self, hives):
+        home, dc = str(hives['home']), str(hives['home-dc'])
+        fake = FakeTmux({
+            'home-0': (home, {'@1'}, True),
+            'home-dc-0': (dc, {'@7'}, True),
+            'home-dc-1': (dc, {'@7'}, False),
+        })
+        ok, _ = self._kill(fake, hives['home-dc'])
+        assert ok
+        assert sorted(fake.kills) == ['home-dc-0', 'home-dc-1']
+        assert set(fake.sessions) == {'home-0'}
+
+    def test_same_named_hive_elsewhere_is_left_alone(self, hives, capsys):
+        fake = FakeTmux({
+            'home-0': (str(hives['home']), {'@1'}, False),
+            'home-1': (str(hives['other-home']), {'@4'}, False),
+        })
+        ok, _ = self._kill(fake, hives['home'])
+        assert ok
+        assert fake.kills == ['home-0']
+        out = capsys.readouterr().out
+        assert 'Leaving home-1 alone' in out
+        assert str(hives['other-home']) in out
+
+    @pytest.mark.parametrize('env_line', [
+        None,             # never set: tmux says "unknown variable"
+        '-HIVE_ROOT',     # marked removed
+        'HIVE_ROOT=',     # empty: once read as the current directory
+        'HIVE_ROOT=home', # relative
+    ])
+    @pytest.mark.parametrize('cwd', ['root', 'parent'])
+    def test_session_without_usable_hive_root_is_left_alone(
+            self, hives, monkeypatch, capsys, env_line, cwd):
+        # hive sets HIVE_ROOT on every session it makes, so a `<hive>-<N>`
+        # session without one was made some other way. Run from the hive
+        # root (where an empty value would resolve to the hive) and from
+        # its parent (where the relative `home` would).
+        home = str(hives['home'])
+        fake = FakeTmux({'home-0': (home, {'@1'}, False),
+                         'home-7': (None, {'@7'}, False)})
+        if env_line is not None:
+            fake.env_lines['home-7'] = env_line
+        monkeypatch.chdir(hives['home'] if cwd == 'root'
+                          else hives['home'].parent)
+        ok, _ = self._kill(fake, hives['home'])
+        assert ok
+        assert fake.kills == ['home-0']
+        assert 'Leaving home-7 alone: it has no HIVE_ROOT' in (
+            capsys.readouterr().out)
+
+    def test_only_unusable_hive_roots_kills_nothing(self, hives, capsys):
+        fake = FakeTmux({'home-0': (None, {'@1'}, False)})
+        ok, _ = self._kill(fake, hives['home'])
+        assert ok and fake.kills == []
+        assert 'No tmux sessions for hive home' in capsys.readouterr().out
+
+    def test_hand_made_leading_zero_name_is_not_a_candidate(self, hives):
+        home = str(hives['home'])
+        fake = FakeTmux({'home-0': (home, {'@1'}, False),
+                         'home-01': (home, {'@2'}, False)})
+        ok, _ = self._kill(fake, hives['home'])
+        assert ok and fake.kills == ['home-0']
+
+    def test_every_candidate_unreadable_is_an_error(self, hives, capsys):
+        home = str(hives['home'])
+        fake = FakeTmux({'home-0': (home, {'@1'}, False),
+                         'home-1': (home, {'@1'}, False)})
+        fake.unreadable.update({'home-0', 'home-1'})
+        ok, _ = self._kill(fake, hives['home'])
+        assert not ok and fake.kills == []
+        captured = capsys.readouterr()
+        # A failed check must not read as "nothing to kill".
+        assert 'No tmux sessions' not in captured.out
+        assert 'Nothing killed: could not check 2 possible sessions' in (
+            captured.err)
+
+    def test_failed_window_listing_kills_nothing(self, hives, capsys):
+        fake = FakeTmux({'home-0': (str(hives['home']), {'@1'}, False)})
+        fake.windows_error = 'server exited unexpectedly'
+        ok, _ = self._kill(fake, hives['home'])
+        assert not ok and fake.kills == []
+        assert 'Could not list tmux windows' in capsys.readouterr().err
+
+    def test_failed_kill_of_current_session_is_reported(self, hives, capsys):
+        home = str(hives['home'])
+        fake = FakeTmux({'home-0': (home, {'@1'}, False),
+                         'home-1': (home, {'@1'}, True)})
+        fake.fail_kill.add('home-1')
+        ok, _ = self._kill(fake, hives['home'], current='home-1')
+        assert not ok
+        assert fake.kills == ['home-0', 'home-1']
+        assert 'Could not kill home-1' in capsys.readouterr().err
+
+    @pytest.mark.parametrize('leaf', ['a.b', 'a:b'])
+    def test_name_tmux_rewrites_is_refused(self, tmp_path, capsys, leaf):
+        # tmux runs hive `a.b`'s sessions as `a_b-N`, so matching `a.b-N`
+        # would always report a false "nothing to kill".
+        root = tmp_path / leaf
+        root.mkdir()
+        fake = FakeTmux({'a_b-0': (str(root), {'@1'}, False)})
+        ok, _ = self._kill(fake, root)
+        assert not ok and fake.kills == []
+        assert "rewrites '.' and ':'" in capsys.readouterr().err
+
+    def test_unreadable_hive_root_is_left_alone_and_fails(self, hives, capsys):
+        home = str(hives['home'])
+        fake = FakeTmux({'home-0': (home, {'@1'}, False),
+                         'home-1': (home, {'@1'}, False)})
+        fake.unreadable.add('home-1')
+        ok, _ = self._kill(fake, hives['home'])
+        assert not ok
+        assert fake.kills == ['home-0']
+        assert 'could not read its HIVE_ROOT' in capsys.readouterr().err
+
+    def test_current_session_is_killed_last(self, hives):
+        home = str(hives['home'])
+        fake = FakeTmux({name: (home, {'@1', '@2'}, name == 'home-1')
+                         for name in ('home-0', 'home-1', 'home-2')})
+        ok, _ = self._kill(fake, hives['home'], current='home-1')
+        assert ok
+        assert sorted(fake.kills) == ['home-0', 'home-1', 'home-2']
+        assert fake.kills[-1] == 'home-1'
+
+    def test_no_sessions_for_hive_kills_nothing(self, hives, capsys):
+        fake = FakeTmux({'home-dc-0': (str(hives['home-dc']), {'@7'}, True)})
+        ok, _ = self._kill(fake, hives['home'])
+        assert ok and fake.kills == []
+        assert 'No tmux sessions for hive home' in capsys.readouterr().out
+
+    @pytest.mark.parametrize('stderr', [
+        'no server running on /tmp/tmux-501/default',
+        'error connecting to /tmp/tmux-501/default (No such file or directory)',
+    ])
+    def test_no_server_kills_nothing(self, hives, stderr):
+        fake = FakeTmux({}, list_error=stderr)
+        ok, _ = self._kill(fake, hives['home'])
+        assert ok and fake.kills == []
+
+    def test_failed_listing_is_an_error_not_an_empty_hive(self, hives, capsys):
+        fake = FakeTmux({}, list_error='error connecting to x (Permission denied)')
+        ok, _ = self._kill(fake, hives['home'])
+        assert not ok and fake.kills == []
+        assert 'Could not list tmux sessions' in capsys.readouterr().err
+
+    def test_without_yes_or_terminal_refuses(self, hives, capsys):
+        fake = FakeTmux({'home-0': (str(hives['home']), {'@1'}, False)})
+        ok, asked = self._kill(fake, hives['home'], yes=False, tty=False)
+        assert not ok and fake.kills == []
+        asked.assert_not_called()
+        assert '--yes' in capsys.readouterr().err
+
+    @pytest.mark.parametrize('answer', ['', 'n', 'no', 'nope'])
+    def test_declining_kills_nothing(self, hives, answer):
+        fake = FakeTmux({'home-0': (str(hives['home']), {'@1'}, False)})
+        ok, asked = self._kill(fake, hives['home'], yes=False, tty=True,
+                               answer=answer)
+        assert ok and fake.kills == []
+        asked.assert_called_once()
+
+    @pytest.mark.parametrize('answer', ['y', 'Y', 'yes', ' yes '])
+    def test_confirming_kills(self, hives, answer):
+        fake = FakeTmux({'home-0': (str(hives['home']), {'@1'}, False)})
+        ok, _ = self._kill(fake, hives['home'], yes=False, tty=True,
+                           answer=answer)
+        assert ok and fake.kills == ['home-0']
+
+    def test_failed_kill_is_reported(self, hives, capsys):
+        home = str(hives['home'])
+        fake = FakeTmux({'home-0': (home, {'@1'}, False),
+                         'home-1': (home, {'@1'}, False)})
+        fake.fail_kill.add('home-0')
+        ok, _ = self._kill(fake, hives['home'])
+        assert not ok
+        assert sorted(fake.kills) == ['home-0', 'home-1']
+        assert 'Could not kill home-0' in capsys.readouterr().err
+
+    def test_shared_windows_are_counted_once(self, hives, capsys):
+        home = str(hives['home'])
+        windows = {'@1', '@2', '@3'}
+        fake = FakeTmux({'home-0': (home, windows, True),
+                         'home-1': (home, windows, False)})
+        self._kill(fake, hives['home'])
+        out = capsys.readouterr().out
+        assert 'Hive home: 2 sessions, closing 3 windows' in out
+        assert 'home-0  (attached)' in out
+
+    def test_reports_windows_another_session_keeps_open(self, hives, capsys):
+        home = str(hives['home'])
+        fake = FakeTmux({'home-0': (home, {'@1', '@2'}, True),
+                         'scratch': (None, {'@2'}, False)})
+        ok, _ = self._kill(fake, hives['home'])
+        assert ok and fake.kills == ['home-0']
+        out = capsys.readouterr().out
+        assert 'closing 1 window.' in out
+        assert ('1 window stays open: also in scratch, which is not part '
+                'of hive home.') in out
+
+    def test_windows_kept_by_several_sessions_read_plural(self, hives,
+                                                          capsys):
+        home = str(hives['home'])
+        fake = FakeTmux({'home-0': (home, {'@1', '@2', '@3'}, True),
+                         'notes': (None, {'@2'}, False),
+                         'scratch': (None, {'@3'}, False)})
+        self._kill(fake, hives['home'])
+        assert ('2 windows stay open: also in notes, scratch, which are not '
+                'part of hive home.') in capsys.readouterr().out
+
+
+class TestTmuxKillCli:
+    """`hive tmux kill` through the real parser and main()."""
+
+    def _main(self, monkeypatch, argv, kill_ok=True):
+        monkeypatch.setattr(sys, 'argv', argv)
+        root = Path('/hives/home')
+        with patch.object(hive, '_tmux_available', return_value=True), \
+             patch.object(hive, '_resolve_tmux_hive',
+                          return_value=root) as resolve, \
+             patch.object(hive, '_tmux_kill',
+                          return_value=kill_ok) as kill, \
+             patch.object(hive, '_tmux_start') as start:
+            hive.main()
+        start.assert_not_called()
+        return resolve, kill, root
+
+    def test_positional_hive_and_yes(self, monkeypatch):
+        resolve, kill, root = self._main(
+            monkeypatch, ['hive', 'tmux', 'kill', 'home', '--yes'])
+        resolve.assert_called_once_with('home')
+        kill.assert_called_once_with(root, assume_yes=True)
+
+    def test_tmux_level_hive_flag(self, monkeypatch):
+        resolve, kill, root = self._main(
+            monkeypatch, ['hive', 'tmux', '--hive', 'home', 'kill'])
+        resolve.assert_called_once_with('home')
+        kill.assert_called_once_with(root, assume_yes=False)
+
+    def test_defaults_to_cwd_hive(self, monkeypatch):
+        resolve, kill, root = self._main(monkeypatch,
+                                         ['hive', 'tmux', 'kill', '-y'])
+        resolve.assert_called_once_with(None)
+        kill.assert_called_once_with(root, assume_yes=True)
+
+    def test_naming_the_hive_twice_is_refused(self, monkeypatch, capsys):
+        with pytest.raises(SystemExit) as exc:
+            self._main(monkeypatch,
+                       ['hive', 'tmux', '--hive', 'home', 'kill', 'home-dc'])
+        assert exc.value.code == 2
+        assert 'Name the hive once' in capsys.readouterr().err
+
+    def test_failed_kill_exits_nonzero(self, monkeypatch):
+        with pytest.raises(SystemExit) as exc:
+            self._main(monkeypatch, ['hive', 'tmux', 'kill', 'home', '-y'],
+                       kill_ok=False)
+        assert exc.value.code == 1
+
+    def test_subcommand_name_survives_parsing(self, monkeypatch):
+        monkeypatch.setattr(sys, 'argv', ['hive', 'tmux', 'kill', 'home'])
+        with patch.object(hive, 'cmd_tmux') as fn:
+            hive.main()
+        args = fn.call_args[0][0]
+        assert args.command == 'tmux'
+        assert args.tmux_action == 'kill'
+        assert args.kill_hive == 'home'
 
 
 # --- tmux-backed probe -------------------------------------------------------
