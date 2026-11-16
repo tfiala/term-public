@@ -55,4 +55,13 @@ case "$shell" in
   *) fail "tmux default-shell is '$shell', expected the system bash 5" ;;
 esac
 
+# tmux.conf drops SSH_AUTH_SOCK from update-environment on macOS only; on
+# Linux a forwarded agent must still follow each attach.
+update_env="$(tmux -L tp-smoke -f "$ROOT/tmux/tmux.conf" start-server \; show-options -gv update-environment 2>&1)" \
+  || fail "tmux could not load tmux/tmux.conf: $update_env"
+tmux -L tp-smoke kill-server 2>/dev/null || true
+tr ' ' '\n' <<<"$update_env" | grep -qx SSH_AUTH_SOCK \
+  || fail "tmux update-environment lacks SSH_AUTH_SOCK on Linux: $(tr '\n' ' ' <<<"$update_env")"
+pass "tmux update-environment keeps SSH_AUTH_SOCK"
+
 echo "smoke test passed"
